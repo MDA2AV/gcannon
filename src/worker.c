@@ -124,11 +124,18 @@ static void start_connect(worker_t *w, int conn_idx)
     io_uring_sqe_set_data64(sqe, PACK_UD(UD_CONNECT, c->gen, conn_idx));
 }
 
-static void close_conn(worker_t *w, gc_conn_t *c)
+static void close_conn(worker_t *w, gc_conn_t *c, int conn_idx)
 {
-    (void)w;
-    if (c->fd >= 0)
+    if (c->fd >= 0) {
+        /* Cancel multishot recv so io_uring drops its socket reference,
+           allowing the kernel to fully destroy the socket and free the 4-tuple */
+        struct io_uring_sqe *sqe = io_uring_get_sqe(&w->ring);
+        if (sqe) {
+            io_uring_prep_cancel64(sqe, PACK_UD(UD_RECV, c->gen, conn_idx), 0);
+            io_uring_sqe_set_data64(sqe, PACK_UD(UD_CANCEL, c->gen, conn_idx));
+        }
         close(c->fd);
+    }
     c->fd = -1;
     c->state = CONN_CLOSED;
     c->send_inflight = 0;
@@ -137,11 +144,12 @@ static void close_conn(worker_t *w, gc_conn_t *c)
 
 static void reconnect(worker_t *w, int conn_idx)
 {
-    close_conn(w, &w->conns[conn_idx]);
+    close_conn(w, &w->conns[conn_idx], conn_idx);
     w->stats.reconnects++;
     if (*w->running)
         start_connect(w, conn_idx);
 }
+
 
 /* ── init ──────────────────────────────────────────────────────────── */
 
