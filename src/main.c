@@ -25,7 +25,7 @@ typedef struct thread_ctx {
     int        request_len;
     int        pipeline_depth;
     int        num_conns;
-    int        cpu_id;
+    int        requests_per_conn;
     struct sockaddr_in addr;
 } thread_ctx_t;
 
@@ -83,7 +83,7 @@ static void *worker_thread(void *arg)
     thread_ctx_t *ctx = arg;
     worker_init(&ctx->worker, ctx->worker.id, &ctx->addr,
                 ctx->pipeline_buf, ctx->request_len, ctx->pipeline_depth,
-                ctx->num_conns, &g_running);
+                ctx->num_conns, ctx->requests_per_conn, &g_running);
     worker_loop(&ctx->worker);
     return NULL;
 }
@@ -104,6 +104,7 @@ int main(int argc, char **argv)
     int num_threads = 1;
     int duration_sec = 10;
     int pipeline_depth = 16;
+    int requests_per_conn = 0; /* 0 = keep-alive forever */
     const char *url = NULL;
 
     /* Parse CLI args */
@@ -118,16 +119,18 @@ int main(int argc, char **argv)
             duration_sec = parse_duration(argv[++i]);
         } else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
             pipeline_depth = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-r") == 0 && i + 1 < argc) {
+            requests_per_conn = atoi(argv[++i]);
         } else {
             fprintf(stderr, "Usage: gcannon <url> -c <conns> -t <threads> "
-                            "-d <duration> [-p <pipeline>]\n");
+                            "-d <duration> [-p <pipeline>] [-r <req/conn>]\n");
             return 1;
         }
     }
 
     if (!url) {
         fprintf(stderr, "Usage: gcannon <url> -c <conns> -t <threads> "
-                        "-d <duration> [-p <pipeline>]\n");
+                        "-d <duration> [-p <pipeline>] [-r <req/conn>]\n");
         return 1;
     }
 
@@ -173,6 +176,10 @@ int main(int argc, char **argv)
     printf("  Conns:     %d (%.0f/thread)\n", num_connections,
            (double)num_connections / num_threads);
     printf("  Pipeline:  %d\n", pipeline_depth);
+    if (requests_per_conn > 0)
+        printf("  Req/conn:  %d\n", requests_per_conn);
+    else
+        printf("  Req/conn:  unlimited (keep-alive)\n");
     printf("  Duration:  %ds\n", duration_sec);
     printf("\n");
 
@@ -183,25 +190,31 @@ int main(int argc, char **argv)
     thread_ctx_t *ctxs = calloc(num_threads, sizeof(thread_ctx_t));
     pthread_t *threads = calloc(num_threads, sizeof(pthread_t));
 
-    int num_cpus = sysconf(_SC_NPROCESSORS_ONLN);
-
     for (int i = 0; i < num_threads; i++) {
         ctxs[i].worker.id      = i;
         ctxs[i].pipeline_buf   = pipeline_buf;
         ctxs[i].request_len    = request_len;
         ctxs[i].pipeline_depth = pipeline_depth;
-        ctxs[i].num_conns      = conns_per_thread + (i < extra ? 1 : 0);
-        ctxs[i].cpu_id         = i % num_cpus;
-        ctxs[i].addr           = addr;
+        ctxs[i].num_conns         = conns_per_thread + (i < extra ? 1 : 0);
+        ctxs[i].requests_per_conn = requests_per_conn;
+        ctxs[i].addr              = addr;
         pthread_create(&threads[i], NULL, worker_thread, &ctxs[i]);
     }
 
     /* Warmup — let connections establish */
     nanosleep(&(struct timespec){ .tv_sec = 0, .tv_nsec = 100000000 }, NULL); /* 100ms */
 
-    /* Reset stats after warmup so connect phase doesn't pollute results */
-    for (int i = 0; i < num_threads; i++)
-        memset(&ctxs[i].worker.stats, 0, sizeof(worker_stats_t));
+    /* Reset counters after warmup */
+    for (int i = 0; i < num_threads; i++) {
+        worker_stats_t *s = &ctxs[i].worker.stats;
+        __atomic_store_n(&s->requests, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&s->responses, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&s->bytes_read, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&s->connect_errors, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&s->read_errors, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&s->timeouts, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&s->reconnects, 0, __ATOMIC_RELAXED);
+    }
 
     struct timespec start_time;
     clock_gettime(CLOCK_MONOTONIC, &start_time);

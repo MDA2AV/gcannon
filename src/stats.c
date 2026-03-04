@@ -26,6 +26,7 @@ void stats_merge(worker_stats_t *dst, const worker_stats_t *src)
     dst->connect_errors += src->connect_errors;
     dst->read_errors    += src->read_errors;
     dst->timeouts       += src->timeouts;
+    dst->reconnects     += src->reconnects;
     dst->latency_count  += src->latency_count;
     dst->latency_sum_us += src->latency_sum_us;
     dst->overflow       += src->overflow;
@@ -117,6 +118,8 @@ void stats_print(const worker_stats_t *s, double elapsed_sec)
     printf("  Throughput: %s req/s\n", rps_buf);
     printf("  Bandwidth:  %s\n", bw_buf);
 
+    if (s->reconnects)
+        printf("  Reconnects: %lu\n", s->reconnects);
     if (s->connect_errors || s->read_errors || s->timeouts) {
         printf("  Errors: connect %lu, read %lu, timeout %lu\n",
                s->connect_errors, s->read_errors, s->timeouts);

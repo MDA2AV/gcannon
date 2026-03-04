@@ -29,16 +29,17 @@ static inline void return_buffer(worker_t *w, uint16_t bid)
     io_uring_buf_ring_advance(w->buf_ring, 1);
 }
 
-static inline void arm_recv_multishot(worker_t *w, int fd)
+static inline void arm_recv_multishot(worker_t *w, int conn_idx)
 {
+    gc_conn_t *c = &w->conns[conn_idx];
     struct io_uring_sqe *sqe = sqe_get(&w->ring);
-    io_uring_prep_recv_multishot(sqe, fd, NULL, 0, 0);
+    io_uring_prep_recv_multishot(sqe, c->fd, NULL, 0, 0);
     sqe->flags    |= IOSQE_BUFFER_SELECT;
     sqe->buf_group = BUFFER_RING_BGID;
-    io_uring_sqe_set_data64(sqe, PACK_UD(UD_RECV, fd));
+    io_uring_sqe_set_data64(sqe, PACK_UD(UD_RECV, c->gen, conn_idx));
 }
 
-static inline void fire_requests(worker_t *w, gc_conn_t *c, int count)
+static inline void fire_requests(worker_t *w, gc_conn_t *c, int conn_idx, int count)
 {
     if (count <= 0 || c->send_inflight || c->state != CONN_ACTIVE)
         return;
@@ -46,15 +47,23 @@ static inline void fire_requests(worker_t *w, gc_conn_t *c, int count)
     if (count > w->pipeline_depth)
         count = w->pipeline_depth;
 
+    /* Cap to remaining requests on this connection */
+    if (w->requests_per_conn > 0) {
+        int remaining = w->requests_per_conn - c->requests_sent;
+        if (remaining <= 0) return;
+        if (count > remaining) count = remaining;
+    }
+
     int send_len = count * w->request_len;
     struct io_uring_sqe *sqe = sqe_get(&w->ring);
     io_uring_prep_send(sqe, c->fd, w->pipeline_buf, send_len, MSG_NOSIGNAL);
-    io_uring_sqe_set_data64(sqe, PACK_UD(UD_SEND, c->fd));
+    io_uring_sqe_set_data64(sqe, PACK_UD(UD_SEND, c->gen, conn_idx));
 
     c->send_inflight = 1;
     c->send_total = send_len;
     c->send_done  = 0;
     c->pipeline_inflight += count;
+    c->requests_sent += count;
     w->stats.requests += count;
 
     /* Record send times for latency tracking */
@@ -74,31 +83,30 @@ static inline uint64_t timespec_diff_us(struct timespec *start, struct timespec 
     return (uint64_t)(sec * 1000000L + nsec / 1000L);
 }
 
-static int create_connect_socket(void)
+static int create_connect_socket(int linger_rst)
 {
     int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (fd < 0) return -1;
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    if (linger_rst) {
+        struct linger lg = { .l_onoff = 1, .l_linger = 0 };
+        setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+    }
     return fd;
 }
 
 static void start_connect(worker_t *w, int conn_idx)
 {
     gc_conn_t *c = &w->conns[conn_idx];
-    int fd = create_connect_socket();
+    int fd = create_connect_socket(w->requests_per_conn > 0);
     if (fd < 0) {
         w->stats.connect_errors++;
         return;
     }
 
-    if (fd >= MAX_CONNS_PER_WORKER) {
-        close(fd);
-        w->stats.connect_errors++;
-        return;
-    }
-
     c->fd = fd;
+    c->gen++;
     c->state = CONN_CONNECTING;
     c->pipeline_inflight = 0;
     c->send_inflight = 0;
@@ -106,19 +114,19 @@ static void start_connect(worker_t *w, int conn_idx)
     c->send_done = 0;
     c->send_time_head = 0;
     c->send_time_tail = 0;
+    c->requests_sent = 0;
+    c->responses_recv = 0;
     http_parser_reset(&c->parser);
-    w->conn_fd_map[fd] = conn_idx;
 
     struct io_uring_sqe *sqe = sqe_get(&w->ring);
     io_uring_prep_connect(sqe, fd, (struct sockaddr *)&w->server_addr,
                           sizeof(w->server_addr));
-    io_uring_sqe_set_data64(sqe, PACK_UD(UD_CONNECT, fd));
+    io_uring_sqe_set_data64(sqe, PACK_UD(UD_CONNECT, c->gen, conn_idx));
 }
 
 static void close_conn(worker_t *w, gc_conn_t *c)
 {
-    if (c->fd >= 0 && c->fd < MAX_CONNS_PER_WORKER)
-        w->conn_fd_map[c->fd] = -1;
+    (void)w;
     if (c->fd >= 0)
         close(c->fd);
     c->fd = -1;
@@ -129,8 +137,8 @@ static void close_conn(worker_t *w, gc_conn_t *c)
 
 static void reconnect(worker_t *w, int conn_idx)
 {
-    gc_conn_t *c = &w->conns[conn_idx];
-    close_conn(w, c);
+    close_conn(w, &w->conns[conn_idx]);
+    w->stats.reconnects++;
     if (*w->running)
         start_connect(w, conn_idx);
 }
@@ -139,17 +147,18 @@ static void reconnect(worker_t *w, int conn_idx)
 
 void worker_init(worker_t *w, int id, struct sockaddr_in *addr,
                  char *pipeline_buf, int request_len, int pipeline_depth,
-                 int num_conns, volatile int *running)
+                 int num_conns, int requests_per_conn, volatile int *running)
 {
     memset(w, 0, sizeof(*w));
-    w->id             = id;
-    w->server_addr    = *addr;
-    w->pipeline_buf   = pipeline_buf;
-    w->request_len    = request_len;
-    w->pipeline_depth = pipeline_depth;
-    w->pipeline_len   = pipeline_depth * request_len;
-    w->num_conns      = num_conns;
-    w->running        = running;
+    w->id                = id;
+    w->server_addr       = *addr;
+    w->pipeline_buf      = pipeline_buf;
+    w->request_len       = request_len;
+    w->pipeline_depth    = pipeline_depth;
+    w->pipeline_len      = pipeline_depth * request_len;
+    w->num_conns         = num_conns;
+    w->requests_per_conn = requests_per_conn;
+    w->running           = running;
 
     /* io_uring */
     struct io_uring_params params;
@@ -183,15 +192,14 @@ void worker_init(worker_t *w, int id, struct sockaddr_in *addr,
     }
     io_uring_buf_ring_advance(w->buf_ring, BUF_RING_ENTRIES);
 
-    /* Connection arrays */
+    /* Connection array */
     w->conns = calloc(num_conns, sizeof(gc_conn_t));
-    w->conn_fd_map = malloc(MAX_CONNS_PER_WORKER * sizeof(int));
-    memset(w->conn_fd_map, -1, MAX_CONNS_PER_WORKER * sizeof(int));
 
     /* Start all connections */
     for (int i = 0; i < num_conns; i++) {
         w->conns[i].fd = -1;
         w->conns[i].state = CONN_CLOSED;
+        w->conns[i].gen = 0;
         start_connect(w, i);
     }
 }
@@ -215,34 +223,40 @@ void worker_loop(worker_t *w)
 
         for (unsigned i = 0; i < got; i++) {
             struct io_uring_cqe *cqe = cqes[i];
-            uint64_t   ud   = cqe->user_data;
-            ud_kind_t  kind = UD_KIND(ud);
-            int        fd   = UD_FD(ud);
-            int        res  = cqe->res;
+            uint64_t   ud       = cqe->user_data;
+            ud_kind_t  kind     = UD_KIND(ud);
+            uint16_t   cqe_gen  = UD_GEN(ud);
+            int        conn_idx = UD_IDX(ud);
+            int        res      = cqe->res;
 
-            if (fd < 0 || fd >= MAX_CONNS_PER_WORKER) continue;
-            int conn_idx = w->conn_fd_map[fd];
+            if (conn_idx < 0 || conn_idx >= w->num_conns) continue;
+            gc_conn_t *c = &w->conns[conn_idx];
+
+            /* Stale CQE from a previous generation — ignore */
+            if (cqe_gen != c->gen) {
+                /* Still need to return buffer if recv had one */
+                if (kind == UD_RECV && (cqe->flags & IORING_CQE_F_BUFFER)) {
+                    uint16_t bid = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
+                    return_buffer(w, bid);
+                }
+                continue;
+            }
 
             switch (kind) {
 
             case UD_CONNECT: {
-                if (conn_idx < 0) break;
-                gc_conn_t *c = &w->conns[conn_idx];
                 if (res < 0) {
                     w->stats.connect_errors++;
                     reconnect(w, conn_idx);
                     break;
                 }
                 c->state = CONN_ACTIVE;
-                arm_recv_multishot(w, fd);
-                fire_requests(w, c, w->pipeline_depth);
+                arm_recv_multishot(w, conn_idx);
+                fire_requests(w, c, conn_idx, w->pipeline_depth);
                 break;
             }
 
             case UD_SEND: {
-                if (conn_idx < 0) break;
-                gc_conn_t *c = &w->conns[conn_idx];
-
                 if (res < 0) {
                     c->send_inflight = 0;
                     w->stats.read_errors++;
@@ -258,7 +272,7 @@ void worker_loop(worker_t *w)
                     io_uring_prep_send(sqe, c->fd,
                                        w->pipeline_buf + off,
                                        c->send_total - off, MSG_NOSIGNAL);
-                    io_uring_sqe_set_data64(sqe, PACK_UD(UD_SEND, c->fd));
+                    io_uring_sqe_set_data64(sqe, PACK_UD(UD_SEND, c->gen, conn_idx));
                 } else {
                     c->send_inflight = 0;
                 }
@@ -274,50 +288,51 @@ void worker_loop(worker_t *w)
                         uint16_t bid = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
                         return_buffer(w, bid);
                     }
-                    if (conn_idx >= 0)
-                        reconnect(w, conn_idx);
+                    reconnect(w, conn_idx);
                     break;
                 }
 
                 if (!has_buffer) break;
 
                 uint16_t bid = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
+                uint8_t *buf = w->buf_slab + (size_t)bid * RECV_BUF_SIZE;
 
-                if (conn_idx >= 0) {
-                    gc_conn_t *c = &w->conns[conn_idx];
-                    uint8_t *buf = w->buf_slab + (size_t)bid * RECV_BUF_SIZE;
+                w->stats.bytes_read += res;
+                int completed = http_parse_responses(&c->parser, buf, res);
 
-                    w->stats.bytes_read += res;
-                    int completed = http_parse_responses(&c->parser, buf, res);
+                /* Record latencies */
+                struct timespec now;
+                if (completed > 0)
+                    clock_gettime(CLOCK_MONOTONIC, &now);
 
-                    /* Record latencies */
-                    struct timespec now;
-                    if (completed > 0)
-                        clock_gettime(CLOCK_MONOTONIC, &now);
+                for (int j = 0; j < completed; j++) {
+                    w->stats.responses++;
+                    c->pipeline_inflight--;
+                    c->responses_recv++;
 
-                    for (int j = 0; j < completed; j++) {
-                        w->stats.responses++;
-                        c->pipeline_inflight--;
-
-                        if (c->send_time_head < c->send_time_tail) {
-                            struct timespec *ts_start =
-                                &c->send_times[c->send_time_head % PIPELINE_DEPTH_MAX];
-                            uint64_t lat = timespec_diff_us(ts_start, &now);
-                            stats_record_latency(&w->stats, lat);
-                            c->send_time_head++;
-                        }
+                    if (c->send_time_head < c->send_time_tail) {
+                        struct timespec *ts_start =
+                            &c->send_times[c->send_time_head % PIPELINE_DEPTH_MAX];
+                        uint64_t lat = timespec_diff_us(ts_start, &now);
+                        stats_record_latency(&w->stats, lat);
+                        c->send_time_head++;
                     }
+                }
 
-                    return_buffer(w, bid);
+                return_buffer(w, bid);
 
-                    if (!has_more)
-                        arm_recv_multishot(w, fd);
+                /* Check if this connection's quota is done */
+                int done = w->requests_per_conn > 0 &&
+                           c->requests_sent >= w->requests_per_conn;
 
-                    /* Refill pipeline with completed count */
-                    if (completed > 0)
-                        fire_requests(w, c, completed);
+                if (done) {
+                    reconnect(w, conn_idx);
                 } else {
-                    return_buffer(w, bid);
+                    if (!has_more)
+                        arm_recv_multishot(w, conn_idx);
+
+                    if (completed > 0)
+                        fire_requests(w, c, conn_idx, completed);
                 }
                 break;
             }
@@ -345,5 +360,4 @@ void worker_destroy(worker_t *w)
     io_uring_queue_exit(&w->ring);
     free(w->buf_slab);
     free(w->conns);
-    free(w->conn_fd_map);
 }

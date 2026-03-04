@@ -2,13 +2,14 @@
 
 #include <stdint.h>
 
-/* ── User-data packing (64-bit: upper 32 = kind, lower 32 = fd) ──── */
+/* ── User-data packing (64-bit: [kind:16][gen:16][conn_idx:32]) ───── */
 
 typedef enum { UD_CONNECT = 1, UD_RECV = 2, UD_SEND = 3, UD_CANCEL = 4 } ud_kind_t;
 
-#define PACK_UD(kind, fd)   (((uint64_t)(kind) << 32) | (uint32_t)(fd))
-#define UD_KIND(ud)         ((ud_kind_t)((ud) >> 32))
-#define UD_FD(ud)           ((int)((ud) & 0xFFFFFFFF))
+#define PACK_UD(kind, gen, idx)  (((uint64_t)(kind) << 48) | ((uint64_t)((gen) & 0xFFFF) << 32) | (uint32_t)(idx))
+#define UD_KIND(ud)              ((ud_kind_t)((ud) >> 48))
+#define UD_GEN(ud)               ((uint16_t)(((ud) >> 32) & 0xFFFF))
+#define UD_IDX(ud)               ((int)((ud) & 0xFFFFFFFF))
 
 /* ── Tunables ─────────────────────────────────────────────────────── */
 

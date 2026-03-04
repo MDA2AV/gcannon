@@ -12,6 +12,7 @@ typedef enum { CONN_CONNECTING, CONN_ACTIVE, CONN_CLOSED } conn_state_t;
 
 typedef struct gc_conn {
     int              fd;
+    uint16_t         gen;            /* generation counter for stale CQE detection */
     conn_state_t     state;
     int              pipeline_inflight;
     http_parser_t    parser;
@@ -21,6 +22,8 @@ typedef struct gc_conn {
     int              send_inflight;
     int              send_total;     /* total bytes we intended to send */
     int              send_done;      /* bytes confirmed sent so far */
+    int              requests_sent;  /* total requests sent on this connection */
+    int              responses_recv; /* total responses received on this connection */
 } gc_conn_t;
 
 typedef struct worker {
@@ -31,7 +34,6 @@ typedef struct worker {
     uint32_t                  buf_mask;
 
     gc_conn_t                *conns;
-    int                      *conn_fd_map; /* fd → conn index, sparse */
     int                       num_conns;
 
     struct sockaddr_in        server_addr;
@@ -40,6 +42,7 @@ typedef struct worker {
     int                       pipeline_len;  /* pipeline_depth * request_len */
     int                       pipeline_depth;
 
+    int                       requests_per_conn; /* 0 = keep-alive forever */
     worker_stats_t            stats;
     volatile int             *running;
     int                       id;
@@ -48,7 +51,7 @@ typedef struct worker {
 /* Initialize worker (must be called from worker thread for SINGLE_ISSUER) */
 void worker_init(worker_t *w, int id, struct sockaddr_in *addr,
                  char *pipeline_buf, int request_len, int pipeline_depth,
-                 int num_conns, volatile int *running);
+                 int num_conns, int requests_per_conn, volatile int *running);
 
 /* Main event loop — blocks until *running == 0 */
 void worker_loop(worker_t *w);

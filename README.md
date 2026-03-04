@@ -24,7 +24,7 @@ make
 ## Usage
 
 ```
-gcannon <url> -c <connections> -t <threads> -d <duration> [-p <pipeline>]
+gcannon <url> -c <connections> -t <threads> -d <duration> [-p <pipeline>] [-r <req/conn>]
 ```
 
 | Flag | Default | Description |
@@ -34,9 +34,22 @@ gcannon <url> -c <connections> -t <threads> -d <duration> [-p <pipeline>]
 | `-t` | 1 | Worker threads |
 | `-d` | 10s | Duration (`10s`, `1m`) |
 | `-p` | 16 | Pipeline depth (max 64) |
+| `-r` | unlimited | Requests per connection before reconnecting |
+
+### Keep-alive mode (default)
+
+Connections stay open for the entire run. Maximum throughput.
 
 ```bash
 gcannon http://127.0.0.1:8080/plaintext -c 512 -t 8 -d 10s -p 16
+```
+
+### Short-lived connections
+
+Each connection sends N requests, then closes and reconnects. Tests the full accept → serve → close cycle.
+
+```bash
+gcannon http://127.0.0.1:8080/plaintext -c 256 -t 4 -d 10s -p 1 -r 1000
 ```
 
 ## Architecture
@@ -53,23 +66,25 @@ worker thread [0..N-1]
 ├── own io_uring ring (SINGLE_ISSUER | DEFER_TASKRUN)
 ├── provided buffer ring for zero-copy recv
 ├── manages connections_per_thread connections
-└── event loop: connect → send(pipeline) → recv → count → send(refill)
+└── event loop: connect → send(pipeline) → recv → count → send(refill) [→ reconnect]
 ```
 
 Each worker thread is fully independent — no locks, no cross-thread communication.
+
+Connection identity uses a generation counter in io_uring user-data to detect and ignore stale CQEs from previous connections on the same slot.
 
 ## Project Structure
 
 ```
 include/
-  constants.h  — UD packing macros, ring/buffer tunables
+  constants.h  — UD packing macros (kind/gen/idx), ring/buffer tunables
   worker.h     — worker thread struct, connection state
   http.h       — request builder, response parser
   stats.h      — two-tier latency histogram
 
 src/
   main.c       — CLI, thread orchestration, stats reporting
-  worker.c     — io_uring event loop (connect/send/recv)
+  worker.c     — io_uring event loop (connect/send/recv/reconnect)
   http.c       — HTTP request builder, response boundary parser
   stats.c      — histogram, percentile computation
 ```
@@ -79,15 +94,17 @@ src/
 ```
 gcannon — io_uring HTTP load generator
   Target:    127.0.0.1:8080/plaintext
-  Threads:   8
-  Conns:     512 (64/thread)
+  Threads:   4
+  Conns:     256 (64/thread)
   Pipeline:  16
-  Duration:  10s
+  Req/conn:  1000
+  Duration:  5s
 
   Thread Stats   Avg      p50      p90      p99    p99.9
-    Latency   4.24ms   4.11ms   4.20ms   5.50ms   33.50ms
+    Latency   2.19ms   2.06ms   2.90ms   5.14ms   7.27ms
 
-  19382819 requests in 10.00s, 19366819 responses
-  Throughput: 1.94M req/s
-  Bandwidth:  144.04MB/s
+  9331080 requests in 5.00s, 9188954 responses
+  Throughput: 1.84M req/s
+  Bandwidth:  136.68MB/s
+  Reconnects: 9202
 ```
