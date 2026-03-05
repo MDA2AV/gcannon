@@ -2,9 +2,7 @@
 
 io_uring HTTP load generator. Designed to benchmark HTTP servers with minimal syscall overhead.
 
-## Why not wrk?
-
-wrk uses epoll — one `epoll_wait` + individual `read`/`write` syscalls per event. gcannon uses io_uring:
+## Features
 
 - **Single syscall per loop** — `io_uring_submit_and_wait_timeout` submits and harvests in one kernel entry
 - **Zero-copy recv** — provided buffer rings, kernel writes directly into pre-registered memory
@@ -20,6 +18,8 @@ Requires liburing (`liburing-dev` on Debian/Ubuntu).
 ```bash
 make
 ```
+
+HTTP response parsing uses [picohttpparser](https://github.com/h2o/picohttpparser), included under `external/`.
 
 ## Usage
 
@@ -85,8 +85,11 @@ include/
 src/
   main.c       — CLI, thread orchestration, stats reporting
   worker.c     — io_uring event loop (connect/send/recv/reconnect)
-  http.c       — HTTP request builder, response boundary parser
+  http.c       — HTTP request builder, response parser (picohttpparser)
   stats.c      — histogram, percentile computation
+
+external/
+  picohttpparser/  — h2o/picohttpparser
 ```
 
 ## Output

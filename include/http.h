@@ -10,12 +10,17 @@ int http_build_pipeline(const char *host, int port, const char *path,
 
 /* HTTP response parser state (per-connection) */
 typedef struct http_parser {
-    int  state;           /* 0 = scanning headers, 1 = reading body */
+    int  state;           /* 0 = headers, 1 = content-length body, 2 = chunked body */
     int  content_length;
     int  body_received;
     char header_buf[512];
     int  header_buf_len;
     int  status_code;     /* last parsed status code */
+    int  chunked;         /* 1 if Transfer-Encoding: chunked */
+    int  chunk_remaining; /* bytes left in current chunk */
+    int  chunk_state;     /* 0 = reading size line, 1 = data, 2 = post-chunk CRLF */
+    char chunk_line[20];  /* accumulates hex size line across recv boundaries */
+    int  chunk_line_len;
 } http_parser_t;
 
 /* Feed data into the parser. Returns number of complete responses found.

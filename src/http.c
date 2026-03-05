@@ -3,26 +3,39 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+
+#include "picohttpparser.h"
 
 int http_build_pipeline(const char *host, int port, const char *path,
                         int pipeline_depth, char **out_buf)
 {
-    char single[512];
+    /* Measure the single request length first */
     int single_len;
-
-    if (port == 80)
-        single_len = snprintf(single, sizeof(single),
+    if (port == 80 || port == 443)
+        single_len = snprintf(NULL, 0,
             "GET %s HTTP/1.1\r\nHost: %s\r\n\r\n",
             path, host);
     else
-        single_len = snprintf(single, sizeof(single),
+        single_len = snprintf(NULL, 0,
             "GET %s HTTP/1.1\r\nHost: %s:%d\r\n\r\n",
             path, host, port);
 
     int total_len = single_len * pipeline_depth;
     char *buf = malloc(total_len);
-    for (int i = 0; i < pipeline_depth; i++)
-        memcpy(buf + i * single_len, single, single_len);
+
+    /* Format into the first slot, then replicate */
+    if (port == 80 || port == 443)
+        snprintf(buf, single_len + 1,
+            "GET %s HTTP/1.1\r\nHost: %s\r\n\r\n",
+            path, host);
+    else
+        snprintf(buf, single_len + 1,
+            "GET %s HTTP/1.1\r\nHost: %s:%d\r\n\r\n",
+            path, host, port);
+
+    for (int i = 1; i < pipeline_depth; i++)
+        memcpy(buf + i * single_len, buf, single_len);
 
     *out_buf = buf;
     return total_len;
@@ -35,6 +48,10 @@ void http_parser_reset(http_parser_t *p)
     p->body_received = 0;
     p->header_buf_len = 0;
     p->status_code = 0;
+    p->chunked = 0;
+    p->chunk_remaining = 0;
+    p->chunk_state = 0;
+    p->chunk_line_len = 0;
 }
 
 /*
@@ -51,25 +68,39 @@ static const uint8_t *parse_headers(http_parser_t *p, const uint8_t *data, int l
     p->header_buf_len += copy;
     p->header_buf[p->header_buf_len] = '\0';
 
-    /* Search for end of headers */
-    char *end = strstr(p->header_buf, "\r\n\r\n");
-    if (!end)
-        return NULL;
+    int minor_version, status;
+    const char *msg;
+    size_t msg_len, num_headers = 16;
+    struct phr_header headers[16];
 
-    int header_len = (int)(end - p->header_buf) + 4;
+    int ret = phr_parse_response(p->header_buf, (size_t)p->header_buf_len,
+                                 &minor_version, &status, &msg, &msg_len,
+                                 headers, &num_headers, 0);
+    if (ret == -2)
+        return NULL; /* incomplete */
+    if (ret == -1)
+        return NULL; /* parse error, treat as incomplete */
 
-    /* Parse status code from first line: "HTTP/1.1 200 OK\r\n" */
-    char *sp = strchr(p->header_buf, ' ');
-    if (sp)
-        p->status_code = atoi(sp + 1);
+    int header_len = ret;
+    p->status_code = status;
 
-    /* Parse Content-Length */
+    /* Find Content-Length or Transfer-Encoding in parsed headers */
     p->content_length = 0;
-    char *cl = strcasestr(p->header_buf, "Content-Length:");
-    if (cl) {
-        cl += 15; /* skip "Content-Length:" */
-        while (*cl == ' ') cl++;
-        p->content_length = atoi(cl);
+    p->chunked = 0;
+    for (size_t i = 0; i < num_headers; i++) {
+        if (headers[i].name_len == 14 &&
+            strncasecmp(headers[i].name, "content-length", 14) == 0) {
+            p->content_length = atoi(headers[i].value);
+        } else if (headers[i].name_len == 17 &&
+                   strncasecmp(headers[i].name, "transfer-encoding", 17) == 0) {
+            /* Check if value contains "chunked" */
+            for (size_t j = 0; j + 7 <= headers[i].value_len; j++) {
+                if (strncasecmp(headers[i].value + j, "chunked", 7) == 0) {
+                    p->chunked = 1;
+                    break;
+                }
+            }
+        }
     }
 
     /* How many bytes of `data` were consumed as headers vs body */
@@ -77,7 +108,14 @@ static const uint8_t *parse_headers(http_parser_t *p, const uint8_t *data, int l
     if (consumed_from_data < 0) consumed_from_data = 0;
     if (consumed_from_data > len) consumed_from_data = len;
 
-    p->state = 1;
+    if (p->chunked) {
+        p->state = 2;
+        p->chunk_state = 0;
+        p->chunk_remaining = 0;
+        p->chunk_line_len = 0;
+    } else {
+        p->state = 1;
+    }
     p->body_received = 0;
     p->header_buf_len = 0;
 
@@ -101,7 +139,7 @@ int http_parse_responses(http_parser_t *p, const uint8_t *data, int len)
         }
 
         if (p->state == 1) {
-            /* Reading body */
+            /* Reading content-length body */
             int remaining = p->content_length - p->body_received;
             int available = (int)(end - ptr);
             int consume = available < remaining ? available : remaining;
@@ -110,13 +148,75 @@ int http_parse_responses(http_parser_t *p, const uint8_t *data, int len)
 
             if (p->body_received >= p->content_length) {
                 completed++;
-                /* Reset for next response */
                 p->state = 0;
                 p->content_length = -1;
                 p->body_received = 0;
                 p->status_code = 0;
             }
         }
+
+        if (p->state == 2) {
+            /* Reading chunked body */
+            while (ptr < end) {
+                if (p->chunk_state == 0) {
+                    /* Accumulate chunk-size line until \r\n */
+                    while (ptr < end) {
+                        char c = (char)*ptr++;
+                        if (c == '\n' && p->chunk_line_len > 0 &&
+                            p->chunk_line[p->chunk_line_len - 1] == '\r') {
+                            p->chunk_line[p->chunk_line_len - 1] = '\0';
+                            long size = strtol(p->chunk_line, NULL, 16);
+                            p->chunk_line_len = 0;
+                            if (size == 0) {
+                                /* Final chunk — skip optional trailing CRLF */
+                                if (ptr + 1 < end && ptr[0] == '\r' && ptr[1] == '\n')
+                                    ptr += 2;
+                                completed++;
+                                p->state = 0;
+                                p->content_length = -1;
+                                p->body_received = 0;
+                                p->status_code = 0;
+                                p->chunked = 0;
+                                p->chunk_remaining = 0;
+                                p->chunk_state = 0;
+                                goto next_response;
+                            }
+                            p->chunk_remaining = (int)size;
+                            p->chunk_state = 1;
+                            break;
+                        }
+                        if (p->chunk_line_len < (int)sizeof(p->chunk_line) - 1)
+                            p->chunk_line[p->chunk_line_len++] = c;
+                    }
+                    if (p->chunk_state == 0)
+                        break; /* need more data for size line */
+                }
+
+                if (p->chunk_state == 1) {
+                    /* Consume chunk data */
+                    int available = (int)(end - ptr);
+                    int consume = available < p->chunk_remaining ? available : p->chunk_remaining;
+                    ptr += consume;
+                    p->chunk_remaining -= consume;
+                    if (p->chunk_remaining == 0)
+                        p->chunk_state = 2;
+                    else
+                        break; /* need more data */
+                }
+
+                if (p->chunk_state == 2) {
+                    /* Consume post-chunk CRLF */
+                    int available = (int)(end - ptr);
+                    if (available >= 2) {
+                        ptr += 2; /* skip \r\n */
+                        p->chunk_state = 0;
+                    } else {
+                        break; /* need more data for CRLF */
+                    }
+                }
+            }
+        }
+next_response:;
     }
 
     return completed;
