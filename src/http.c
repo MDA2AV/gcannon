@@ -55,9 +55,9 @@ void http_parser_reset(http_parser_t *p)
 }
 
 /*
- * Scan for \r\n\r\n in the header accumulation buffer.
- * If found, extract Content-Length and status code.
- * Returns pointer past end of headers, or NULL if not yet complete.
+ * Accumulate header data and parse with picohttpparser.
+ * Extracts status code, Content-Length, and Transfer-Encoding.
+ * Returns pointer past end of headers, or NULL if incomplete.
  */
 static const uint8_t *parse_headers(http_parser_t *p, const uint8_t *data, int len)
 {
