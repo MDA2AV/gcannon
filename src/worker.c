@@ -54,10 +54,21 @@ static inline void fire_requests(worker_t *w, gc_conn_t *c, int conn_idx, int co
         if (count > remaining) count = remaining;
     }
 
-    int send_len = count * w->request_len;
+    request_tpl_t *tpl = &w->templates[c->tpl_idx];
+    int send_len = count * tpl->request_len;
     struct io_uring_sqe *sqe = sqe_get(&w->ring);
-    io_uring_prep_send(sqe, c->fd, w->pipeline_buf, send_len, MSG_NOSIGNAL);
+    io_uring_prep_send(sqe, c->fd, tpl->pipeline_buf, send_len, MSG_NOSIGNAL);
     io_uring_sqe_set_data64(sqe, PACK_UD(UD_SEND, c->gen, conn_idx));
+
+    /* Record send times at SQE-prep time — this is the true start of the
+       round-trip.  Recording later (at SEND_COMPLETE) gives near-zero
+       latency when DEFER_TASKRUN batches SEND and RECV CQEs together. */
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    for (int k = 0; k < count; k++) {
+        c->send_times[c->send_time_tail % PIPELINE_DEPTH_MAX] = now;
+        c->send_time_tail++;
+    }
 
     c->send_inflight = 1;
     c->send_total = send_len;
@@ -65,14 +76,6 @@ static inline void fire_requests(worker_t *w, gc_conn_t *c, int conn_idx, int co
     c->pipeline_inflight += count;
     c->requests_sent += count;
     w->stats.requests += count;
-
-    /* Record send times for latency tracking */
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    for (int i = 0; i < count; i++) {
-        c->send_times[c->send_time_tail % PIPELINE_DEPTH_MAX] = now;
-        c->send_time_tail++;
-    }
 }
 
 static inline uint64_t timespec_diff_us(struct timespec *start, struct timespec *end)
@@ -108,6 +111,7 @@ static void start_connect(worker_t *w, int conn_idx)
     c->fd = fd;
     c->gen++;
     c->state = CONN_CONNECTING;
+    c->tpl_idx = conn_idx % w->num_templates;
     c->pipeline_inflight = 0;
     c->send_inflight = 0;
     c->send_total = 0;
@@ -154,16 +158,15 @@ static void reconnect(worker_t *w, int conn_idx)
 /* ── init ──────────────────────────────────────────────────────────── */
 
 void worker_init(worker_t *w, int id, struct sockaddr_in *addr,
-                 char *pipeline_buf, int request_len, int pipeline_depth,
+                 request_tpl_t *templates, int num_templates, int pipeline_depth,
                  int num_conns, int requests_per_conn, volatile int *running)
 {
     memset(w, 0, sizeof(*w));
     w->id                = id;
     w->server_addr       = *addr;
-    w->pipeline_buf      = pipeline_buf;
-    w->request_len       = request_len;
+    w->templates         = templates;
+    w->num_templates     = num_templates;
     w->pipeline_depth    = pipeline_depth;
-    w->pipeline_len      = pipeline_depth * request_len;
     w->num_conns         = num_conns;
     w->requests_per_conn = requests_per_conn;
     w->running           = running;
@@ -275,14 +278,21 @@ void worker_loop(worker_t *w)
                 c->send_done += res;
                 if (c->send_done < c->send_total) {
                     /* Partial send — resubmit remainder */
+                    request_tpl_t *tpl = &w->templates[c->tpl_idx];
                     int off = c->send_done;
                     struct io_uring_sqe *sqe = sqe_get(&w->ring);
                     io_uring_prep_send(sqe, c->fd,
-                                       w->pipeline_buf + off,
+                                       tpl->pipeline_buf + off,
                                        c->send_total - off, MSG_NOSIGNAL);
                     io_uring_sqe_set_data64(sqe, PACK_UD(UD_SEND, c->gen, conn_idx));
                 } else {
                     c->send_inflight = 0;
+
+                    /* If responses were already processed (RECV before SEND in
+                       batch), the connection would stall because fire_requests
+                       was blocked by send_inflight.  Unstall it now. */
+                    if (c->pipeline_inflight == 0 && c->state == CONN_ACTIVE)
+                        fire_requests(w, c, conn_idx, w->pipeline_depth);
                 }
                 break;
             }
@@ -351,6 +361,7 @@ void worker_loop(worker_t *w)
         }
 
         io_uring_cq_advance(&w->ring, got);
+        io_uring_submit(&w->ring);
     }
 }
 

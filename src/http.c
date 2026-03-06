@@ -22,7 +22,7 @@ int http_build_pipeline(const char *host, int port, const char *path,
             path, host, port);
 
     int total_len = single_len * pipeline_depth;
-    char *buf = malloc(total_len);
+    char *buf = malloc(total_len + 1); /* +1 for snprintf null terminator */
 
     /* Format into the first slot, then replicate */
     if (port == 80 || port == 443)

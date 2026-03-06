@@ -118,6 +118,11 @@ void stats_print(const worker_stats_t *s, double elapsed_sec)
     printf("  Throughput: %s req/s\n", rps_buf);
     printf("  Bandwidth:  %s\n", bw_buf);
 
+    printf("  Latency samples: %lu / %lu responses (%.1f%%)\n",
+           s->latency_count, s->responses,
+           s->responses ? 100.0 * s->latency_count / s->responses : 0.0);
+    if (s->overflow)
+        printf("  Latency overflow (>110ms): %u\n", s->overflow);
     if (s->reconnects)
         printf("  Reconnects: %lu\n", s->reconnects);
     if (s->connect_errors || s->read_errors || s->timeouts) {
