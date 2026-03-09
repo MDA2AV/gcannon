@@ -23,6 +23,11 @@ typedef struct worker_stats {
     uint64_t read_errors;
     uint64_t timeouts;
     uint64_t reconnects;
+    uint64_t status_2xx;
+    uint64_t status_3xx;
+    uint64_t status_4xx;
+    uint64_t status_5xx;
+    uint64_t status_other;
     uint32_t tier1[TIER1_BUCKETS];
     uint32_t tier2[TIER2_BUCKETS];
     uint32_t overflow;

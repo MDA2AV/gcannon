@@ -27,6 +27,11 @@ void stats_merge(worker_stats_t *dst, const worker_stats_t *src)
     dst->read_errors    += src->read_errors;
     dst->timeouts       += src->timeouts;
     dst->reconnects     += src->reconnects;
+    dst->status_2xx     += src->status_2xx;
+    dst->status_3xx     += src->status_3xx;
+    dst->status_4xx     += src->status_4xx;
+    dst->status_5xx     += src->status_5xx;
+    dst->status_other   += src->status_other;
     dst->latency_count  += src->latency_count;
     dst->latency_sum_us += src->latency_sum_us;
     dst->overflow       += src->overflow;
@@ -118,6 +123,17 @@ void stats_print(const worker_stats_t *s, double elapsed_sec)
     printf("  Throughput: %s req/s\n", rps_buf);
     printf("  Bandwidth:  %s\n", bw_buf);
 
+    printf("  Status codes: 2xx=%lu, 3xx=%lu, 4xx=%lu, 5xx=%lu",
+           s->status_2xx, s->status_3xx, s->status_4xx, s->status_5xx);
+    if (s->status_other)
+        printf(", other=%lu", s->status_other);
+    printf("\n");
+
+    printf("  Latency samples: %lu / %lu responses (%.1f%%)\n",
+           s->latency_count, s->responses,
+           s->responses ? 100.0 * s->latency_count / s->responses : 0.0);
+    if (s->overflow)
+        printf("  Latency overflow (>110ms): %u\n", s->overflow);
     if (s->reconnects)
         printf("  Reconnects: %lu\n", s->reconnects);
     if (s->connect_errors || s->read_errors || s->timeouts) {

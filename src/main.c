@@ -20,12 +20,13 @@
 static volatile int g_running = 1;
 
 typedef struct thread_ctx {
-    worker_t   worker;
-    char      *pipeline_buf;
-    int        request_len;
-    int        pipeline_depth;
-    int        num_conns;
-    int        requests_per_conn;
+    worker_t         worker;
+    request_tpl_t   *templates;
+    int              num_templates;
+    int              pipeline_depth;
+    int              num_conns;
+    int              requests_per_conn;
+    int              expected_status;
     struct sockaddr_in addr;
 } thread_ctx_t;
 
@@ -76,14 +77,51 @@ static int parse_duration(const char *s)
     return val;
 }
 
+/* ── raw request file loading ──────────────────────────────────────── */
+
+static char *load_file(const char *path, int *out_len)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "Error: cannot open raw request file '%s'\n", path);
+        return NULL;
+    }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *buf = malloc(sz);
+    if ((long)fread(buf, 1, sz, f) != sz) {
+        fprintf(stderr, "Error: failed to read '%s'\n", path);
+        free(buf);
+        fclose(f);
+        return NULL;
+    }
+    fclose(f);
+    *out_len = (int)sz;
+    return buf;
+}
+
+static int build_pipeline_from_raw(const char *raw, int raw_len,
+                                   int pipeline_depth, request_tpl_t *tpl)
+{
+    tpl->request_len  = raw_len;
+    tpl->pipeline_len = raw_len * pipeline_depth;
+    tpl->pipeline_buf = malloc(tpl->pipeline_len);
+    memcpy(tpl->pipeline_buf, raw, raw_len);
+    for (int i = 1; i < pipeline_depth; i++)
+        memcpy(tpl->pipeline_buf + i * raw_len, raw, raw_len);
+    return 0;
+}
+
 /* ── worker thread entry ───────────────────────────────────────────── */
 
 static void *worker_thread(void *arg)
 {
     thread_ctx_t *ctx = arg;
     worker_init(&ctx->worker, ctx->worker.id, &ctx->addr,
-                ctx->pipeline_buf, ctx->request_len, ctx->pipeline_depth,
-                ctx->num_conns, ctx->requests_per_conn, &g_running);
+                ctx->templates, ctx->num_templates, ctx->pipeline_depth,
+                ctx->num_conns, ctx->requests_per_conn, ctx->expected_status,
+                &g_running);
     worker_loop(&ctx->worker);
     return NULL;
 }
@@ -105,7 +143,9 @@ int main(int argc, char **argv)
     int duration_sec = 10;
     int pipeline_depth = 16;
     int requests_per_conn = 0; /* 0 = keep-alive forever */
+    int expected_status = 200; /* expected HTTP status code */
     const char *url = NULL;
+    const char *raw_files = NULL;
 
     /* Parse CLI args */
     for (int i = 1; i < argc; i++) {
@@ -121,51 +161,121 @@ int main(int argc, char **argv)
             pipeline_depth = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-r") == 0 && i + 1 < argc) {
             requests_per_conn = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
+            expected_status = atoi(argv[++i]);
+        } else if ((strcmp(argv[i], "--raw") == 0 || strcmp(argv[i], "-R") == 0) && i + 1 < argc) {
+            raw_files = argv[++i];
         } else {
             fprintf(stderr, "Usage: gcannon <url> -c <conns> -t <threads> "
-                            "-d <duration> [-p <pipeline>] [-r <req/conn>]\n");
+                            "-d <duration> [-p <pipeline>] [-r <req/conn>] "
+                            "[-s <status>] [-R|--raw file1,file2,...]\n");
             return 1;
         }
     }
 
-    if (!url) {
+    if (!url && !raw_files) {
         fprintf(stderr, "Usage: gcannon <url> -c <conns> -t <threads> "
-                        "-d <duration> [-p <pipeline>] [-r <req/conn>]\n");
+                        "-d <duration> [-p <pipeline>] [-r <req/conn>] "
+                        "[-R|--raw file1,file2,...]\n");
         return 1;
     }
 
     if (pipeline_depth > PIPELINE_DEPTH_MAX)
         pipeline_depth = PIPELINE_DEPTH_MAX;
 
-    /* Parse URL */
-    char host[256], path[1024];
-    int port;
-    if (parse_url(url, host, sizeof(host), &port, path, sizeof(path)) < 0)
-        return 1;
-
-    /* Resolve host */
+    /* Resolve target host */
+    char host[256] = {0}, path[1024] = "/";
+    int port = 80;
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_port   = htons(port);
 
-    if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
-        struct hostent *he = gethostbyname(host);
-        if (!he) {
-            fprintf(stderr, "Error: cannot resolve host '%s'\n", host);
+    if (url) {
+        if (parse_url(url, host, sizeof(host), &port, path, sizeof(path)) < 0)
             return 1;
+        addr.sin_port = htons(port);
+        if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
+            struct hostent *he = gethostbyname(host);
+            if (!he) {
+                fprintf(stderr, "Error: cannot resolve host '%s'\n", host);
+                return 1;
+            }
+            memcpy(&addr.sin_addr, he->h_addr_list[0], he->h_length);
         }
-        memcpy(&addr.sin_addr, he->h_addr_list[0], he->h_length);
     }
 
-    /* Build HTTP pipeline buffer */
-    char *pipeline_buf;
-    int request_len = http_build_pipeline(host, port, path, 1, &pipeline_buf);
-    free(pipeline_buf);
-    /* Build the full pipeline */
-    int pipeline_total_len = http_build_pipeline(host, port, path,
-                                                  pipeline_depth, &pipeline_buf);
-    (void)pipeline_total_len;
+    /* Build request templates */
+    request_tpl_t *templates = NULL;
+    int num_templates = 0;
+
+    if (raw_files) {
+        /* Count commas to get number of files */
+        int count = 1;
+        for (const char *p = raw_files; *p; p++)
+            if (*p == ',') count++;
+
+        templates = calloc(count, sizeof(request_tpl_t));
+
+        /* Parse comma-separated file list */
+        char *files_dup = strdup(raw_files);
+        char *saveptr;
+        char *tok = strtok_r(files_dup, ",", &saveptr);
+        while (tok) {
+            int raw_len;
+            char *raw = load_file(tok, &raw_len);
+            if (!raw) { free(files_dup); return 1; }
+
+            /* If no URL was given, extract host:port from the first raw file's Host header */
+            if (!url && num_templates == 0) {
+                char *host_hdr = strstr(raw, "Host: ");
+                if (!host_hdr) host_hdr = strstr(raw, "host: ");
+                if (host_hdr) {
+                    host_hdr += 6;
+                    char *eol = strstr(host_hdr, "\r\n");
+                    int hlen = eol ? (int)(eol - host_hdr) : (int)strlen(host_hdr);
+                    if (hlen >= (int)sizeof(host)) hlen = sizeof(host) - 1;
+                    memcpy(host, host_hdr, hlen);
+                    host[hlen] = '\0';
+                    /* Parse host:port */
+                    char *colon = strchr(host, ':');
+                    if (colon) {
+                        *colon = '\0';
+                        port = atoi(colon + 1);
+                    }
+                    addr.sin_port = htons(port);
+                    if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
+                        struct hostent *he = gethostbyname(host);
+                        if (!he) {
+                            fprintf(stderr, "Error: cannot resolve host '%s'\n", host);
+                            free(files_dup); return 1;
+                        }
+                        memcpy(&addr.sin_addr, he->h_addr_list[0], he->h_length);
+                    }
+                }
+            }
+
+            build_pipeline_from_raw(raw, raw_len, pipeline_depth, &templates[num_templates]);
+            num_templates++;
+            free(raw);
+            tok = strtok_r(NULL, ",", &saveptr);
+        }
+        free(files_dup);
+    } else {
+        /* Build GET request from URL */
+        templates = calloc(1, sizeof(request_tpl_t));
+        num_templates = 1;
+
+        char *single_buf;
+        int request_len = http_build_pipeline(host, port, path, 1, &single_buf);
+        free(single_buf);
+
+        char *pipeline_buf;
+        http_build_pipeline(host, port, path, pipeline_depth, &pipeline_buf);
+
+        templates[0].pipeline_buf = pipeline_buf;
+        templates[0].request_len  = request_len;
+        templates[0].pipeline_len = request_len * pipeline_depth;
+    }
 
     int conns_per_thread = num_connections / num_threads;
     int extra = num_connections % num_threads;
@@ -180,6 +290,9 @@ int main(int argc, char **argv)
         printf("  Req/conn:  %d\n", requests_per_conn);
     else
         printf("  Req/conn:  unlimited (keep-alive)\n");
+    if (num_templates > 1)
+        printf("  Templates: %d\n", num_templates);
+    printf("  Expected:  %d\n", expected_status);
     printf("  Duration:  %ds\n", duration_sec);
     printf("\n");
 
@@ -191,12 +304,13 @@ int main(int argc, char **argv)
     pthread_t *threads = calloc(num_threads, sizeof(pthread_t));
 
     for (int i = 0; i < num_threads; i++) {
-        ctxs[i].worker.id      = i;
-        ctxs[i].pipeline_buf   = pipeline_buf;
-        ctxs[i].request_len    = request_len;
-        ctxs[i].pipeline_depth = pipeline_depth;
-        ctxs[i].num_conns         = conns_per_thread + (i < extra ? 1 : 0);
+        ctxs[i].worker.id        = i;
+        ctxs[i].templates        = templates;
+        ctxs[i].num_templates    = num_templates;
+        ctxs[i].pipeline_depth   = pipeline_depth;
+        ctxs[i].num_conns        = conns_per_thread + (i < extra ? 1 : 0);
         ctxs[i].requests_per_conn = requests_per_conn;
+        ctxs[i].expected_status   = expected_status;
         ctxs[i].addr              = addr;
         pthread_create(&threads[i], NULL, worker_thread, &ctxs[i]);
     }
@@ -204,17 +318,9 @@ int main(int argc, char **argv)
     /* Warmup — let connections establish */
     nanosleep(&(struct timespec){ .tv_sec = 0, .tv_nsec = 100000000 }, NULL); /* 100ms */
 
-    /* Reset counters after warmup */
-    for (int i = 0; i < num_threads; i++) {
-        worker_stats_t *s = &ctxs[i].worker.stats;
-        __atomic_store_n(&s->requests, 0, __ATOMIC_RELAXED);
-        __atomic_store_n(&s->responses, 0, __ATOMIC_RELAXED);
-        __atomic_store_n(&s->bytes_read, 0, __ATOMIC_RELAXED);
-        __atomic_store_n(&s->connect_errors, 0, __ATOMIC_RELAXED);
-        __atomic_store_n(&s->read_errors, 0, __ATOMIC_RELAXED);
-        __atomic_store_n(&s->timeouts, 0, __ATOMIC_RELAXED);
-        __atomic_store_n(&s->reconnects, 0, __ATOMIC_RELAXED);
-    }
+    /* Reset counters after warmup (including latency histogram) */
+    for (int i = 0; i < num_threads; i++)
+        memset(&ctxs[i].worker.stats, 0, sizeof(worker_stats_t));
 
     struct timespec start_time;
     clock_gettime(CLOCK_MONOTONIC, &start_time);
@@ -246,8 +352,26 @@ int main(int argc, char **argv)
 
     stats_print(&total, elapsed);
 
-    free(pipeline_buf);
+    /* Check for unexpected status codes */
+    uint64_t expected_count = 0;
+    if (expected_status >= 200 && expected_status < 300)      expected_count = total.status_2xx;
+    else if (expected_status >= 300 && expected_status < 400)  expected_count = total.status_3xx;
+    else if (expected_status >= 400 && expected_status < 500)  expected_count = total.status_4xx;
+    else if (expected_status >= 500 && expected_status < 600)  expected_count = total.status_5xx;
+
+    uint64_t unexpected = total.responses - expected_count;
+    int exit_code = 0;
+    if (unexpected > 0 && total.responses > 0) {
+        printf("\n  WARNING: %lu/%lu responses (%.1f%%) had unexpected status (expected %dxx)\n",
+               unexpected, total.responses,
+               100.0 * unexpected / total.responses, expected_status / 100);
+        exit_code = 1;
+    }
+
+    for (int i = 0; i < num_templates; i++)
+        free(templates[i].pipeline_buf);
+    free(templates);
     free(ctxs);
     free(threads);
-    return 0;
+    return exit_code;
 }
