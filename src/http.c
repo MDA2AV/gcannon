@@ -126,6 +126,7 @@ static const uint8_t *parse_headers(http_parser_t *p, const uint8_t *data, int l
 int http_parse_responses(http_parser_t *p, const uint8_t *data, int len)
 {
     int completed = 0;
+    p->completed_count = 0;
     const uint8_t *ptr = data;
     const uint8_t *end = data + len;
 
@@ -147,6 +148,8 @@ int http_parse_responses(http_parser_t *p, const uint8_t *data, int len)
             ptr += consume;
 
             if (p->body_received >= p->content_length) {
+                if (p->completed_count < 256)
+                    p->completed_statuses[p->completed_count++] = p->status_code;
                 completed++;
                 p->state = 0;
                 p->content_length = -1;
@@ -171,6 +174,8 @@ int http_parse_responses(http_parser_t *p, const uint8_t *data, int len)
                                 /* Final chunk — skip optional trailing CRLF */
                                 if (ptr + 1 < end && ptr[0] == '\r' && ptr[1] == '\n')
                                     ptr += 2;
+                                if (p->completed_count < 256)
+                                    p->completed_statuses[p->completed_count++] = p->status_code;
                                 completed++;
                                 p->state = 0;
                                 p->content_length = -1;

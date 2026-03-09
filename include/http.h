@@ -21,6 +21,9 @@ typedef struct http_parser {
     int  chunk_state;     /* 0 = reading size line, 1 = data, 2 = post-chunk CRLF */
     char chunk_line[20];  /* accumulates hex size line across recv boundaries */
     int  chunk_line_len;
+    /* Status codes of completed responses (filled by http_parse_responses) */
+    int  completed_statuses[256];
+    int  completed_count;
 } http_parser_t;
 
 /* Feed data into the parser. Returns number of complete responses found.

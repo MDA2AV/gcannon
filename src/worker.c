@@ -159,7 +159,8 @@ static void reconnect(worker_t *w, int conn_idx)
 
 void worker_init(worker_t *w, int id, struct sockaddr_in *addr,
                  request_tpl_t *templates, int num_templates, int pipeline_depth,
-                 int num_conns, int requests_per_conn, volatile int *running)
+                 int num_conns, int requests_per_conn, int expected_status,
+                 volatile int *running)
 {
     memset(w, 0, sizeof(*w));
     w->id                = id;
@@ -169,6 +170,7 @@ void worker_init(worker_t *w, int id, struct sockaddr_in *addr,
     w->pipeline_depth    = pipeline_depth;
     w->num_conns         = num_conns;
     w->requests_per_conn = requests_per_conn;
+    w->expected_status   = expected_status;
     w->running           = running;
 
     /* io_uring */
@@ -288,11 +290,14 @@ void worker_loop(worker_t *w)
                 } else {
                     c->send_inflight = 0;
 
-                    /* If responses were already processed (RECV before SEND in
-                       batch), the connection would stall because fire_requests
-                       was blocked by send_inflight.  Unstall it now. */
-                    if (c->pipeline_inflight == 0 && c->state == CONN_ACTIVE)
-                        fire_requests(w, c, conn_idx, w->pipeline_depth);
+                    /* Refill pipeline gap — RECV may have arrived before SEND
+                       in the same batch, consuming responses while send_inflight
+                       blocked fire_requests. */
+                    if (c->state == CONN_ACTIVE) {
+                        int to_refill = w->pipeline_depth - c->pipeline_inflight;
+                        if (to_refill > 0)
+                            fire_requests(w, c, conn_idx, to_refill);
+                    }
                 }
                 break;
             }
@@ -327,6 +332,16 @@ void worker_loop(worker_t *w)
                     w->stats.responses++;
                     c->pipeline_inflight--;
                     c->responses_recv++;
+
+                    /* Track status codes */
+                    if (j < c->parser.completed_count) {
+                        int sc = c->parser.completed_statuses[j];
+                        if (sc >= 200 && sc < 300)      w->stats.status_2xx++;
+                        else if (sc >= 300 && sc < 400)  w->stats.status_3xx++;
+                        else if (sc >= 400 && sc < 500)  w->stats.status_4xx++;
+                        else if (sc >= 500 && sc < 600)  w->stats.status_5xx++;
+                        else                             w->stats.status_other++;
+                    }
 
                     if (c->send_time_head < c->send_time_tail) {
                         struct timespec *ts_start =
