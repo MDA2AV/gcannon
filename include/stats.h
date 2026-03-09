@@ -3,14 +3,14 @@
 #include <stdint.h>
 
 /*
- * Two-tier latency histogram (~88KB per worker):
+ * Two-tier latency histogram (~2MB per worker):
  *   Tier 1: 0–9999μs   at 1μs resolution   (10000 buckets)
- *   Tier 2: 10ms–110ms  at 100μs resolution (1000 buckets)
- * Anything > 110ms goes into an overflow counter.
+ *   Tier 2: 10ms–5000ms at 100μs resolution (49900 buckets)
+ * Anything > 5s goes into an overflow counter.
  */
 
 #define TIER1_BUCKETS   10000   /* 0–9999μs, 1μs each */
-#define TIER2_BUCKETS   1000    /* 10000–109999μs, 100μs each */
+#define TIER2_BUCKETS   49900   /* 10000–4999999μs, 100μs each */
 #define TIER1_MAX_US    10000
 #define TIER2_STEP_US   100
 #define TIER2_MAX_US    (TIER1_MAX_US + TIER2_BUCKETS * TIER2_STEP_US)
