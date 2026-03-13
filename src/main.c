@@ -120,7 +120,8 @@ static void *worker_thread(void *arg)
     thread_ctx_t *ctx = arg;
     worker_init(&ctx->worker, ctx->worker.id, &ctx->addr,
                 ctx->templates, ctx->num_templates, ctx->pipeline_depth,
-                ctx->num_conns, ctx->requests_per_conn, ctx->expected_status,
+                ctx->num_conns, ctx->worker.conn_offset,
+                ctx->requests_per_conn, ctx->expected_status,
                 &g_running);
     worker_loop(&ctx->worker);
     return NULL;
@@ -303,8 +304,10 @@ int main(int argc, char **argv)
     thread_ctx_t *ctxs = calloc(num_threads, sizeof(thread_ctx_t));
     pthread_t *threads = calloc(num_threads, sizeof(pthread_t));
 
+    int conn_offset = 0;
     for (int i = 0; i < num_threads; i++) {
         ctxs[i].worker.id        = i;
+        ctxs[i].worker.conn_offset = conn_offset;
         ctxs[i].templates        = templates;
         ctxs[i].num_templates    = num_templates;
         ctxs[i].pipeline_depth   = pipeline_depth;
@@ -312,6 +315,7 @@ int main(int argc, char **argv)
         ctxs[i].requests_per_conn = requests_per_conn;
         ctxs[i].expected_status   = expected_status;
         ctxs[i].addr              = addr;
+        conn_offset += ctxs[i].num_conns;
         pthread_create(&threads[i], NULL, worker_thread, &ctxs[i]);
     }
 
@@ -350,7 +354,7 @@ int main(int argc, char **argv)
         worker_destroy(&ctxs[i].worker);
     }
 
-    stats_print(&total, elapsed);
+    stats_print(&total, elapsed, num_templates);
 
     /* Check for unexpected status codes */
     uint64_t expected_count = 0;

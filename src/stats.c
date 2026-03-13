@@ -36,6 +36,9 @@ void stats_merge(worker_stats_t *dst, const worker_stats_t *src)
     dst->latency_sum_us += src->latency_sum_us;
     dst->overflow       += src->overflow;
 
+    for (int i = 0; i < MAX_TEMPLATES; i++)
+        dst->tpl_responses[i] += src->tpl_responses[i];
+
     for (int i = 0; i < TIER1_BUCKETS; i++)
         dst->tier1[i] += src->tier1[i];
     for (int i = 0; i < TIER2_BUCKETS; i++)
@@ -96,7 +99,7 @@ static void format_bytes(char *buf, size_t sz, double bytes_per_sec)
         snprintf(buf, sz, "%.0fB/s", bytes_per_sec);
 }
 
-void stats_print(const worker_stats_t *s, double elapsed_sec)
+void stats_print(const worker_stats_t *s, double elapsed_sec, int num_templates)
 {
     char p50[32], p90[32], p99[32], p999[32];
     char rps_buf[32], bw_buf[32], avg_buf[32];
@@ -139,5 +142,14 @@ void stats_print(const worker_stats_t *s, double elapsed_sec)
     if (s->connect_errors || s->read_errors || s->timeouts) {
         printf("  Errors: connect %lu, read %lu, timeout %lu\n",
                s->connect_errors, s->read_errors, s->timeouts);
+    }
+
+    if (num_templates > 1) {
+        printf("  Per-template: ");
+        for (int i = 0; i < num_templates; i++) {
+            if (i > 0) printf(",");
+            printf("%lu", s->tpl_responses[i]);
+        }
+        printf("\n");
     }
 }

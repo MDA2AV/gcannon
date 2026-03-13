@@ -111,7 +111,13 @@ static void start_connect(worker_t *w, int conn_idx)
     c->fd = fd;
     c->gen++;
     c->state = CONN_CONNECTING;
-    c->tpl_idx = conn_idx % w->num_templates;
+    if (c->gen == 1) {
+        /* First connect — distribute evenly across templates */
+        c->tpl_idx = (w->conn_offset + conn_idx) % w->num_templates;
+    } else {
+        /* Reconnect — rotate to next template */
+        c->tpl_idx = (c->tpl_idx + 1) % w->num_templates;
+    }
     c->pipeline_inflight = 0;
     c->send_inflight = 0;
     c->send_total = 0;
@@ -159,8 +165,8 @@ static void reconnect(worker_t *w, int conn_idx)
 
 void worker_init(worker_t *w, int id, struct sockaddr_in *addr,
                  request_tpl_t *templates, int num_templates, int pipeline_depth,
-                 int num_conns, int requests_per_conn, int expected_status,
-                 volatile int *running)
+                 int num_conns, int conn_offset, int requests_per_conn,
+                 int expected_status, volatile int *running)
 {
     memset(w, 0, sizeof(*w));
     w->id                = id;
@@ -169,6 +175,7 @@ void worker_init(worker_t *w, int id, struct sockaddr_in *addr,
     w->num_templates     = num_templates;
     w->pipeline_depth    = pipeline_depth;
     w->num_conns         = num_conns;
+    w->conn_offset       = conn_offset;
     w->requests_per_conn = requests_per_conn;
     w->expected_status   = expected_status;
     w->running           = running;
@@ -330,6 +337,7 @@ void worker_loop(worker_t *w)
 
                 for (int j = 0; j < completed; j++) {
                     w->stats.responses++;
+                    w->stats.tpl_responses[c->tpl_idx]++;
                     c->pipeline_inflight--;
                     c->responses_recv++;
 

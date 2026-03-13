@@ -51,6 +51,7 @@ typedef struct worker {
 
     int                       requests_per_conn; /* 0 = keep-alive forever */
     int                       expected_status;   /* expected HTTP status code (0 = any) */
+    int                       conn_offset;       /* global connection index offset for template assignment */
     worker_stats_t            stats;
     volatile int             *running;
     int                       id;
@@ -59,8 +60,8 @@ typedef struct worker {
 /* Initialize worker (must be called from worker thread for SINGLE_ISSUER) */
 void worker_init(worker_t *w, int id, struct sockaddr_in *addr,
                  request_tpl_t *templates, int num_templates, int pipeline_depth,
-                 int num_conns, int requests_per_conn, int expected_status,
-                 volatile int *running);
+                 int num_conns, int conn_offset, int requests_per_conn,
+                 int expected_status, volatile int *running);
 
 /* Main event loop — blocks until *running == 0 */
 void worker_loop(worker_t *w);

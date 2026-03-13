@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include "constants.h"
 
 /*
  * Two-tier latency histogram (~2MB per worker):
@@ -33,9 +34,10 @@ typedef struct worker_stats {
     uint32_t overflow;
     uint64_t latency_count;
     uint64_t latency_sum_us;
+    uint64_t tpl_responses[MAX_TEMPLATES];
 } worker_stats_t;
 
 void stats_record_latency(worker_stats_t *s, uint64_t latency_us);
 void stats_merge(worker_stats_t *dst, const worker_stats_t *src);
 uint64_t stats_percentile(const worker_stats_t *s, double pct);
-void stats_print(const worker_stats_t *s, double elapsed_sec);
+void stats_print(const worker_stats_t *s, double elapsed_sec, int num_templates);

@@ -20,3 +20,4 @@ typedef enum { UD_CONNECT = 1, UD_RECV = 2, UD_SEND = 3, UD_CANCEL = 4 } ud_kind
 #define PIPELINE_DEPTH_MAX    64
 #define MAX_CONNS_PER_WORKER  16384
 #define BUFFER_RING_BGID      1
+#define MAX_TEMPLATES         64

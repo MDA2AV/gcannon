@@ -13,7 +13,7 @@ typedef struct http_parser {
     int  state;           /* 0 = headers, 1 = content-length body, 2 = chunked body */
     int  content_length;
     int  body_received;
-    char header_buf[512];
+    char header_buf[1024];
     int  header_buf_len;
     int  status_code;     /* last parsed status code */
     int  chunked;         /* 1 if Transfer-Encoding: chunked */
