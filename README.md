@@ -1,113 +1,123 @@
 # gcannon
 
-io_uring HTTP load generator. Designed to benchmark HTTP servers with minimal syscall overhead.
+High-performance load generator built on Linux io_uring. Supports HTTP/1.1 and WebSocket.
 
-## Features
-
-- **Single syscall per loop** — `io_uring_submit_and_wait_timeout` submits and harvests in one kernel entry
-- **Zero-copy recv** — provided buffer rings, kernel writes directly into pre-registered memory
-- **Multishot recv** — one SQE arms continuous receive, no re-arming per event
-- **Batch CQE processing** — harvests up to 2048 completions at once
-- **HTTP pipelining** — fire N requests per connection without waiting for responses
-- **Pre-built request buffer** — no per-request formatting, same pointer/length every send
-
-## Building
-
-Requires liburing (`liburing-dev` on Debian/Ubuntu).
+## Install
 
 ```bash
+# Requires liburing-dev
+git clone https://github.com/user/gcannon && cd gcannon
 make
+sudo cp gcannon /usr/local/bin/
 ```
 
-HTTP response parsing uses [picohttpparser](https://github.com/h2o/picohttpparser), included under `external/`.
+## Quick Start
 
-## Usage
+```bash
+# HTTP benchmark
+gcannon http://localhost:8080/ -c 512 -t 8 -d 10s
 
+# HTTP with pipelining
+gcannon http://localhost:8080/ -c 512 -t 8 -d 10s -p 16
+
+# WebSocket echo
+gcannon http://localhost:8080/ws --ws -c 512 -t 8 -d 10s
+
+# Raw request files (multiple templates)
+gcannon http://localhost:8080 --raw get.raw,post.raw -c 256 -t 4 -d 5s
 ```
-gcannon <url> -c <connections> -t <threads> -d <duration> [-p <pipeline>] [-r <req/conn>]
-```
+
+## Options
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `<url>` | required | Target URL (`http://` only) |
 | `-c` | 100 | Total connections |
 | `-t` | 1 | Worker threads |
-| `-d` | 10s | Duration (`10s`, `1m`) |
+| `-d` | 10s | Duration (`5s`, `1m`) |
 | `-p` | 16 | Pipeline depth (max 64) |
-| `-r` | unlimited | Requests per connection before reconnecting |
+| `-r` | unlimited | Requests per connection (reconnects after N) |
+| `-s` | 200 | Expected HTTP status code |
+| `--raw` | | Comma-separated raw request files |
+| `--ws` | | WebSocket echo mode |
+| `--ws-msg` | `hello` | WebSocket message payload |
 
-### Keep-alive mode (default)
+## Modes
 
-Connections stay open for the entire run. Maximum throughput.
+### HTTP (default)
 
-```bash
-gcannon http://127.0.0.1:8080/plaintext -c 512 -t 8 -d 10s -p 16
-```
-
-### Short-lived connections
-
-Each connection sends N requests, then closes and reconnects. Tests the full accept → serve → close cycle.
+Sends pipelined HTTP/1.1 requests. Supports keep-alive and short-lived connections.
 
 ```bash
-gcannon http://127.0.0.1:8080/plaintext -c 256 -t 4 -d 10s -p 1 -r 1000
+# Keep-alive (max throughput)
+gcannon http://localhost:8080/json -c 1024 -t 16 -d 10s -p 16
+
+# Short-lived connections (reconnect after 100 requests)
+gcannon http://localhost:8080/ -c 512 -t 8 -d 10s -r 100
+
+# Multiple request templates (round-robin on reconnect)
+gcannon http://localhost:8080 --raw get.raw,post.raw,upload.raw -c 256 -t 4 -d 5s -r 5
 ```
 
-## Architecture
+### WebSocket
 
-```
-main thread
-├── parse args, resolve host, build HTTP request buffer
-├── spawn N worker threads (100ms warmup, then reset stats)
-├── sleep(duration)
-├── set running=0, join threads
-└── aggregate stats + print
+Upgrades each connection to WebSocket via HTTP/1.1, then sends/receives echo frames.
 
-worker thread [0..N-1]
-├── own io_uring ring (SINGLE_ISSUER | DEFER_TASKRUN)
-├── provided buffer ring for zero-copy recv
-├── manages connections_per_thread connections
-└── event loop: connect → send(pipeline) → recv → count → send(refill) [→ reconnect]
-```
+```bash
+gcannon http://localhost:8080/ws --ws -c 4096 -t 64 -d 5s -p 16
 
-Each worker thread is fully independent — no locks, no cross-thread communication.
-
-Connection identity uses a generation counter in io_uring user-data to detect and ignore stale CQEs from previous connections on the same slot.
-
-## Project Structure
-
-```
-include/
-  constants.h  — UD packing macros (kind/gen/idx), ring/buffer tunables
-  worker.h     — worker thread struct, connection state
-  http.h       — request builder, response parser
-  stats.h      — two-tier latency histogram
-
-src/
-  main.c       — CLI, thread orchestration, stats reporting
-  worker.c     — io_uring event loop (connect/send/recv/reconnect)
-  http.c       — HTTP request builder, response parser (picohttpparser)
-  stats.c      — histogram, percentile computation
-
-external/
-  picohttpparser/  — h2o/picohttpparser
+# Custom message
+gcannon http://localhost:8080/ws --ws-msg '{"type":"ping"}' -c 256 -t 8 -d 5s
 ```
 
 ## Output
 
 ```
 gcannon — io_uring HTTP load generator
-  Target:    127.0.0.1:8080/plaintext
-  Threads:   4
-  Conns:     256 (64/thread)
+  Target:    localhost:8080/json
+  Threads:   8
+  Conns:     512 (64/thread)
   Pipeline:  16
-  Req/conn:  1000
   Duration:  5s
 
   Thread Stats   Avg      p50      p90      p99    p99.9
-    Latency   2.19ms   2.06ms   2.90ms   5.14ms   7.27ms
+    Latency   1.82ms   1.70ms   2.50ms   4.90ms   7.10ms
 
-  9331080 requests in 5.00s, 9188954 responses
-  Throughput: 1.84M req/s
-  Bandwidth:  136.68MB/s
-  Reconnects: 9202
+  4823901 requests in 5.00s, 4823901 responses
+  Throughput: 964.78K req/s
+  Bandwidth:  72.36MB/s
+  Status codes: 2xx=4823901, 3xx=0, 4xx=0, 5xx=0
+  Reconnects: 0
 ```
+
+## How It Works
+
+Each worker thread runs an independent io_uring event loop with zero cross-thread communication.
+
+- **io_uring** with `SINGLE_ISSUER` + `DEFER_TASKRUN` for minimal kernel transitions
+- **Provided buffer rings** for zero-copy recv (kernel writes directly into pre-registered memory)
+- **Multishot recv** (one SQE arms continuous receive per connection)
+- **Batch CQE processing** (up to 2048 completions per loop iteration)
+- **Pre-built request buffers** (no per-request formatting)
+- **Generation counters** in io_uring user-data to detect stale CQEs after reconnection
+
+```
+main thread
+  spawn N workers (100ms warmup, reset stats, run for duration)
+  join, aggregate stats, print
+
+worker thread
+  io_uring ring + provided buffer ring
+  for each connection: connect -> send(pipeline) -> recv -> count -> refill -> [reconnect]
+```
+
+## Building
+
+```bash
+make          # build
+make clean    # clean
+```
+
+Requires Linux 6.1+ (for io_uring features) and `liburing-dev`.
+
+HTTP parsing uses [picohttpparser](https://github.com/h2o/picohttpparser) (vendored in `external/`).
