@@ -35,6 +35,7 @@ typedef struct worker_stats {
     uint64_t latency_count;
     uint64_t latency_sum_us;
     uint64_t tpl_responses[MAX_TEMPLATES];
+    uint64_t tpl_responses_2xx[MAX_TEMPLATES];
 } worker_stats_t;
 
 void stats_record_latency(worker_stats_t *s, uint64_t latency_us);

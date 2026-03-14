@@ -36,8 +36,10 @@ void stats_merge(worker_stats_t *dst, const worker_stats_t *src)
     dst->latency_sum_us += src->latency_sum_us;
     dst->overflow       += src->overflow;
 
-    for (int i = 0; i < MAX_TEMPLATES; i++)
+    for (int i = 0; i < MAX_TEMPLATES; i++) {
         dst->tpl_responses[i] += src->tpl_responses[i];
+        dst->tpl_responses_2xx[i] += src->tpl_responses_2xx[i];
+    }
 
     for (int i = 0; i < TIER1_BUCKETS; i++)
         dst->tier1[i] += src->tier1[i];
@@ -149,6 +151,12 @@ void stats_print(const worker_stats_t *s, double elapsed_sec, int num_templates)
         for (int i = 0; i < num_templates; i++) {
             if (i > 0) printf(",");
             printf("%lu", s->tpl_responses[i]);
+        }
+        printf("\n");
+        printf("  Per-template-ok: ");
+        for (int i = 0; i < num_templates; i++) {
+            if (i > 0) printf(",");
+            printf("%lu", s->tpl_responses_2xx[i]);
         }
         printf("\n");
     }

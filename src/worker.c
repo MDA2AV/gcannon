@@ -344,7 +344,10 @@ void worker_loop(worker_t *w)
                     /* Track status codes */
                     if (j < c->parser.completed_count) {
                         int sc = c->parser.completed_statuses[j];
-                        if (sc >= 200 && sc < 300)      w->stats.status_2xx++;
+                        if (sc >= 200 && sc < 300) {
+                            w->stats.status_2xx++;
+                            w->stats.tpl_responses_2xx[c->tpl_idx]++;
+                        }
                         else if (sc >= 300 && sc < 400)  w->stats.status_3xx++;
                         else if (sc >= 400 && sc < 500)  w->stats.status_4xx++;
                         else if (sc >= 500 && sc < 600)  w->stats.status_5xx++;
