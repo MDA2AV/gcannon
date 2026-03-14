@@ -27,6 +27,12 @@ typedef struct thread_ctx {
     int              num_conns;
     int              requests_per_conn;
     int              expected_status;
+    int              ws_mode;
+    const char      *ws_host;
+    int              ws_port;
+    const char      *ws_path;
+    const uint8_t   *ws_payload;
+    int              ws_payload_len;
     struct sockaddr_in addr;
 } thread_ctx_t;
 
@@ -122,6 +128,8 @@ static void *worker_thread(void *arg)
                 ctx->templates, ctx->num_templates, ctx->pipeline_depth,
                 ctx->num_conns, ctx->worker.conn_offset,
                 ctx->requests_per_conn, ctx->expected_status,
+                ctx->ws_mode, ctx->ws_host, ctx->ws_port, ctx->ws_path,
+                ctx->ws_payload, ctx->ws_payload_len,
                 &g_running);
     worker_loop(&ctx->worker);
     return NULL;
@@ -145,6 +153,8 @@ int main(int argc, char **argv)
     int pipeline_depth = 16;
     int requests_per_conn = 0; /* 0 = keep-alive forever */
     int expected_status = 200; /* expected HTTP status code */
+    int ws_mode = 0;
+    const char *ws_message = "hello";
     const char *url = NULL;
     const char *raw_files = NULL;
 
@@ -166,10 +176,16 @@ int main(int argc, char **argv)
             expected_status = atoi(argv[++i]);
         } else if ((strcmp(argv[i], "--raw") == 0 || strcmp(argv[i], "-R") == 0) && i + 1 < argc) {
             raw_files = argv[++i];
+        } else if (strcmp(argv[i], "--ws") == 0) {
+            ws_mode = 1;
+        } else if (strcmp(argv[i], "--ws-msg") == 0 && i + 1 < argc) {
+            ws_message = argv[++i];
+            ws_mode = 1;
         } else {
             fprintf(stderr, "Usage: gcannon <url> -c <conns> -t <threads> "
                             "-d <duration> [-p <pipeline>] [-r <req/conn>] "
-                            "[-s <status>] [-R|--raw file1,file2,...]\n");
+                            "[-s <status>] [-R|--raw file1,file2,...] "
+                            "[--ws [--ws-msg <message>]]\n");
             return 1;
         }
     }
@@ -281,7 +297,7 @@ int main(int argc, char **argv)
     int conns_per_thread = num_connections / num_threads;
     int extra = num_connections % num_threads;
 
-    printf("gcannon — io_uring HTTP load generator\n");
+    printf("gcannon — io_uring %s load generator\n", ws_mode ? "WebSocket" : "HTTP");
     printf("  Target:    %s:%d%s\n", host, port, path);
     printf("  Threads:   %d\n", num_threads);
     printf("  Conns:     %d (%.0f/thread)\n", num_connections,
@@ -314,6 +330,12 @@ int main(int argc, char **argv)
         ctxs[i].num_conns        = conns_per_thread + (i < extra ? 1 : 0);
         ctxs[i].requests_per_conn = requests_per_conn;
         ctxs[i].expected_status   = expected_status;
+        ctxs[i].ws_mode           = ws_mode;
+        ctxs[i].ws_host           = host;
+        ctxs[i].ws_port           = port;
+        ctxs[i].ws_path           = path;
+        ctxs[i].ws_payload        = (const uint8_t *)ws_message;
+        ctxs[i].ws_payload_len    = strlen(ws_message);
         ctxs[i].addr              = addr;
         conn_offset += ctxs[i].num_conns;
         pthread_create(&threads[i], NULL, worker_thread, &ctxs[i]);

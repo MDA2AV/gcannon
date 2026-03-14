@@ -39,6 +39,17 @@ static inline void arm_recv_multishot(worker_t *w, int conn_idx)
     io_uring_sqe_set_data64(sqe, PACK_UD(UD_RECV, c->gen, conn_idx));
 }
 
+static inline void fire_ws_upgrade(worker_t *w, gc_conn_t *c, int conn_idx)
+{
+    if (c->send_inflight) return;
+    struct io_uring_sqe *sqe = sqe_get(&w->ring);
+    io_uring_prep_send(sqe, c->fd, w->ws_upgrade_buf, w->ws_upgrade_len, MSG_NOSIGNAL);
+    io_uring_sqe_set_data64(sqe, PACK_UD(UD_SEND, c->gen, conn_idx));
+    c->send_inflight = 1;
+    c->send_total = w->ws_upgrade_len;
+    c->send_done  = 0;
+}
+
 static inline void fire_requests(worker_t *w, gc_conn_t *c, int conn_idx, int count)
 {
     if (count <= 0 || c->send_inflight || c->state != CONN_ACTIVE)
@@ -54,15 +65,22 @@ static inline void fire_requests(worker_t *w, gc_conn_t *c, int conn_idx, int co
         if (count > remaining) count = remaining;
     }
 
-    request_tpl_t *tpl = &w->templates[c->tpl_idx];
-    int send_len = count * tpl->request_len;
+    const char *buf;
+    int send_len;
+
+    if (w->ws_mode) {
+        send_len = count * w->ws_frame_len;
+        buf = (const char *)w->ws_frame_buf;
+    } else {
+        request_tpl_t *tpl = &w->templates[c->tpl_idx];
+        buf = tpl->pipeline_buf;
+        send_len = count * tpl->request_len;
+    }
+
     struct io_uring_sqe *sqe = sqe_get(&w->ring);
-    io_uring_prep_send(sqe, c->fd, tpl->pipeline_buf, send_len, MSG_NOSIGNAL);
+    io_uring_prep_send(sqe, c->fd, buf, send_len, MSG_NOSIGNAL);
     io_uring_sqe_set_data64(sqe, PACK_UD(UD_SEND, c->gen, conn_idx));
 
-    /* Record send times at SQE-prep time — this is the true start of the
-       round-trip.  Recording later (at SEND_COMPLETE) gives near-zero
-       latency when DEFER_TASKRUN batches SEND and RECV CQEs together. */
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     for (int k = 0; k < count; k++) {
@@ -127,6 +145,7 @@ static void start_connect(worker_t *w, int conn_idx)
     c->requests_sent = 0;
     c->responses_recv = 0;
     http_parser_reset(&c->parser);
+    ws_parser_reset(&c->ws_parser);
 
     struct io_uring_sqe *sqe = sqe_get(&w->ring);
     io_uring_prep_connect(sqe, fd, (struct sockaddr *)&w->server_addr,
@@ -166,7 +185,10 @@ static void reconnect(worker_t *w, int conn_idx)
 void worker_init(worker_t *w, int id, struct sockaddr_in *addr,
                  request_tpl_t *templates, int num_templates, int pipeline_depth,
                  int num_conns, int conn_offset, int requests_per_conn,
-                 int expected_status, volatile int *running)
+                 int expected_status, int ws_mode,
+                 const char *ws_host, int ws_port, const char *ws_path,
+                 const uint8_t *ws_payload, int ws_payload_len,
+                 volatile int *running)
 {
     memset(w, 0, sizeof(*w));
     w->id                = id;
@@ -178,7 +200,23 @@ void worker_init(worker_t *w, int id, struct sockaddr_in *addr,
     w->conn_offset       = conn_offset;
     w->requests_per_conn = requests_per_conn;
     w->expected_status   = expected_status;
+    w->ws_mode           = ws_mode;
     w->running           = running;
+
+    if (ws_mode && ws_host) {
+        /* Build upgrade request */
+        w->ws_upgrade_buf = malloc(1024);
+        w->ws_upgrade_len = ws_build_upgrade_request(w->ws_upgrade_buf, 1024,
+                                                      ws_host, ws_port, ws_path);
+        /* Build pipelined WS frames: pipeline_depth copies */
+        uint8_t single_frame[256];
+        int frame_len = ws_build_frame(single_frame, ws_payload, ws_payload_len);
+        w->ws_frame_len = frame_len;
+        w->ws_pipeline_len = frame_len * pipeline_depth;
+        w->ws_frame_buf = malloc(w->ws_pipeline_len);
+        for (int i = 0; i < pipeline_depth; i++)
+            memcpy(w->ws_frame_buf + i * frame_len, single_frame, frame_len);
+    }
 
     /* io_uring */
     struct io_uring_params params;
@@ -270,9 +308,14 @@ void worker_loop(worker_t *w)
                     reconnect(w, conn_idx);
                     break;
                 }
-                c->state = CONN_ACTIVE;
                 arm_recv_multishot(w, conn_idx);
-                fire_requests(w, c, conn_idx, w->pipeline_depth);
+                if (w->ws_mode) {
+                    c->state = CONN_WS_UPGRADING;
+                    fire_ws_upgrade(w, c, conn_idx);
+                } else {
+                    c->state = CONN_ACTIVE;
+                    fire_requests(w, c, conn_idx, w->pipeline_depth);
+                }
                 break;
             }
 
@@ -287,11 +330,18 @@ void worker_loop(worker_t *w)
                 c->send_done += res;
                 if (c->send_done < c->send_total) {
                     /* Partial send — resubmit remainder */
-                    request_tpl_t *tpl = &w->templates[c->tpl_idx];
+                    const char *base;
+                    if (c->state == CONN_WS_UPGRADING) {
+                        base = w->ws_upgrade_buf;
+                    } else if (w->ws_mode) {
+                        base = (const char *)w->ws_frame_buf;
+                    } else {
+                        base = w->templates[c->tpl_idx].pipeline_buf;
+                    }
                     int off = c->send_done;
                     struct io_uring_sqe *sqe = sqe_get(&w->ring);
                     io_uring_prep_send(sqe, c->fd,
-                                       tpl->pipeline_buf + off,
+                                       base + off,
                                        c->send_total - off, MSG_NOSIGNAL);
                     io_uring_sqe_set_data64(sqe, PACK_UD(UD_SEND, c->gen, conn_idx));
                 } else {
@@ -328,7 +378,38 @@ void worker_loop(worker_t *w)
                 uint8_t *buf = w->buf_slab + (size_t)bid * RECV_BUF_SIZE;
 
                 w->stats.bytes_read += res;
-                int completed = http_parse_responses(&c->parser, buf, res);
+
+                int completed = 0;
+
+                if (c->state == CONN_WS_UPGRADING) {
+                    /* Parse HTTP upgrade response — look for 101 */
+                    completed = http_parse_responses(&c->parser, buf, res);
+                    if (completed > 0 && c->parser.completed_statuses[0] == 101) {
+                        c->state = CONN_ACTIVE;
+                        w->stats.status_2xx++;
+                        ws_parser_reset(&c->ws_parser);
+                        return_buffer(w, bid);
+                        if (!has_more) arm_recv_multishot(w, conn_idx);
+                        fire_requests(w, c, conn_idx, w->pipeline_depth);
+                        break;
+                    } else if (completed > 0) {
+                        /* Upgrade rejected */
+                        w->stats.status_5xx++;
+                        return_buffer(w, bid);
+                        reconnect(w, conn_idx);
+                        break;
+                    }
+                    /* Incomplete upgrade response — wait for more data */
+                    return_buffer(w, bid);
+                    if (!has_more) arm_recv_multishot(w, conn_idx);
+                    break;
+                }
+
+                if (w->ws_mode) {
+                    completed = ws_parse_frames(&c->ws_parser, buf, res);
+                } else {
+                    completed = http_parse_responses(&c->parser, buf, res);
+                }
 
                 /* Record latencies */
                 struct timespec now;
@@ -341,17 +422,22 @@ void worker_loop(worker_t *w)
                     c->pipeline_inflight--;
                     c->responses_recv++;
 
-                    /* Track status codes */
-                    if (j < c->parser.completed_count) {
-                        int sc = c->parser.completed_statuses[j];
-                        if (sc >= 200 && sc < 300) {
-                            w->stats.status_2xx++;
-                            w->stats.tpl_responses_2xx[c->tpl_idx]++;
+                    if (w->ws_mode) {
+                        w->stats.status_2xx++;
+                        w->stats.tpl_responses_2xx[c->tpl_idx]++;
+                    } else {
+                        /* Track status codes */
+                        if (j < c->parser.completed_count) {
+                            int sc = c->parser.completed_statuses[j];
+                            if (sc >= 200 && sc < 300) {
+                                w->stats.status_2xx++;
+                                w->stats.tpl_responses_2xx[c->tpl_idx]++;
+                            }
+                            else if (sc >= 300 && sc < 400)  w->stats.status_3xx++;
+                            else if (sc >= 400 && sc < 500)  w->stats.status_4xx++;
+                            else if (sc >= 500 && sc < 600)  w->stats.status_5xx++;
+                            else                             w->stats.status_other++;
                         }
-                        else if (sc >= 300 && sc < 400)  w->stats.status_3xx++;
-                        else if (sc >= 400 && sc < 500)  w->stats.status_4xx++;
-                        else if (sc >= 500 && sc < 600)  w->stats.status_5xx++;
-                        else                             w->stats.status_other++;
                     }
 
                     if (c->send_time_head < c->send_time_tail) {

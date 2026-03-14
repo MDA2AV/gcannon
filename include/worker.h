@@ -7,8 +7,9 @@
 #include "constants.h"
 #include "stats.h"
 #include "http.h"
+#include "ws.h"
 
-typedef enum { CONN_CONNECTING, CONN_ACTIVE, CONN_CLOSED } conn_state_t;
+typedef enum { CONN_CONNECTING, CONN_WS_UPGRADING, CONN_ACTIVE, CONN_CLOSED } conn_state_t;
 
 /* Request template — one per raw request file (or the auto-generated GET) */
 typedef struct {
@@ -24,6 +25,7 @@ typedef struct gc_conn {
     int              tpl_idx;        /* which request template this conn uses */
     int              pipeline_inflight;
     http_parser_t    parser;
+    ws_parser_t      ws_parser;
     struct timespec  send_times[PIPELINE_DEPTH_MAX];
     int              send_time_head;
     int              send_time_tail;
@@ -52,6 +54,12 @@ typedef struct worker {
     int                       requests_per_conn; /* 0 = keep-alive forever */
     int                       expected_status;   /* expected HTTP status code (0 = any) */
     int                       conn_offset;       /* global connection index offset for template assignment */
+    int                       ws_mode;           /* 1 = WebSocket echo mode */
+    char                     *ws_upgrade_buf;    /* pre-built upgrade request */
+    int                       ws_upgrade_len;
+    uint8_t                  *ws_frame_buf;      /* pipeline_depth copies of the WS frame */
+    int                       ws_frame_len;      /* single frame length */
+    int                       ws_pipeline_len;   /* total buffer length */
     worker_stats_t            stats;
     volatile int             *running;
     int                       id;
@@ -61,7 +69,10 @@ typedef struct worker {
 void worker_init(worker_t *w, int id, struct sockaddr_in *addr,
                  request_tpl_t *templates, int num_templates, int pipeline_depth,
                  int num_conns, int conn_offset, int requests_per_conn,
-                 int expected_status, volatile int *running);
+                 int expected_status, int ws_mode,
+                 const char *ws_host, int ws_port, const char *ws_path,
+                 const uint8_t *ws_payload, int ws_payload_len,
+                 volatile int *running);
 
 /* Main event loop — blocks until *running == 0 */
 void worker_loop(worker_t *w);

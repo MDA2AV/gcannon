@@ -2,7 +2,7 @@ CC      = gcc
 CFLAGS  = -O2 -Wall -Wextra -march=native -Iinclude -DUSE_PICO -Iexternal/picohttpparser
 LDFLAGS = -luring -lpthread
 
-SRC     = src/main.c src/worker.c src/http.c src/stats.c
+SRC     = src/main.c src/worker.c src/http.c src/ws.c src/stats.c
 OBJ     = $(SRC:.c=.o)
 BIN     = gcannon
 
