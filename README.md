@@ -1,4 +1,4 @@
-# gcannon
+# Glass Cannon
 
 High-performance load generator built on Linux io_uring. Supports HTTP/1.1 and WebSocket.
 
