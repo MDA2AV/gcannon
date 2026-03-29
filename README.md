@@ -2,6 +2,8 @@
 
 High-performance load generator built on Linux io_uring. Supports HTTP/1.1 and WebSocket.
 
+## (Http Arena)[https://www.http-arena.com/] official Http/1.1 load generator
+
 ## Install
 
 ```bash
