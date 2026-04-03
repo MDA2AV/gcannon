@@ -45,6 +45,7 @@ gcannon http://localhost:8080 --raw get.raw,post.raw -c 256 -t 4 -d 5s
 | `--ws-msg` | `hello` | WebSocket message payload |
 | `--tui` | | TUI mode: progress bar, live sparkline, colored results |
 | `-b` | 10 | Histogram buckets in TUI mode (adaptive, max 100) |
+| `--cqe-latency` | | Measure latency at CQE arrival instead of after response parsing |
 
 ## Modes
 
