@@ -1,4 +1,4 @@
 gcannon
-src/*.o
+build/
 *.o
 .idea/

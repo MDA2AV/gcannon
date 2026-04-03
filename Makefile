@@ -2,24 +2,28 @@ CC      = gcc
 CFLAGS  = -O2 -Wall -Wextra -march=native -Iinclude -DUSE_PICO -Iexternal/picohttpparser
 LDFLAGS = -luring -lpthread
 
-SRC     = src/main.c src/worker.c src/http.c src/ws.c src/stats.c src/tui.c
-OBJ     = $(SRC:.c=.o)
-BIN     = gcannon
+BUILDDIR = build
 
-PICO_OBJ = external/picohttpparser/picohttpparser.o
+SRC      = src/main.c src/worker.c src/http.c src/ws.c src/stats.c src/tui.c
+OBJ      = $(patsubst src/%.c,$(BUILDDIR)/%.o,$(SRC))
+PICO_OBJ = $(BUILDDIR)/picohttpparser.o
+BIN      = gcannon
 
 all: $(BIN)
 
 $(BIN): $(OBJ) $(PICO_OBJ)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-src/%.o: src/%.c
+$(BUILDDIR)/%.o: src/%.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-external/picohttpparser/picohttpparser.o: external/picohttpparser/picohttpparser.c
+$(BUILDDIR)/picohttpparser.o: external/picohttpparser/picohttpparser.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) -c -o $@ $<
+
+$(BUILDDIR):
+	mkdir -p $(BUILDDIR)
 
 clean:
-	rm -f $(OBJ) $(PICO_OBJ) $(BIN)
+	rm -rf $(BUILDDIR) $(BIN)
 
 .PHONY: all clean
