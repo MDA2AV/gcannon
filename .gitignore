@@ -1,3 +1,4 @@
 gcannon
 src/*.o
 *.o
+.idea/
