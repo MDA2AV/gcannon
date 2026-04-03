@@ -1,5 +1,7 @@
 # Glass Cannon
 
+[![Discord](https://discordapp.com/api/guilds/1177529388229734410/widget.png?style=shield)](https://discord.com/invite/H84B5ZqDXR)
+
 High-performance load generator built on Linux io_uring. Supports HTTP/1.1 and WebSocket.
 
 ## [Http Arena](https://www.http-arena.com/) official Http/1.1 load generator
