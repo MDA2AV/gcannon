@@ -204,6 +204,7 @@ void worker_init(worker_t *w,
                  const char *ws_path,
                  const uint8_t *ws_payload,
                  const int ws_payload_len,
+                 const int cqe_latency,
                  volatile int *running)
 {
     memset(w, 0, sizeof(*w));
@@ -224,6 +225,7 @@ void worker_init(worker_t *w,
     w->requests_per_conn = requests_per_conn;
     w->expected_status   = expected_status;
     w->ws_mode           = ws_mode;
+    w->cqe_latency       = cqe_latency;
     w->running           = running;
 
     if (ws_mode && ws_host) {
@@ -449,15 +451,19 @@ void worker_loop(worker_t *w)
                     break;
                 }
 
+                /* In CQE latency mode, timestamp before parsing */
+                struct timespec now;
+                if (w->cqe_latency)
+                    clock_gettime(CLOCK_MONOTONIC, &now);
+
                 if (w->ws_mode) {
                     completed = ws_parse_frames(&c->ws_parser, buf, res);
                 } else {
                     completed = http_parse_responses(&c->parser, buf, res);
                 }
 
-                /* Record latencies */
-                struct timespec now;
-                if (completed > 0)
+                /* In default mode, timestamp after parsing */
+                if (!w->cqe_latency && completed > 0)
                     clock_gettime(CLOCK_MONOTONIC, &now);
 
                 for (int j = 0; j < completed; j++) {

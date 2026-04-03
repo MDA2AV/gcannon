@@ -29,6 +29,7 @@ typedef struct thread_ctx {
     int              requests_per_conn;
     int              expected_status;
     int              ws_mode;
+    int              cqe_latency;
     const char      *ws_host;
     int              ws_port;
     const char      *ws_path;
@@ -140,7 +141,7 @@ static void *worker_thread(void *arg)
                 ctx->requests_per_conn, ctx->expected_status,
                 ctx->ws_mode, ctx->ws_host, ctx->ws_port, ctx->ws_path,
                 ctx->ws_payload, ctx->ws_payload_len,
-                &g_running);
+                ctx->cqe_latency, &g_running);
     worker_loop(&ctx->worker);
     return NULL;
 }
@@ -165,6 +166,7 @@ int main(int argc, char **argv)
     int expected_status = 200; /* expected HTTP status code */
     int ws_mode = 0;
     int tui_mode = 0;
+    int cqe_latency = 0;
     int hist_buckets = 0; /* 0 = default (10) */
     const char *ws_message = "hello";
     const char *url = NULL;
@@ -197,11 +199,13 @@ int main(int argc, char **argv)
             tui_mode = 1;
         } else if ((strcmp(argv[i], "--buckets") == 0 || strcmp(argv[i], "-b") == 0) && i + 1 < argc) {
             hist_buckets = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--cqe-latency") == 0) {
+            cqe_latency = 1;
         } else {
             fprintf(stderr, "Usage: gcannon <url> -c <conns> -t <threads> "
                             "-d <duration> [-p <pipeline>] [-r <req/conn>] "
                             "[-s <status>] [-R|--raw file1,file2,...] "
-                            "[--ws [--ws-msg <message>]] [--tui] [-b <buckets>]\n");
+                            "[--ws [--ws-msg <message>]] [--tui] [-b <buckets>] [--cqe-latency]\n");
             return 1;
         }
     }
@@ -353,6 +357,7 @@ int main(int argc, char **argv)
         ctxs[i].requests_per_conn = requests_per_conn;
         ctxs[i].expected_status   = expected_status;
         ctxs[i].ws_mode           = ws_mode;
+        ctxs[i].cqe_latency      = cqe_latency;
         ctxs[i].ws_host           = host;
         ctxs[i].ws_port           = port;
         ctxs[i].ws_path           = path;

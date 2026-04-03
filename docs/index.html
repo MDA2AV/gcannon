@@ -740,6 +740,11 @@
           <td>10</td>
           <td>Number of latency histogram buckets in TUI mode (max 100). Buckets are computed adaptively from the actual data range, not fixed thresholds.</td>
         </tr>
+        <tr>
+          <td>--cqe-latency</td>
+          <td></td>
+          <td>Measure latency at io_uring CQE arrival (when the kernel signals data is ready) instead of after the full HTTP response is parsed. Gives a lower-level "time to first data" measurement that excludes userspace parse time.</td>
+        </tr>
       </tbody>
     </table>
   </div>
