@@ -9,7 +9,7 @@
 #include <netinet/tcp.h>
 #include <fcntl.h>
 
-/* ── helpers ───────────────────────────────────────────────────────── */
+/* io_uring implementation inspired by zerg - https://github.com/MDA2AV/zerg */
 
 static inline struct io_uring_sqe *sqe_get(struct io_uring *ring)
 {
@@ -159,13 +159,6 @@ static void start_connect(worker_t *w, const int conn_idx)
 static void close_conn(worker_t *w, gc_conn_t *c, const int conn_idx)
 {
     if (c->fd >= 0) {
-        /* Cancel multishot recv so io_uring eventually drops its socket
-           reference.  This is fire-and-forget: close() runs before the
-           cancel CQE arrives, but the kernel refcounts the socket
-           internally — it won't be fully destroyed until both close()
-           and the cancel completion have released their references.
-           Stale CQEs from this generation are harmless because
-           start_connect() bumps c->gen before reuse. */
         struct io_uring_sqe *sqe = sqe_get(&w->ring);
         io_uring_prep_cancel64(sqe, PACK_UD(UD_RECV, c->gen, conn_idx), 0);
         io_uring_sqe_set_data64(sqe, PACK_UD(UD_CANCEL, c->gen, conn_idx));
