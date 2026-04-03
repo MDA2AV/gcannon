@@ -11,7 +11,7 @@ void stats_record_latency(worker_stats_t *s, uint64_t latency_us)
     if (latency_us < TIER1_MAX_US) {
         s->tier1[latency_us]++;
     } else if (latency_us < TIER2_MAX_US) {
-        uint32_t idx = (latency_us - TIER1_MAX_US) / TIER2_STEP_US;
+        const uint32_t idx = (latency_us - TIER1_MAX_US) / TIER2_STEP_US;
         s->tier2[idx]++;
     } else {
         s->overflow++;
@@ -51,7 +51,7 @@ uint64_t stats_percentile(const worker_stats_t *s, double pct)
 {
     if (s->latency_count == 0) return 0;
 
-    uint64_t target = (uint64_t)(s->latency_count * pct);
+    const uint64_t target = (uint64_t)(s->latency_count * pct);
     uint64_t cumulative = 0;
 
     for (int i = 0; i < TIER1_BUCKETS; i++) {
@@ -69,7 +69,7 @@ uint64_t stats_percentile(const worker_stats_t *s, double pct)
     return TIER2_MAX_US;
 }
 
-static void format_latency(char *buf, size_t sz, uint64_t us)
+static void format_latency(char *buf, size_t sz, const uint64_t us)
 {
     if (us < 1000)
         snprintf(buf, sz, "%luus", us);
@@ -111,10 +111,10 @@ void stats_print(const worker_stats_t *s, double elapsed_sec, int num_templates)
     format_latency(p99,  sizeof(p99),  stats_percentile(s, 0.99));
     format_latency(p999, sizeof(p999), stats_percentile(s, 0.999));
 
-    uint64_t avg_us = s->latency_count ? s->latency_sum_us / s->latency_count : 0;
+    const uint64_t avg_us = s->latency_count ? s->latency_sum_us / s->latency_count : 0;
     format_latency(avg_buf, sizeof(avg_buf), avg_us);
 
-    double rps = s->responses / elapsed_sec;
+    const double rps = s->responses / elapsed_sec;
     format_count(rps_buf, sizeof(rps_buf), (uint64_t)rps);
     format_bytes(bw_buf, sizeof(bw_buf), s->bytes_read / elapsed_sec);
 

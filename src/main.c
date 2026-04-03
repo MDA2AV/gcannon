@@ -14,6 +14,7 @@
 #include "worker.h"
 #include "http.h"
 #include "stats.h"
+#include "tui.h"
 
 /* ── globals ───────────────────────────────────────────────────────── */
 
@@ -74,8 +75,8 @@ static int parse_url(const char *url, char *host, int host_sz,
 
 static int parse_duration(const char *s)
 {
-    int val = atoi(s);
-    int len = strlen(s);
+    const int val = atoi(s);
+    const int len = strlen(s);
     if (len > 0 && (s[len-1] == 's' || s[len-1] == 'S'))
         return val;
     if (len > 0 && (s[len-1] == 'm' || s[len-1] == 'M'))
@@ -93,9 +94,14 @@ static char *load_file(const char *path, int *out_len)
         return NULL;
     }
     fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
+    const long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
     char *buf = malloc(sz);
+    if (!buf) {
+        fprintf(stderr, "Error: out of memory reading '%s'\n", path);
+        fclose(f);
+        return NULL;
+    }
     if ((long)fread(buf, 1, sz, f) != sz) {
         fprintf(stderr, "Error: failed to read '%s'\n", path);
         free(buf);
@@ -113,6 +119,10 @@ static int build_pipeline_from_raw(const char *raw, int raw_len,
     tpl->request_len  = raw_len;
     tpl->pipeline_len = raw_len * pipeline_depth;
     tpl->pipeline_buf = malloc(tpl->pipeline_len);
+    if (!tpl->pipeline_buf) {
+        fprintf(stderr, "Error: out of memory building pipeline\n");
+        return -1;
+    }
     memcpy(tpl->pipeline_buf, raw, raw_len);
     for (int i = 1; i < pipeline_depth; i++)
         memcpy(tpl->pipeline_buf + i * raw_len, raw, raw_len);
@@ -150,10 +160,12 @@ int main(int argc, char **argv)
     int num_connections = 100;
     int num_threads = 1;
     int duration_sec = 10;
-    int pipeline_depth = 16;
+    int pipeline_depth = 1;
     int requests_per_conn = 0; /* 0 = keep-alive forever */
     int expected_status = 200; /* expected HTTP status code */
     int ws_mode = 0;
+    int tui_mode = 0;
+    int hist_buckets = 0; /* 0 = default (10) */
     const char *ws_message = "hello";
     const char *url = NULL;
     const char *raw_files = NULL;
@@ -181,11 +193,15 @@ int main(int argc, char **argv)
         } else if (strcmp(argv[i], "--ws-msg") == 0 && i + 1 < argc) {
             ws_message = argv[++i];
             ws_mode = 1;
+        } else if (strcmp(argv[i], "--tui") == 0) {
+            tui_mode = 1;
+        } else if ((strcmp(argv[i], "--buckets") == 0 || strcmp(argv[i], "-b") == 0) && i + 1 < argc) {
+            hist_buckets = atoi(argv[++i]);
         } else {
             fprintf(stderr, "Usage: gcannon <url> -c <conns> -t <threads> "
                             "-d <duration> [-p <pipeline>] [-r <req/conn>] "
                             "[-s <status>] [-R|--raw file1,file2,...] "
-                            "[--ws [--ws-msg <message>]]\n");
+                            "[--ws [--ws-msg <message>]] [--tui] [-b <buckets>]\n");
             return 1;
         }
     }
@@ -193,7 +209,7 @@ int main(int argc, char **argv)
     if (!url && !raw_files) {
         fprintf(stderr, "Usage: gcannon <url> -c <conns> -t <threads> "
                         "-d <duration> [-p <pipeline>] [-r <req/conn>] "
-                        "[-R|--raw file1,file2,...]\n");
+                        "[-R|--raw file1,file2,...] [--tui]\n");
         return 1;
     }
 
@@ -203,8 +219,7 @@ int main(int argc, char **argv)
     /* Resolve target host */
     char host[256] = {0}, path[1024] = "/";
     int port = 80;
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
+    struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
 
     if (url) {
@@ -232,9 +247,11 @@ int main(int argc, char **argv)
             if (*p == ',') count++;
 
         templates = calloc(count, sizeof(request_tpl_t));
+        if (!templates) { fprintf(stderr, "Error: out of memory\n"); return 1; }
 
         /* Parse comma-separated file list */
         char *files_dup = strdup(raw_files);
+        if (!files_dup) { fprintf(stderr, "Error: out of memory\n"); return 1; }
         char *saveptr;
         char *tok = strtok_r(files_dup, ",", &saveptr);
         while (tok) {
@@ -280,6 +297,7 @@ int main(int argc, char **argv)
     } else {
         /* Build GET request from URL */
         templates = calloc(1, sizeof(request_tpl_t));
+        if (!templates) { fprintf(stderr, "Error: out of memory\n"); return 1; }
         num_templates = 1;
 
         char *single_buf;
@@ -319,6 +337,10 @@ int main(int argc, char **argv)
     /* Spawn worker threads */
     thread_ctx_t *ctxs = calloc(num_threads, sizeof(thread_ctx_t));
     pthread_t *threads = calloc(num_threads, sizeof(pthread_t));
+    if (!ctxs || !threads) {
+        fprintf(stderr, "Error: out of memory\n");
+        return 1;
+    }
 
     int conn_offset = 0;
     for (int i = 0; i < num_threads; i++) {
@@ -351,11 +373,31 @@ int main(int argc, char **argv)
     struct timespec start_time;
     clock_gettime(CLOCK_MONOTONIC, &start_time);
 
-    /* Wait for duration */
-    struct timespec sleep_ts = { .tv_sec = duration_sec, .tv_nsec = 0 };
-    while (g_running && sleep_ts.tv_sec > 0) {
+    /* Wait for duration (with optional TUI progress bar) */
+    uint64_t prev_responses = 0;
+    int ticks = 0;
+    uint64_t *rps_history = NULL;
+    if (tui_mode) {
+        rps_history = calloc(duration_sec > 0 ? duration_sec : 1, sizeof(uint64_t));
+        tui_progress_init(duration_sec);
+    }
+
+    while (g_running && ticks < duration_sec) {
         nanosleep(&(struct timespec){ .tv_sec = 1, .tv_nsec = 0 }, NULL);
-        sleep_ts.tv_sec--;
+        ticks++;
+
+        if (tui_mode) {
+            uint64_t snap_resp = 0, snap_bytes = 0;
+            for (int i = 0; i < num_threads; i++) {
+                snap_resp  += ctxs[i].worker.stats.responses;
+                snap_bytes += ctxs[i].worker.stats.bytes_read;
+            }
+            rps_history[ticks - 1] = snap_resp - prev_responses;
+            tui_progress_update(ticks, duration_sec,
+                                snap_resp, snap_bytes, prev_responses,
+                                rps_history, ticks);
+            prev_responses = snap_resp;
+        }
     }
     g_running = 0;
 
@@ -369,16 +411,19 @@ int main(int argc, char **argv)
                    + (end_time.tv_nsec - start_time.tv_nsec) / 1e9;
 
     /* Aggregate stats */
-    worker_stats_t total;
-    memset(&total, 0, sizeof(total));
+    worker_stats_t total = {0};
     for (int i = 0; i < num_threads; i++) {
         stats_merge(&total, &ctxs[i].worker.stats);
         worker_destroy(&ctxs[i].worker);
     }
 
-    stats_print(&total, elapsed, num_templates);
+    if (tui_mode) {
+        tui_print_results(&total, elapsed, num_templates, expected_status, hist_buckets);
+    } else {
+        stats_print(&total, elapsed, num_templates);
+    }
 
-    /* Check for unexpected status codes */
+    /* Check for unexpected status codes (exit code) */
     uint64_t expected_count = 0;
     if (expected_status >= 200 && expected_status < 300)      expected_count = total.status_2xx;
     else if (expected_status >= 300 && expected_status < 400)  expected_count = total.status_3xx;
@@ -388,9 +433,10 @@ int main(int argc, char **argv)
     uint64_t unexpected = total.responses - expected_count;
     int exit_code = 0;
     if (unexpected > 0 && total.responses > 0) {
-        printf("\n  WARNING: %lu/%lu responses (%.1f%%) had unexpected status (expected %dxx)\n",
-               unexpected, total.responses,
-               100.0 * unexpected / total.responses, expected_status / 100);
+        if (!tui_mode)
+            printf("\n  WARNING: %lu/%lu responses (%.1f%%) had unexpected status (expected %dxx)\n",
+                   unexpected, total.responses,
+                   100.0 * unexpected / total.responses, expected_status / 100);
         exit_code = 1;
     }
 
@@ -399,5 +445,6 @@ int main(int argc, char **argv)
     free(templates);
     free(ctxs);
     free(threads);
+    free(rps_history);
     return exit_code;
 }

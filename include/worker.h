@@ -66,7 +66,7 @@ typedef struct worker {
 } worker_t;
 
 /* Initialize worker (must be called from worker thread for SINGLE_ISSUER) */
-void worker_init(worker_t *w, int id, struct sockaddr_in *addr,
+void worker_init(worker_t *w, int id, const struct sockaddr_in *addr,
                  request_tpl_t *templates, int num_templates, int pipeline_depth,
                  int num_conns, int conn_offset, int requests_per_conn,
                  int expected_status, int ws_mode,
