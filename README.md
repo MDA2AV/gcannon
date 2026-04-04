@@ -39,7 +39,7 @@ gcannon http://localhost:8080 --raw get.raw,post.raw -c 256 -t 4 -d 5s
 | `-c` | 100 | Total connections |
 | `-t` | 1 | Worker threads |
 | `-d` | 10s | Duration (`5s`, `1m`) |
-| `-p` | 16 | Pipeline depth (max 64) |
+| `-p` | 1 | Pipeline depth (max 64) |
 | `-r` | unlimited | Requests per connection (reconnects after N) |
 | `-s` | 200 | Expected HTTP status code |
 | `--raw` | | Comma-separated raw request files |
@@ -167,7 +167,7 @@ gcannon http://localhost:8080/ --tui -b 5    # 5 buckets for a compact view
 Each worker thread runs an independent io_uring event loop with zero cross-thread communication.
 
 - **io_uring** with `SINGLE_ISSUER` + `DEFER_TASKRUN` for minimal kernel transitions
-- **Provided buffer rings** for zero-copy recv (kernel writes directly into pre-registered memory)
+- **Provided buffer rings** for efficient recv (kernel picks buffers from a pre-registered pool)
 - **Multishot recv** (one SQE arms continuous receive per connection)
 - **Batch CQE processing** (up to 2048 completions per loop iteration)
 - **Pre-built request buffers** (no per-request formatting)

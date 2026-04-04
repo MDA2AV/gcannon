@@ -4,7 +4,7 @@
 #include "constants.h"
 
 /*
- * Two-tier latency histogram (~2MB per worker):
+ * Two-tier latency histogram (~234KB per worker):
  *   Tier 1: 0–9999μs   at 1μs resolution   (10000 buckets)
  *   Tier 2: 10ms–5000ms at 100μs resolution (49900 buckets)
  * Anything > 5s goes into an overflow counter.

@@ -501,7 +501,7 @@
       </div>
       <div class="card" style="font-size:0.92rem">
         <h4>Extreme Throughput</h4>
-        <p>The fastest HTTP load generator available. Built on <code>io_uring</code>'s zero-copy async I/O to maximize requests per second from a single machine.</p>
+        <p>The fastest HTTP load generator available. Built on <code>io_uring</code>'s batched async I/O to maximize requests per second from a single machine.</p>
       </div>
       <div class="card" style="font-size:0.92rem">
         <h4>Accurate Latency</h4>
@@ -802,7 +802,7 @@
       Many benchmarking tools report only averages or sample a fraction of requests. Averages hide tail latency &mdash; your p99 could be 100x your average, and you'd never know. Glass Cannon records <strong>every single response</strong> in a fixed-memory histogram, so percentiles are exact, not estimated.
     </p>
     <p>
-      The two-tier histogram uses ~2MB per worker and requires zero allocations during the benchmark. The sub-10ms tier has 1&mu;s precision, which matters when your server responds in tens of microseconds. And because <code>CLOCK_MONOTONIC</code> reads via vDSO, the timestamping itself adds negligible overhead &mdash; no syscall, no context switch, just a fast register read.
+      The two-tier histogram uses ~234KB per worker and requires zero allocations during the benchmark. The sub-10ms tier has 1&mu;s precision, which matters when your server responds in tens of microseconds. And because <code>CLOCK_MONOTONIC</code> reads via vDSO, the timestamping itself adds negligible overhead &mdash; no syscall, no context switch, just a fast register read.
     </p>
   </div>
 </section>
@@ -815,76 +815,6 @@
     <p class="lead">
       The tool itself must not be the bottleneck. If your load generator maxes out before your server does, you're measuring the wrong thing.
     </p>
-
-    <table class="cmp-table">
-      <thead>
-        <tr>
-          <th>Feature</th>
-          <th>Glass Cannon</th>
-          <th>wrk</th>
-          <th>hey</th>
-          <th>bombardier</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr>
-          <td>I/O model</td>
-          <td><span class="badge yes">io_uring</span></td>
-          <td><span class="badge partial">epoll</span></td>
-          <td><span class="badge partial">goroutines</span></td>
-          <td><span class="badge partial">goroutines</span></td>
-        </tr>
-        <tr>
-          <td>Zero-copy recv</td>
-          <td><span class="badge yes">Yes</span></td>
-          <td><span class="badge no">No</span></td>
-          <td><span class="badge no">No</span></td>
-          <td><span class="badge no">No</span></td>
-        </tr>
-        <tr>
-          <td>Pipelined requests</td>
-          <td><span class="badge yes">Up to 64</span></td>
-          <td><span class="badge no">No</span></td>
-          <td><span class="badge no">No</span></td>
-          <td><span class="badge no">No</span></td>
-        </tr>
-        <tr>
-          <td>Cross-thread sync</td>
-          <td><span class="badge yes">None</span></td>
-          <td><span class="badge partial">Minimal</span></td>
-          <td><span class="badge partial">Channels</span></td>
-          <td><span class="badge partial">Channels</span></td>
-        </tr>
-        <tr>
-          <td>Syscalls per request</td>
-          <td><span class="badge yes">~0 (batched)</span></td>
-          <td><span class="badge partial">2+ per request</span></td>
-          <td><span class="badge partial">2+ per request</span></td>
-          <td><span class="badge partial">2+ per request</span></td>
-        </tr>
-        <tr>
-          <td>Latency histogram</td>
-          <td><span class="badge yes">&mu;s resolution</span></td>
-          <td><span class="badge yes">HdrHistogram</span></td>
-          <td><span class="badge partial">Summary only</span></td>
-          <td><span class="badge yes">HdrHistogram</span></td>
-        </tr>
-        <tr>
-          <td>Memory allocations in hot path</td>
-          <td><span class="badge yes">Zero</span></td>
-          <td><span class="badge partial">Minimal</span></td>
-          <td><span class="badge no">GC pressure</span></td>
-          <td><span class="badge no">GC pressure</span></td>
-        </tr>
-        <tr>
-          <td>WebSocket support</td>
-          <td><span class="badge yes">Yes</span></td>
-          <td><span class="badge no">No</span></td>
-          <td><span class="badge no">No</span></td>
-          <td><span class="badge no">No</span></td>
-        </tr>
-      </tbody>
-    </table>
 
     <h3>Key Advantages</h3>
 
@@ -933,7 +863,7 @@
         <div style="color:var(--text2);margin:12px 0">&lt;── <span style="color:var(--yellow)">Completion Queue</span> ────</div>
         <div style="color:var(--text2)">process completions</div>
         <div style="color:var(--text2);margin-bottom:16px">(no syscall needed)</div>
-        <div style="color:var(--green);margin-top:16px;border-top:1px solid var(--border);padding-top:12px">Zero context switches in steady state</div>
+        <div style="color:var(--green);margin-top:16px;border-top:1px solid var(--border);padding-top:12px">Minimal context switches in steady state</div>
       </div>
       <div style="flex:1;background:var(--bg3);border:1px solid var(--border);border-left:none;border-radius:0 10px 10px 0;padding:24px 28px">
         <div style="color:var(--cyan);font-weight:700;margin-bottom:16px">Linux Kernel</div>
@@ -965,7 +895,7 @@
     <div class="card-grid">
       <div class="card">
         <h4>Provided Buffer Rings</h4>
-        <p>Pre-registered memory that the kernel writes recv data into directly. No copying from kernel space to user space.</p>
+        <p>Pre-registered buffer pool managed by the kernel. Eliminates per-recv buffer allocation and reduces submission overhead.</p>
       </div>
       <div class="card">
         <h4>Multishot Receive</h4>
