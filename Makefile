@@ -4,7 +4,7 @@ LDFLAGS = -luring -lpthread
 
 BUILDDIR = build
 
-SRC      = src/main.c src/worker.c src/http.c src/ws.c src/stats.c src/tui.c
+SRC      = src/main.c src/worker.c src/http.c src/ws.c src/stats.c src/tui.c src/history.c
 OBJ      = $(patsubst src/%.c,$(BUILDDIR)/%.o,$(SRC))
 PICO_OBJ = $(BUILDDIR)/picohttpparser.o
 BIN      = gcannon

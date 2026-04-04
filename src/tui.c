@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 /* ── ANSI escape codes ────────────────────────────────────────── */
 
@@ -315,10 +316,144 @@ static void print_histogram(const worker_stats_t *s, int num_buckets)
     }
 }
 
+/* ── arrow helpers ── */
+
+#define ARROW_UP   "\xe2\x86\x91"   /* ↑ */
+#define ARROW_DOWN "\xe2\x86\x93"   /* ↓ */
+
+static const char *trend_arrow(double prev, double curr, int higher_is_better)
+{
+    if (prev == 0 && curr == 0) return "  ";
+    double rel = prev > 0 ? (curr - prev) / prev : 1.0;
+    if (rel > 0.005) /* curr is higher */
+        return higher_is_better ? GREEN ARROW_UP RST " " : RED ARROW_UP RST " ";
+    if (rel < -0.005) /* curr is lower */
+        return higher_is_better ? RED ARROW_DOWN RST " " : GREEN ARROW_DOWN RST " ";
+    return "  ";
+}
+
+static void print_comparison(const run_record_t *prev, int num_prev,
+                             const run_record_t *current)
+{
+    if (num_prev == 0) return;
+
+    int ncols = num_prev + 1;
+    const run_record_t *last_prev = &prev[num_prev - 1];
+
+    printf("\n");
+    printf("  " BOLD "Run History" RST "\n");
+    printf("\n");
+
+    /* ── top border ── */
+    printf("    " GRAY BOX_TL);
+    printf(H10);
+    for (int i = 0; i < ncols; i++)
+        printf(BOX_TT H10 BOX_H BOX_H);
+    printf(BOX_TR RST "\n");
+
+    /* ── header row 1: labels ── */
+    printf("    " GRAY BOX_V RST "          ");
+    for (int i = 0; i < num_prev; i++)
+        printf(GRAY BOX_V RST DIM "  Run #%-4d " RST, i + 1);
+    printf(GRAY BOX_V RST BOLD "  Current   " RST GRAY BOX_V RST "\n");
+
+    /* ── header row 2: timestamps ── */
+    printf("    " GRAY BOX_V RST "          ");
+    for (int i = 0; i < num_prev; i++) {
+        struct tm tm;
+        time_t t = (time_t)prev[i].timestamp;
+        localtime_r(&t, &tm);
+        char ts[16];
+        strftime(ts, sizeof(ts), "%H:%M:%S", &tm);
+        printf(GRAY BOX_V RST DIM "  %8s  " RST, ts);
+    }
+    {
+        struct tm tm;
+        time_t t = (time_t)current->timestamp;
+        localtime_r(&t, &tm);
+        char ts[16];
+        strftime(ts, sizeof(ts), "%H:%M:%S", &tm);
+        printf(GRAY BOX_V RST "  %8s  " GRAY BOX_V RST "\n", ts);
+    }
+
+    /* ── mid separator ── */
+    printf("    " GRAY BOX_LT);
+    printf(H10);
+    for (int i = 0; i < ncols; i++)
+        printf(BOX_X H10 BOX_H BOX_H);
+    printf(BOX_RT RST "\n");
+
+    /* ── data rows ── */
+    struct {
+        const char *label;
+        int higher_is_better;
+    } rows[] = {
+        { "Req/s", 1 },
+        { "p50",   0 },
+        { "p99",   0 },
+        { "p99.9", 0 },
+        { "BW",    1 },
+    };
+
+    for (int r = 0; r < 5; r++) {
+        char buf[32];
+        printf("    " GRAY BOX_V RST " %-8s ", rows[r].label);
+
+        for (int i = 0; i < num_prev; i++) {
+            const run_record_t *rec = &prev[i];
+            switch (r) {
+            case 0: fmt_count(buf, sizeof(buf), (uint64_t)rec->rps); break;
+            case 1: fmt_latency(buf, sizeof(buf), rec->latency_p50_us); break;
+            case 2: fmt_latency(buf, sizeof(buf), rec->latency_p99_us); break;
+            case 3: fmt_latency(buf, sizeof(buf), rec->latency_p999_us); break;
+            case 4: fmt_bytes(buf, sizeof(buf), rec->bandwidth_bps); break;
+            }
+            printf(GRAY BOX_V RST DIM " %10s " RST, buf);
+        }
+
+        /* current column with arrow */
+        double prev_val = 0, curr_val = 0;
+        switch (r) {
+        case 0:
+            fmt_count(buf, sizeof(buf), (uint64_t)current->rps);
+            prev_val = last_prev->rps; curr_val = current->rps;
+            break;
+        case 1:
+            fmt_latency(buf, sizeof(buf), current->latency_p50_us);
+            prev_val = (double)last_prev->latency_p50_us; curr_val = (double)current->latency_p50_us;
+            break;
+        case 2:
+            fmt_latency(buf, sizeof(buf), current->latency_p99_us);
+            prev_val = (double)last_prev->latency_p99_us; curr_val = (double)current->latency_p99_us;
+            break;
+        case 3:
+            fmt_latency(buf, sizeof(buf), current->latency_p999_us);
+            prev_val = (double)last_prev->latency_p999_us; curr_val = (double)current->latency_p999_us;
+            break;
+        case 4:
+            fmt_bytes(buf, sizeof(buf), current->bandwidth_bps);
+            prev_val = last_prev->bandwidth_bps; curr_val = current->bandwidth_bps;
+            break;
+        }
+
+        const char *arrow = trend_arrow(prev_val, curr_val, rows[r].higher_is_better);
+        printf(GRAY BOX_V RST " %8s %s" GRAY BOX_V RST "\n", buf, arrow);
+    }
+
+    /* ── bottom border ── */
+    printf("    " GRAY BOX_BL);
+    printf(H10);
+    for (int i = 0; i < ncols; i++)
+        printf(BOX_BT H10 BOX_H BOX_H);
+    printf(BOX_BR RST "\n");
+}
+
 /* ── results display ──────────────────────────────────────────── */
 
 void tui_print_results(const worker_stats_t *s, double elapsed_sec,
-                       int num_templates, int expected_status, int hist_buckets)
+                       int num_templates, int expected_status, int hist_buckets,
+                       const run_record_t *prev_runs, int num_prev_runs,
+                       const run_record_t *current_run)
 {
     char avg[32], p50[32], p90[32], p99[32], p999[32];
     char rps[32], bw[32], req[32], resp[32];
@@ -403,6 +538,10 @@ void tui_print_results(const worker_stats_t *s, double elapsed_sec,
     printf("  " BOLD "Latency Distribution" RST "\n");
     printf("\n");
     print_histogram(s, hist_buckets);
+
+    /* ── run history comparison ── */
+    if (num_prev_runs > 0 && current_run)
+        print_comparison(prev_runs, num_prev_runs, current_run);
 
     /* ── extra info ── */
     printf("\n");

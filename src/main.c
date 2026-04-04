@@ -15,6 +15,7 @@
 #include "http.h"
 #include "stats.h"
 #include "tui.h"
+#include "history.h"
 
 /* ── globals ───────────────────────────────────────────────────────── */
 
@@ -422,8 +423,24 @@ int main(int argc, char **argv)
         worker_destroy(&ctxs[i].worker);
     }
 
+    /* Save run history */
+    history_file_t history = {0};
+    run_record_t current_record = {0};
+    history_load(&history);
+
+    int num_prev = history.count;
+    run_record_t prev_runs[HISTORY_MAX_RUNS];
+    memcpy(prev_runs, history.runs, num_prev * sizeof(run_record_t));
+
+    history_build_record(&current_record, &total, elapsed,
+                         host, port, path,
+                         num_connections, num_threads,
+                         pipeline_depth, duration_sec);
+    history_save(&history, &current_record);
+
     if (tui_mode) {
-        tui_print_results(&total, elapsed, num_templates, expected_status, hist_buckets);
+        tui_print_results(&total, elapsed, num_templates, expected_status,
+                          hist_buckets, prev_runs, num_prev, &current_record);
     } else {
         stats_print(&total, elapsed, num_templates);
     }
