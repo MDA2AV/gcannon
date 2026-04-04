@@ -30,6 +30,7 @@ typedef struct thread_ctx {
     int              expected_status;
     int              ws_mode;
     int              cqe_latency;
+    int              per_tpl_latency;
     const char      *ws_host;
     int              ws_port;
     const char      *ws_path;
@@ -141,7 +142,8 @@ static void *worker_thread(void *arg)
                 ctx->requests_per_conn, ctx->expected_status,
                 ctx->ws_mode, ctx->ws_host, ctx->ws_port, ctx->ws_path,
                 ctx->ws_payload, ctx->ws_payload_len,
-                ctx->cqe_latency, &g_running);
+                ctx->cqe_latency, ctx->per_tpl_latency,
+                &g_running);
     worker_loop(&ctx->worker);
     return NULL;
 }
@@ -167,6 +169,7 @@ int main(int argc, char **argv)
     int ws_mode = 0;
     int tui_mode = 0;
     int cqe_latency = 0;
+    int per_tpl_latency = 0;
     int hist_buckets = 0; /* 0 = default (10) */
     const char *ws_message = "hello";
     const char *url = NULL;
@@ -201,6 +204,8 @@ int main(int argc, char **argv)
             hist_buckets = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--cqe-latency") == 0) {
             cqe_latency = 1;
+        } else if (strcmp(argv[i], "--per-tpl-latency") == 0) {
+            per_tpl_latency = 1;
         } else {
             fprintf(stderr, "Usage: gcannon <url> -c <conns> -t <threads> "
                             "-d <duration> [-p <pipeline>] [-r <req/conn>] "
@@ -358,6 +363,7 @@ int main(int argc, char **argv)
         ctxs[i].expected_status   = expected_status;
         ctxs[i].ws_mode           = ws_mode;
         ctxs[i].cqe_latency      = cqe_latency;
+        ctxs[i].per_tpl_latency  = per_tpl_latency;
         ctxs[i].ws_host           = host;
         ctxs[i].ws_port           = port;
         ctxs[i].ws_path           = path;
@@ -372,8 +378,16 @@ int main(int argc, char **argv)
     nanosleep(&(struct timespec){ .tv_sec = 0, .tv_nsec = 100000000 }, NULL); /* 100ms */
 
     /* Reset counters after warmup (including latency histogram) */
-    for (int i = 0; i < num_threads; i++)
+    for (int i = 0; i < num_threads; i++) {
+        latency_hist_t *saved_tpl = ctxs[i].worker.stats.tpl_latency;
+        int saved_n = ctxs[i].worker.stats.num_tpl_latency;
         memset(&ctxs[i].worker.stats, 0, sizeof(worker_stats_t));
+        if (saved_tpl) {
+            memset(saved_tpl, 0, saved_n * sizeof(latency_hist_t));
+            ctxs[i].worker.stats.tpl_latency = saved_tpl;
+            ctxs[i].worker.stats.num_tpl_latency = saved_n;
+        }
+    }
 
     struct timespec start_time;
     clock_gettime(CLOCK_MONOTONIC, &start_time);
@@ -417,6 +431,10 @@ int main(int argc, char **argv)
 
     /* Aggregate stats */
     worker_stats_t total = {0};
+    if (per_tpl_latency && num_templates > 1) {
+        total.tpl_latency = calloc(num_templates, sizeof(latency_hist_t));
+        total.num_tpl_latency = num_templates;
+    }
     for (int i = 0; i < num_threads; i++) {
         stats_merge(&total, &ctxs[i].worker.stats);
         worker_destroy(&ctxs[i].worker);
@@ -445,6 +463,7 @@ int main(int argc, char **argv)
         exit_code = 1;
     }
 
+    free(total.tpl_latency);
     for (int i = 0; i < num_templates; i++)
         free(templates[i].pipeline_buf);
     free(templates);

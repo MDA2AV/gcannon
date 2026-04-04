@@ -16,6 +16,15 @@
 #define TIER2_STEP_US   100
 #define TIER2_MAX_US    (TIER1_MAX_US + TIER2_BUCKETS * TIER2_STEP_US)
 
+/* Per-template latency histogram (same two-tier layout, heap-allocated) */
+typedef struct latency_hist {
+    uint32_t tier1[TIER1_BUCKETS];
+    uint32_t tier2[TIER2_BUCKETS];
+    uint32_t overflow;
+    uint64_t count;
+    uint64_t sum_us;
+} latency_hist_t;
+
 typedef struct worker_stats {
     uint64_t requests;
     uint64_t responses;
@@ -36,9 +45,14 @@ typedef struct worker_stats {
     uint64_t latency_sum_us;
     uint64_t tpl_responses[MAX_TEMPLATES];
     uint64_t tpl_responses_2xx[MAX_TEMPLATES];
+    latency_hist_t *tpl_latency;   /* per-template histograms (NULL if disabled) */
+    int             num_tpl_latency;
 } worker_stats_t;
 
 void stats_record_latency(worker_stats_t *s, uint64_t latency_us);
+void hist_record(latency_hist_t *h, uint64_t latency_us);
+void hist_merge(latency_hist_t *dst, const latency_hist_t *src);
+uint64_t hist_percentile(const latency_hist_t *h, double pct);
 void stats_merge(worker_stats_t *dst, const worker_stats_t *src);
 uint64_t stats_percentile(const worker_stats_t *s, double pct);
 void stats_print(const worker_stats_t *s, double elapsed_sec, int num_templates);

@@ -3,6 +3,50 @@
 #include <stdio.h>
 #include <string.h>
 
+void hist_record(latency_hist_t *h, uint64_t latency_us)
+{
+    h->count++;
+    h->sum_us += latency_us;
+
+    if (latency_us < TIER1_MAX_US)
+        h->tier1[latency_us]++;
+    else if (latency_us < TIER2_MAX_US)
+        h->tier2[(latency_us - TIER1_MAX_US) / TIER2_STEP_US]++;
+    else
+        h->overflow++;
+}
+
+void hist_merge(latency_hist_t *dst, const latency_hist_t *src)
+{
+    dst->count  += src->count;
+    dst->sum_us += src->sum_us;
+    dst->overflow += src->overflow;
+    for (int i = 0; i < TIER1_BUCKETS; i++)
+        dst->tier1[i] += src->tier1[i];
+    for (int i = 0; i < TIER2_BUCKETS; i++)
+        dst->tier2[i] += src->tier2[i];
+}
+
+uint64_t hist_percentile(const latency_hist_t *h, double pct)
+{
+    if (h->count == 0) return 0;
+
+    const uint64_t target = (uint64_t)(h->count * pct);
+    uint64_t cumulative = 0;
+
+    for (int i = 0; i < TIER1_BUCKETS; i++) {
+        cumulative += h->tier1[i];
+        if (cumulative > target)
+            return (uint64_t)i;
+    }
+    for (int i = 0; i < TIER2_BUCKETS; i++) {
+        cumulative += h->tier2[i];
+        if (cumulative > target)
+            return TIER1_MAX_US + (uint64_t)i * TIER2_STEP_US;
+    }
+    return TIER2_MAX_US;
+}
+
 void stats_record_latency(worker_stats_t *s, uint64_t latency_us)
 {
     s->latency_count++;
@@ -45,6 +89,13 @@ void stats_merge(worker_stats_t *dst, const worker_stats_t *src)
         dst->tier1[i] += src->tier1[i];
     for (int i = 0; i < TIER2_BUCKETS; i++)
         dst->tier2[i] += src->tier2[i];
+
+    if (src->tpl_latency && dst->tpl_latency) {
+        int n = dst->num_tpl_latency < src->num_tpl_latency
+                ? dst->num_tpl_latency : src->num_tpl_latency;
+        for (int i = 0; i < n; i++)
+            hist_merge(&dst->tpl_latency[i], &src->tpl_latency[i]);
+    }
 }
 
 uint64_t stats_percentile(const worker_stats_t *s, double pct)
@@ -159,5 +210,24 @@ void stats_print(const worker_stats_t *s, double elapsed_sec, int num_templates)
             printf("%lu", s->tpl_responses_2xx[i]);
         }
         printf("\n");
+    }
+
+    if (s->tpl_latency && num_templates > 1) {
+        printf("\n");
+        printf("  Per-template latency:\n");
+        printf("  %4s  %8s  %8s  %8s  %8s  %8s\n",
+               "Tpl", "Avg", "p50", "p90", "p99", "p99.9");
+        for (int i = 0; i < s->num_tpl_latency && i < num_templates; i++) {
+            const latency_hist_t *h = &s->tpl_latency[i];
+            if (h->count == 0) continue;
+            char a[32], p5[32], p9[32], p99b[32], p999b[32];
+            format_latency(a,    sizeof(a),    h->count ? h->sum_us / h->count : 0);
+            format_latency(p5,   sizeof(p5),   hist_percentile(h, 0.50));
+            format_latency(p9,   sizeof(p9),   hist_percentile(h, 0.90));
+            format_latency(p99b, sizeof(p99b), hist_percentile(h, 0.99));
+            format_latency(p999b,sizeof(p999b),hist_percentile(h, 0.999));
+            printf("    #%-3d %8s  %8s  %8s  %8s  %8s\n",
+                   i, a, p5, p9, p99b, p999b);
+        }
     }
 }

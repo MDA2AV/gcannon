@@ -61,6 +61,7 @@ typedef struct worker {
     int                       ws_frame_len;      /* single frame length */
     int                       ws_pipeline_len;   /* total buffer length */
     int                       cqe_latency;       /* 1 = timestamp at CQE arrival, 0 = after parse */
+    int                       per_tpl_latency;   /* 1 = per-template latency histograms */
     worker_stats_t            stats;
     volatile int             *running;
     int                       id;
@@ -73,7 +74,8 @@ void worker_init(worker_t *w, int id, const struct sockaddr_in *addr,
                  int expected_status, int ws_mode,
                  const char *ws_host, int ws_port, const char *ws_path,
                  const uint8_t *ws_payload, int ws_payload_len,
-                 int cqe_latency, volatile int *running);
+                 int cqe_latency, int per_tpl_latency,
+                 volatile int *running);
 
 /* Main event loop — blocks until *running == 0 */
 void worker_loop(worker_t *w);
