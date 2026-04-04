@@ -198,6 +198,7 @@ void worker_init(worker_t *w,
                  const uint8_t *ws_payload,
                  const int ws_payload_len,
                  const int cqe_latency,
+                 const int per_tpl_latency,
                  volatile int *running)
 {
     memset(w, 0, sizeof(*w));
@@ -219,7 +220,13 @@ void worker_init(worker_t *w,
     w->expected_status   = expected_status;
     w->ws_mode           = ws_mode;
     w->cqe_latency       = cqe_latency;
+    w->per_tpl_latency   = per_tpl_latency;
     w->running           = running;
+
+    if (per_tpl_latency && num_templates > 1) {
+        w->stats.tpl_latency = calloc(num_templates, sizeof(latency_hist_t));
+        w->stats.num_tpl_latency = num_templates;
+    }
 
     if (ws_mode && ws_host) {
         /* Build upgrade request */
@@ -491,6 +498,8 @@ void worker_loop(worker_t *w)
                             &c->send_times[c->send_time_head % PIPELINE_DEPTH_MAX];
                         const uint64_t lat = timespec_diff_us(ts_start, &now);
                         stats_record_latency(&w->stats, lat);
+                        if (w->stats.tpl_latency)
+                            hist_record(&w->stats.tpl_latency[c->tpl_idx], lat);
                         c->send_time_head++;
                     }
                 }
@@ -540,4 +549,5 @@ void worker_destroy(worker_t *w)
     io_uring_queue_exit(&w->ring);
     free(w->buf_slab);
     free(w->conns);
+    free(w->stats.tpl_latency);
 }

@@ -433,6 +433,41 @@ void tui_print_results(const worker_stats_t *s, double elapsed_sec,
         printf(RST "\n");
     }
 
+    /* ── per-template latency ── */
+    if (s->tpl_latency && num_templates > 1) {
+        printf("\n");
+        printf("  " BOLD "Per-Template Latency" RST "\n");
+        printf("\n");
+        printf(LTOP);
+        printf("    " GRAY BOX_V RST BOLD "   Tpl    " RST
+               GRAY BOX_V RST BOLD "   Avg    " RST
+               GRAY BOX_V RST BOLD "   p50    " RST
+               GRAY BOX_V RST BOLD "   p99    " RST
+               GRAY BOX_V RST BOLD "  p99.9   " RST
+               GRAY BOX_V RST "\n");
+        printf(LMID);
+        for (int i = 0; i < s->num_tpl_latency && i < num_templates; i++) {
+            const latency_hist_t *h = &s->tpl_latency[i];
+            if (h->count == 0) continue;
+            char a[32], p5[32], p99b[32], p999b[32];
+            char label[11];
+            snprintf(label, sizeof(label), "#%d", i);
+            fmt_latency(a,     sizeof(a),     h->count ? h->sum_us / h->count : 0);
+            fmt_latency(p5,    sizeof(p5),    hist_percentile(h, 0.50));
+            fmt_latency(p99b,  sizeof(p99b),  hist_percentile(h, 0.99));
+            fmt_latency(p999b, sizeof(p999b), hist_percentile(h, 0.999));
+            printf("    " GRAY BOX_V RST BOLD " %8s " RST
+                   GRAY BOX_V RST CYAN " %8s " RST
+                   GRAY BOX_V RST CYAN " %8s " RST
+                   GRAY BOX_V RST YELLOW " %8s " RST
+                   GRAY BOX_V RST RED " %8s " RST
+                   GRAY BOX_V RST "\n",
+                   label, a, p5, p99b, p999b);
+            if (i < s->num_tpl_latency - 1) printf(LMID);
+        }
+        printf(LBOT);
+    }
+
     /* ── expected status warning ── */
     uint64_t expected_count = 0;
     if (expected_status >= 200 && expected_status < 300)      expected_count = s->status_2xx;
