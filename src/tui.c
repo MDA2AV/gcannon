@@ -316,136 +316,148 @@ static void print_histogram(const worker_stats_t *s, int num_buckets)
     }
 }
 
-/* ── arrow helpers ── */
+/* ── run history bar graphs ── */
 
-#define ARROW_UP   "\xe2\x86\x91"   /* ↑ */
-#define ARROW_DOWN "\xe2\x86\x93"   /* ↓ */
+#define HIST_GRAPH_HEIGHT 10
+#define HIST_BAR_W        5     /* block chars per bar */
+#define HIST_COL_W        6     /* bar + 1 gap */
+#define HIST_MAX_VIS      10    /* max visible runs */
 
-static const char *trend_arrow(double prev, double curr, int higher_is_better)
+static void adaptive_range(const double *vals, int n, double *out_lo, double *out_hi)
 {
-    if (prev == 0 && curr == 0) return "  ";
-    double rel = prev > 0 ? (curr - prev) / prev : 1.0;
-    if (rel > 0.005) /* curr is higher */
-        return higher_is_better ? GREEN ARROW_UP RST " " : RED ARROW_UP RST " ";
-    if (rel < -0.005) /* curr is lower */
-        return higher_is_better ? RED ARROW_DOWN RST " " : GREEN ARROW_DOWN RST " ";
-    return "  ";
+    double lo = vals[0], hi = vals[0];
+    for (int i = 1; i < n; i++) {
+        if (vals[i] < lo) lo = vals[i];
+        if (vals[i] > hi) hi = vals[i];
+    }
+    double span = hi - lo;
+    if (span < hi * 0.05) span = hi * 0.05;
+    double pad = span * 0.15;
+    *out_lo = lo - pad;
+    if (*out_lo < 0) *out_lo = 0;
+    *out_hi = hi + pad;
 }
 
-static void print_comparison(const run_record_t *prev, int num_prev,
-                             const run_record_t *current)
+static void render_graph(const char *title,
+                         const double *vals, const char labels[][16],
+                         int n, const char *bar_color,
+                         const char *axis_top, const char *axis_mid,
+                         const char *axis_bot, double lo, double range)
+{
+    /* compute filled rows per column */
+    int filled[HIST_MAX_VIS];
+    for (int i = 0; i < n; i++) {
+        double frac = (vals[i] - lo) / range;
+        filled[i] = (int)(frac * HIST_GRAPH_HEIGHT + 0.5);
+        if (filled[i] < 1) filled[i] = 1;
+        if (filled[i] > HIST_GRAPH_HEIGHT) filled[i] = HIST_GRAPH_HEIGHT;
+    }
+
+    printf("\n    " BOLD "%s" RST "\n", title);
+
+    /* rows: HIST_GRAPH_HEIGHT+1 (value labels) down to 1 */
+    for (int row = HIST_GRAPH_HEIGHT + 1; row >= 1; row--) {
+        /* Y-axis label */
+        if (row > HIST_GRAPH_HEIGHT)
+            printf("            " GRAY BOX_V RST);
+        else if (row == HIST_GRAPH_HEIGHT)
+            printf("    %7s " GRAY BOX_V RST, axis_top);
+        else if (row == HIST_GRAPH_HEIGHT / 2)
+            printf("    %7s " GRAY BOX_V RST, axis_mid);
+        else
+            printf("            " GRAY BOX_V RST);
+
+        for (int i = 0; i < n; i++) {
+            int is_current = (i == n - 1);
+            const char *color = is_current ? GREEN : bar_color;
+
+            if (row == filled[i] + 1) {
+                /* value label above bar tip */
+                printf("%s%*s" RST " ", color, HIST_BAR_W, labels[i]);
+            } else if (row >= 1 && row <= filled[i]) {
+                /* filled block */
+                printf("%s", color);
+                for (int b = 0; b < HIST_BAR_W; b++) printf(BLOCK);
+                printf(RST " ");
+            } else {
+                /* empty */
+                printf("%*s", HIST_COL_W, "");
+            }
+        }
+        printf("\n");
+    }
+
+    /* bottom axis */
+    printf("    %7s " GRAY BOX_BL, axis_bot);
+    for (int i = 0; i < n * HIST_COL_W; i++) printf(BOX_H);
+    printf(RST "\n");
+}
+
+static void print_history_sparkline(const run_record_t *prev, int num_prev,
+                                    const run_record_t *current)
 {
     if (num_prev == 0) return;
 
-    int ncols = num_prev + 1;
-    const run_record_t *last_prev = &prev[num_prev - 1];
+    int total = num_prev + 1;
+    int start = num_prev > HIST_MAX_VIS - 1
+                ? num_prev - (HIST_MAX_VIS - 1) : 0;
 
     printf("\n");
-    printf("  " BOLD "Run History" RST "\n");
-    printf("\n");
+    printf("  " BOLD "Run History" RST GRAY " (%d runs)" RST "\n", total);
 
-    /* ── top border ── */
-    printf("    " GRAY BOX_TL);
-    printf(H10);
-    for (int i = 0; i < ncols; i++)
-        printf(BOX_TT H10 BOX_H BOX_H);
-    printf(BOX_TR RST "\n");
-
-    /* ── header row 1: labels ── */
-    printf("    " GRAY BOX_V RST "          ");
-    for (int i = 0; i < num_prev; i++)
-        printf(GRAY BOX_V RST DIM "  Run #%-4d " RST, i + 1);
-    printf(GRAY BOX_V RST BOLD "  Current   " RST GRAY BOX_V RST "\n");
-
-    /* ── header row 2: timestamps ── */
-    printf("    " GRAY BOX_V RST "          ");
-    for (int i = 0; i < num_prev; i++) {
-        struct tm tm;
-        time_t t = (time_t)prev[i].timestamp;
-        localtime_r(&t, &tm);
-        char ts[16];
-        strftime(ts, sizeof(ts), "%H:%M:%S", &tm);
-        printf(GRAY BOX_V RST DIM "  %8s  " RST, ts);
-    }
+    /* ── Req/s ── */
     {
-        struct tm tm;
-        time_t t = (time_t)current->timestamp;
-        localtime_r(&t, &tm);
-        char ts[16];
-        strftime(ts, sizeof(ts), "%H:%M:%S", &tm);
-        printf(GRAY BOX_V RST "  %8s  " GRAY BOX_V RST "\n", ts);
+        double vals[HIST_MAX_VIS];
+        char labels[HIST_MAX_VIS][16];
+        int n = 0;
+        for (int i = start; i < num_prev; i++) {
+            vals[n] = prev[i].rps;
+            fmt_count(labels[n], sizeof(labels[n]), (uint64_t)prev[i].rps);
+            n++;
+        }
+        vals[n] = current->rps;
+        fmt_count(labels[n], sizeof(labels[n]), (uint64_t)current->rps);
+        n++;
+
+        double lo, hi;
+        adaptive_range(vals, n, &lo, &hi);
+        double range = hi - lo;
+        if (range == 0) range = 1;
+
+        char top[32], mid[32], bot[32];
+        fmt_count(top, sizeof(top), (uint64_t)hi);
+        fmt_count(mid, sizeof(mid), (uint64_t)((hi + lo) / 2));
+        fmt_count(bot, sizeof(bot), (uint64_t)lo);
+
+        render_graph("Req/s", vals, labels, n, CYAN, top, mid, bot, lo, range);
     }
 
-    /* ── mid separator ── */
-    printf("    " GRAY BOX_LT);
-    printf(H10);
-    for (int i = 0; i < ncols; i++)
-        printf(BOX_X H10 BOX_H BOX_H);
-    printf(BOX_RT RST "\n");
-
-    /* ── data rows ── */
-    struct {
-        const char *label;
-        int higher_is_better;
-    } rows[] = {
-        { "Req/s", 1 },
-        { "p50",   0 },
-        { "p99",   0 },
-        { "p99.9", 0 },
-        { "BW",    1 },
-    };
-
-    for (int r = 0; r < 5; r++) {
-        char buf[32];
-        printf("    " GRAY BOX_V RST " %-8s ", rows[r].label);
-
-        for (int i = 0; i < num_prev; i++) {
-            const run_record_t *rec = &prev[i];
-            switch (r) {
-            case 0: fmt_count(buf, sizeof(buf), (uint64_t)rec->rps); break;
-            case 1: fmt_latency(buf, sizeof(buf), rec->latency_p50_us); break;
-            case 2: fmt_latency(buf, sizeof(buf), rec->latency_p99_us); break;
-            case 3: fmt_latency(buf, sizeof(buf), rec->latency_p999_us); break;
-            case 4: fmt_bytes(buf, sizeof(buf), rec->bandwidth_bps); break;
-            }
-            printf(GRAY BOX_V RST DIM " %10s " RST, buf);
+    /* ── Avg Latency ── */
+    {
+        double vals[HIST_MAX_VIS];
+        char labels[HIST_MAX_VIS][16];
+        int n = 0;
+        for (int i = start; i < num_prev; i++) {
+            vals[n] = (double)prev[i].latency_avg_us;
+            fmt_latency(labels[n], sizeof(labels[n]), prev[i].latency_avg_us);
+            n++;
         }
+        vals[n] = (double)current->latency_avg_us;
+        fmt_latency(labels[n], sizeof(labels[n]), current->latency_avg_us);
+        n++;
 
-        /* current column with arrow */
-        double prev_val = 0, curr_val = 0;
-        switch (r) {
-        case 0:
-            fmt_count(buf, sizeof(buf), (uint64_t)current->rps);
-            prev_val = last_prev->rps; curr_val = current->rps;
-            break;
-        case 1:
-            fmt_latency(buf, sizeof(buf), current->latency_p50_us);
-            prev_val = (double)last_prev->latency_p50_us; curr_val = (double)current->latency_p50_us;
-            break;
-        case 2:
-            fmt_latency(buf, sizeof(buf), current->latency_p99_us);
-            prev_val = (double)last_prev->latency_p99_us; curr_val = (double)current->latency_p99_us;
-            break;
-        case 3:
-            fmt_latency(buf, sizeof(buf), current->latency_p999_us);
-            prev_val = (double)last_prev->latency_p999_us; curr_val = (double)current->latency_p999_us;
-            break;
-        case 4:
-            fmt_bytes(buf, sizeof(buf), current->bandwidth_bps);
-            prev_val = last_prev->bandwidth_bps; curr_val = current->bandwidth_bps;
-            break;
-        }
+        double lo, hi;
+        adaptive_range(vals, n, &lo, &hi);
+        double range = hi - lo;
+        if (range == 0) range = 1;
 
-        const char *arrow = trend_arrow(prev_val, curr_val, rows[r].higher_is_better);
-        printf(GRAY BOX_V RST " %8s %s" GRAY BOX_V RST "\n", buf, arrow);
+        char top[32], mid[32], bot[32];
+        fmt_latency(top, sizeof(top), (uint64_t)hi);
+        fmt_latency(mid, sizeof(mid), (uint64_t)((hi + lo) / 2));
+        fmt_latency(bot, sizeof(bot), (uint64_t)lo);
+
+        render_graph("Avg Latency", vals, labels, n, YELLOW, top, mid, bot, lo, range);
     }
-
-    /* ── bottom border ── */
-    printf("    " GRAY BOX_BL);
-    printf(H10);
-    for (int i = 0; i < ncols; i++)
-        printf(BOX_BT H10 BOX_H BOX_H);
-    printf(BOX_BR RST "\n");
 }
 
 /* ── results display ──────────────────────────────────────────── */
@@ -539,9 +551,9 @@ void tui_print_results(const worker_stats_t *s, double elapsed_sec,
     printf("\n");
     print_histogram(s, hist_buckets);
 
-    /* ── run history comparison ── */
+    /* ── run history sparkline ── */
     if (num_prev_runs > 0 && current_run)
-        print_comparison(prev_runs, num_prev_runs, current_run);
+        print_history_sparkline(prev_runs, num_prev_runs, current_run);
 
     /* ── extra info ── */
     printf("\n");

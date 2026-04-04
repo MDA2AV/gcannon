@@ -48,6 +48,8 @@ gcannon http://localhost:8080 --raw get.raw,post.raw -c 256 -t 4 -d 5s
 | `--tui` | | TUI mode: progress bar, live sparkline, colored results |
 | `-b` | 10 | Histogram buckets in TUI mode (adaptive, max 100) |
 | `--cqe-latency` | | Measure latency at CQE arrival instead of after response parsing |
+| `--per-tpl-latency` | | Per-template latency histograms (with `--raw` and multiple templates) |
+| `--clear-history` | | Clear saved run history and exit |
 
 ## Modes
 
@@ -161,6 +163,44 @@ The histogram adapts to your data — bucket boundaries are computed from the ac
 gcannon http://localhost:8080/ --tui -b 30   # 30 buckets for more detail
 gcannon http://localhost:8080/ --tui -b 5    # 5 buckets for a compact view
 ```
+
+**Run history** — in TUI mode, bar graphs show req/s and avg latency across up to 100 previous runs, stored in `~/.gcannon/history.bin`. The Y-axis adapts to the data range so small differences are visible. Each bar shows its value at the tip:
+
+```
+  Run History (5 runs)
+
+    Req/s
+              │                         3.51M
+      3.52M │                         █████
+            │               3.50M     █████
+      3.49M │     3.48M     █████     █████
+            │     █████     █████     █████
+            │     █████     █████     █████
+      3.46M └────────────────────────────────
+
+    Avg Latency
+            │ 152us
+      154us │ █████
+            │ █████                   148us
+      149us │ █████     147us         █████
+            │ █████     █████         █████
+            │ █████     █████         █████
+      144us └────────────────────────────────
+```
+
+Clear history with `gcannon --clear-history`.
+
+Results are saved after every run (not just TUI mode) so the next `--tui` run always has history.
+
+### Per-Template Latency
+
+When using multiple raw request files, `--per-tpl-latency` tracks latency histograms per template:
+
+```bash
+gcannon http://localhost:8080 --raw get.raw,post.raw --per-tpl-latency -c 256 -t 4 -d 5s
+```
+
+Each template gets its own percentile breakdown (avg, p50, p90, p99, p99.9). Only allocated when the flag is passed — zero overhead otherwise.
 
 ## How It Works
 

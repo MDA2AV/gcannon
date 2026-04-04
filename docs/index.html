@@ -647,6 +647,39 @@
       </div>
     </div>
 
+    <h3>Run History</h3>
+    <p>
+      Results are saved after every run to <code>~/.gcannon/history.bin</code> (up to 100 runs). In TUI mode, bar graphs show req/s and avg latency trends across the last 10 runs. The Y-axis adapts to the data range so small differences are visible, and each bar shows its value at the tip. The current run is highlighted in green. Clear history with <code>--clear-history</code>.
+    </p>
+    <div class="terminal" style="margin-bottom:24px">
+      <div class="terminal-bar"><span class="terminal-title">run history</span></div>
+      <pre style="margin:0;padding:16px;font-size:0.85rem;line-height:1.5">
+  <strong>Run History</strong> <span style="color:#888">(5 runs)</span>
+
+    <strong>Req/s</strong>
+            <span style="color:#888">│</span>                               <span style="color:#0f0">3.51M</span>
+    <span style="color:#888">3.52M │</span>                               <span style="color:#0f0">█████</span>
+            <span style="color:#888">│</span>                 <span style="color:#0ff">3.50M</span>         <span style="color:#0f0">█████</span>
+    <span style="color:#888">3.49M │</span>       <span style="color:#0ff">3.48M</span>     <span style="color:#0ff">█████</span>         <span style="color:#0f0">█████</span>
+            <span style="color:#888">│</span>       <span style="color:#0ff">█████</span>     <span style="color:#0ff">█████</span>         <span style="color:#0f0">█████</span>
+            <span style="color:#888">│</span>       <span style="color:#0ff">█████</span>     <span style="color:#0ff">█████</span>         <span style="color:#0f0">█████</span>
+    <span style="color:#888">3.46M └──────────────────────────────────</span>
+
+    <strong>Avg Latency</strong>
+            <span style="color:#888">│</span> <span style="color:#ff0">152us</span>
+    <span style="color:#888">154us │</span> <span style="color:#ff0">█████</span>
+            <span style="color:#888">│</span> <span style="color:#ff0">█████</span>                         <span style="color:#0f0">148us</span>
+    <span style="color:#888">149us │</span> <span style="color:#ff0">█████</span>     <span style="color:#ff0">147us</span>               <span style="color:#0f0">█████</span>
+            <span style="color:#888">│</span> <span style="color:#ff0">█████</span>     <span style="color:#ff0">█████</span>               <span style="color:#0f0">█████</span>
+            <span style="color:#888">│</span> <span style="color:#ff0">█████</span>     <span style="color:#ff0">█████</span>               <span style="color:#0f0">█████</span>
+    <span style="color:#888">144us └──────────────────────────────────</span></pre>
+    </div>
+
+    <h3>Per-Template Latency</h3>
+    <p>
+      When using multiple <code>--raw</code> request files, pass <code>--per-tpl-latency</code> to track latency histograms per template. Each template gets its own percentile breakdown (avg, p50, p99, p99.9). Zero overhead when not enabled.
+    </p>
+
   </div>
 </section>
 
@@ -744,6 +777,16 @@
           <td>--cqe-latency</td>
           <td></td>
           <td>Measure latency at io_uring CQE arrival (when the kernel signals data is ready) instead of after the full HTTP response is parsed. Gives a lower-level "time to first data" measurement that excludes userspace parse time.</td>
+        </tr>
+        <tr>
+          <td>--per-tpl-latency</td>
+          <td></td>
+          <td>Enable per-template latency histograms when using multiple <code>--raw</code> request files. Each template gets its own percentile breakdown. Only allocates extra memory when enabled.</td>
+        </tr>
+        <tr>
+          <td>--clear-history</td>
+          <td></td>
+          <td>Clear saved run history (<code>~/.gcannon/history.bin</code>) and exit. Does not run a benchmark.</td>
         </tr>
       </tbody>
     </table>

@@ -6,7 +6,7 @@
 
 #define HISTORY_MAGIC     0x47434E48   /* "GCNH" */
 #define HISTORY_VERSION   1
-#define HISTORY_MAX_RUNS  5
+#define HISTORY_MAX_RUNS  100
 
 typedef struct run_record {
     int64_t   timestamp;
@@ -50,6 +50,7 @@ typedef struct history_file {
 
 int  history_load(history_file_t *hf);
 int  history_save(history_file_t *hf, const run_record_t *rec);
+void history_clear(void);
 void history_build_record(run_record_t *rec,
                           const worker_stats_t *stats,
                           double elapsed_sec,

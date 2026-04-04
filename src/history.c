@@ -68,6 +68,12 @@ int history_save(history_file_t *hf, const run_record_t *rec)
     return 0;
 }
 
+void history_clear(void)
+{
+    const char *p = history_path();
+    if (p) remove(p);
+}
+
 void history_build_record(run_record_t *rec,
                           const worker_stats_t *stats,
                           double elapsed_sec,
