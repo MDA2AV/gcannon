@@ -15,7 +15,7 @@ void tui_progress_update(int elapsed_sec, int duration_sec,
                          const uint64_t *rps_history, int rps_count);
 
 /* Print final benchmark results in TUI format (colors, histogram, etc.)
-   hist_buckets controls the number of latency histogram buckets (0 = default 20)
+   hist_buckets controls the number of latency histogram buckets (0 = default 10)
    prev_runs/num_prev_runs: previous run records for comparison table */
 void tui_print_results(const worker_stats_t *s, double elapsed_sec,
                        int num_templates, int expected_status, int hist_buckets,

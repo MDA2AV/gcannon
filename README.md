@@ -164,7 +164,7 @@ gcannon http://localhost:8080/ --tui -b 30   # 30 buckets for more detail
 gcannon http://localhost:8080/ --tui -b 5    # 5 buckets for a compact view
 ```
 
-**Run history** — in TUI mode, bar graphs show req/s and avg latency across up to 100 previous runs, stored in `~/.gcannon/history.bin`. The Y-axis adapts to the data range so small differences are visible. Each bar shows its value at the tip:
+**Run history** — in TUI mode, bar graphs show req/s and avg latency across the last 10 runs (up to 100 stored in `~/.gcannon/history.bin`). The Y-axis adapts to the data range so small differences are visible. Each bar shows its value at the tip:
 
 ```
   Run History (5 runs)
