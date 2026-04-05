@@ -2,6 +2,8 @@
 
 #include <stdint.h>
 
+#define GCANNON_VERSION "0.5.0"
+
 /* ── User-data packing (64-bit: [kind:16][gen:16][conn_idx:32]) ───── */
 
 typedef enum { UD_CONNECT = 1, UD_RECV = 2, UD_SEND = 3, UD_CANCEL = 4 } ud_kind_t;

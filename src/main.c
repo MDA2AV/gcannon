@@ -333,7 +333,17 @@ int main(int argc, char **argv)
     int extra = num_connections % num_threads;
 
     if (!json_mode) {
-        printf("gcannon — io_uring %s load generator\n", ws_mode ? "WebSocket" : "HTTP");
+        printf("gcannon v%s", GCANNON_VERSION);
+        if (ws_mode || tui_mode || cqe_latency || per_tpl_latency) {
+            printf(" [");
+            int first = 1;
+            if (ws_mode)        { printf("WS");             first = 0; }
+            if (tui_mode)       { printf("%sTUI",   first ? "" : ", "); first = 0; }
+            if (cqe_latency)    { printf("%sCQE",   first ? "" : ", "); first = 0; }
+            if (per_tpl_latency){ printf("%sTPL",   first ? "" : ", "); first = 0; }
+            printf("]");
+        }
+        printf("\n");
         printf("  Target:    %s:%d%s\n", host, port, path);
         printf("  Threads:   %d\n", num_threads);
         printf("  Conns:     %d (%.0f/thread)\n", num_connections,

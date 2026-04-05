@@ -254,6 +254,7 @@ void stats_print_json(const worker_stats_t *s, double elapsed_sec,
     const double bw = elapsed_sec > 0 ? (double)s->bytes_read / elapsed_sec : 0;
 
     printf("{\n");
+    printf("  \"version\": \"%s\",\n", GCANNON_VERSION);
     printf("  \"target\": \"%s\",\n", target);
     printf("  \"mode\": \"%s\",\n", ws_mode ? "websocket" : "http");
     printf("  \"connections\": %d,\n", num_connections);

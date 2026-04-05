@@ -131,6 +131,53 @@
     user-select: all;
   }
 
+  .copy-line {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 16px;
+    margin-top: 8px;
+    font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+    font-size: 0.82rem;
+    color: var(--green);
+  }
+
+  .copy-line code {
+    flex: 1;
+    user-select: all;
+    white-space: nowrap;
+    overflow-x: auto;
+  }
+
+  .copy-btn {
+    flex-shrink: 0;
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text2);
+    cursor: pointer;
+    padding: 4px 8px;
+    font-size: 0.78rem;
+    font-family: inherit;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    transition: color 0.15s, border-color 0.15s;
+  }
+
+  .copy-btn:hover {
+    color: var(--text);
+    border-color: var(--text2);
+  }
+
+  .copy-btn.copied {
+    color: var(--green);
+    border-color: var(--green);
+  }
+
   /* ── Sections ── */
 
   section {
@@ -494,10 +541,14 @@
       </div>
       <div class="card" style="grid-column:1/-1;font-size:0.92rem">
         <h4>Install</h4>
-        <div class="install-box" style="margin-top:10px;display:block;width:100%;font-size:0.82rem">
-          <span style="color:var(--text2)"># requires: Linux 6.1+, gcc, liburing-dev 2.5+</span>
-          <br>sudo apt install build-essential liburing-dev
-          <br>git clone https://github.com/MDA2AV/gcannon.git &amp;&amp; cd gcannon &amp;&amp; make
+        <p style="font-size:0.82rem;color:var(--text2);margin-bottom:4px">Requires Linux 6.1+, gcc, liburing-dev 2.5+</p>
+        <div class="copy-line">
+          <code>sudo apt install build-essential liburing-dev</code>
+          <button class="copy-btn" onclick="copyCmd(this)"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg> Copy</button>
+        </div>
+        <div class="copy-line">
+          <code>git clone https://github.com/MDA2AV/gcannon.git &amp;&amp; cd gcannon &amp;&amp; make</code>
+          <button class="copy-btn" onclick="copyCmd(this)"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg> Copy</button>
         </div>
       </div>
       <div class="card" style="font-size:0.92rem">
@@ -1210,6 +1261,20 @@
     </p>
   </div>
 </footer>
+
+<script>
+function copyCmd(btn) {
+  const text = btn.parentElement.querySelector('code').textContent;
+  navigator.clipboard.writeText(text).then(function() {
+    btn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg> Copied';
+    btn.classList.add('copied');
+    setTimeout(function() {
+      btn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg> Copy';
+      btn.classList.remove('copied');
+    }, 2000);
+  });
+}
+</script>
 
 <script>
 (function() {
