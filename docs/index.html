@@ -1021,6 +1021,180 @@
         <p>Each connection has a generation counter packed into io_uring user-data. Stale completions from reconnected sockets are safely ignored.</p>
       </div>
     </div>
+
+    <!-- ── Worker Deep Dive ── -->
+
+    <h3>Worker Initialization</h3>
+    <p>
+      Each worker thread sets up its own isolated environment before entering the event loop. Nothing is shared between workers &mdash; each one is a fully self-contained load generator.
+    </p>
+
+    <div class="latency-steps">
+      <div class="latency-step">
+        <div class="step-num">1</div>
+        <div class="step-text">
+          <h4>Create the io_uring ring</h4>
+          <p>A ring with 4096 submission queue entries is created with <code>IORING_SETUP_SINGLE_ISSUER</code> (only this thread will ever submit) and <code>IORING_SETUP_DEFER_TASKRUN</code> (kernel defers work until the next submission, reducing interrupts). These two flags together eliminate all internal locking in the kernel's io_uring path.</p>
+        </div>
+      </div>
+      <div class="latency-step">
+        <div class="step-num">2</div>
+        <div class="step-text">
+          <h4>Set up the provided buffer ring</h4>
+          <p>4096 receive buffers (4KB each, ~16MB total) are pre-registered with the kernel via <code>io_uring_setup_buf_ring()</code>. When a recv completion fires, the kernel picks a buffer from this pool automatically &mdash; no userspace allocation or buffer address needed in the submission. After processing, the buffer is returned to the ring for reuse.</p>
+        </div>
+      </div>
+      <div class="latency-step">
+        <div class="step-num">3</div>
+        <div class="step-text">
+          <h4>Allocate connections and connect</h4>
+          <p>An array of <code>gc_conn_t</code> structs is allocated &mdash; one per connection assigned to this worker. Each connection gets a non-blocking TCP socket with <code>TCP_NODELAY</code>, and an <code>io_uring_prep_connect()</code> is submitted for each. All connects happen in parallel via the ring.</p>
+        </div>
+      </div>
+    </div>
+
+    <h3>The Event Loop</h3>
+    <p>
+      The core of Glass Cannon is a tight loop that processes io_uring completions in batches. Each iteration drains up to 2048 completions, processes them, then submits new operations &mdash; all in a single kernel transition.
+    </p>
+
+    <div class="diagram"><span class="hl">worker_loop()</span>
+  <span class="d">│</span>
+  <span class="d">│</span>  <span class="g">io_uring_peek_batch_cqe()</span>         <span class="d">── drain up to 2048 completions</span>
+  <span class="d">│</span>  <span class="d">│</span>
+  <span class="d">│</span>  <span class="d">├──</span> <span class="y">no completions?</span>
+  <span class="d">│</span>  <span class="d">│</span>     <span class="g">io_uring_submit_and_wait_timeout()</span>   <span class="d">── submit pending, wait 1ms</span>
+  <span class="d">│</span>  <span class="d">│</span>
+  <span class="d">│</span>  <span class="d">└──</span> <span class="y">for each CQE:</span>
+  <span class="d">│</span>       <span class="d">│</span>
+  <span class="d">│</span>       <span class="d">├──</span> unpack user_data <span class="d">→</span> <span class="hl">kind</span>, <span class="hl">gen</span>, <span class="hl">conn_idx</span>
+  <span class="d">│</span>       <span class="d">├──</span> <span class="y">stale gen?</span> <span class="d">→ skip (return buffer if recv)</span>
+  <span class="d">│</span>       <span class="d">│</span>
+  <span class="d">│</span>       <span class="d">├──</span> <span class="hl">UD_CONNECT</span>  <span class="d">→ arm multishot recv → fire requests</span>
+  <span class="d">│</span>       <span class="d">├──</span> <span class="hl">UD_SEND</span>     <span class="d">→ partial? resubmit remainder : refill pipeline</span>
+  <span class="d">│</span>       <span class="d">├──</span> <span class="hl">UD_RECV</span>     <span class="d">→ parse response(s) → record latency → refill</span>
+  <span class="d">│</span>       <span class="d">└──</span> <span class="hl">UD_CANCEL</span>   <span class="d">→ no-op (cleanup from reconnect)</span>
+  <span class="d">│</span>
+  <span class="d">│</span>  <span class="g">io_uring_cq_advance()</span>              <span class="d">── mark CQEs as consumed</span>
+  <span class="d">│</span>  <span class="g">io_uring_submit()</span>                  <span class="d">── flush all new SQEs to kernel</span>
+  <span class="d">│</span>
+  <span class="d">└──</span> <span class="y">loop until g_running == 0</span></div>
+
+    <h3>User-Data Packing</h3>
+    <p>
+      Every io_uring submission carries a 64-bit user-data value that comes back with the completion. Glass Cannon packs three fields into this value to identify what each completion means:
+    </p>
+
+    <div class="diagram"><span class="hl">64-bit user_data layout</span>
+
+  <span class="d">┌──────────────┬──────────────┬──────────────────────────────┐</span>
+  <span class="d">│</span>  <span class="hl">kind</span> <span class="d">(16b)</span>  <span class="d">│</span>   <span class="hl">gen</span> <span class="d">(16b)</span>  <span class="d">│</span>       <span class="hl">conn_idx</span> <span class="d">(32b)</span>          <span class="d">│</span>
+  <span class="d">└──────────────┴──────────────┴──────────────────────────────┘</span>
+
+  <span class="hl">kind</span>      <span class="d">─ operation type: CONNECT(1), RECV(2), SEND(3), CANCEL(4)</span>
+  <span class="hl">gen</span>       <span class="d">─ 16-bit generation counter, incremented on each reconnect</span>
+  <span class="hl">conn_idx</span>  <span class="d">─ index into the worker's connection array</span></div>
+
+    <p>
+      The generation counter solves a critical race: when a connection is closed and a new socket is opened on the same index, completions from the old socket may still arrive. The worker compares <code>cqe_gen != c-&gt;gen</code> and silently discards stale completions. This avoids use-after-free bugs without any locking.
+    </p>
+
+    <h3>Connection Lifecycle</h3>
+    <p>
+      Each connection follows a state machine driven entirely by io_uring completions. No threads block, no callbacks are registered &mdash; just CQEs moving state forward.
+    </p>
+
+    <div class="diagram"><span class="hl">HTTP connection</span>
+
+  <span class="y">CONNECTING</span>  <span class="d">──── connect() CQE ────→</span>  <span class="g">ACTIVE</span>
+       <span class="d">│</span>                                   <span class="d">│</span>
+       <span class="d">│</span>   <span class="d">arm_recv_multishot()</span>             <span class="d">│</span>  <span class="d">fire_requests(pipeline_depth)</span>
+       <span class="d">│</span>                                   <span class="d">│</span>
+       <span class="d">│</span>                              <span class="d">┌────┴────┐</span>
+       <span class="d">│</span>                              <span class="d">│</span>  <span class="g">SEND</span>   <span class="d">│──→ partial? resubmit remainder</span>
+       <span class="d">│</span>                              <span class="d">│</span>  <span class="g">RECV</span>   <span class="d">│──→ parse response(s)</span>
+       <span class="d">│</span>                              <span class="d">│</span>         <span class="d">│       record latency</span>
+       <span class="d">│</span>                              <span class="d">│</span>         <span class="d">│       fire_requests(completed)</span>
+       <span class="d">│</span>                              <span class="d">└────┬────┘</span>
+       <span class="d">│</span>                                   <span class="d">│</span>
+       <span class="d">│</span>               <span class="y">quota reached?</span> <span class="d">─────┘</span>
+       <span class="d">│</span>                                   <span class="d">│</span>
+  <span class="y">CLOSED</span> <span class="d">←── close + cancel recv ───</span>  <span class="y">reconnect()</span> <span class="d">──→ gen++ → CONNECTING</span>
+
+
+<span class="hl">WebSocket connection</span>
+
+  <span class="y">CONNECTING</span>  <span class="d">── connect() CQE ──→</span>  <span class="y">WS_UPGRADING</span>
+                                       <span class="d">│</span>
+                                       <span class="d">│  fire_ws_upgrade()</span>
+                                       <span class="d">│  RECV: parse HTTP 101</span>
+                                       <span class="d">│</span>
+                                  <span class="g">ACTIVE</span>
+                                       <span class="d">│  fire_requests() sends masked WS frames</span>
+                                       <span class="d">│  RECV: ws_parse_frames() counts echoes</span>
+                                       <span class="d">│  same latency tracking as HTTP</span></div>
+
+    <h3>How Recv Works: Multishot + Provided Buffers</h3>
+    <p>
+      Traditional recv requires submitting a new SQE for every chunk of data you want to read, and you must tell the kernel which buffer to write into. Glass Cannon uses two io_uring features to eliminate both costs:
+    </p>
+
+    <div class="card-grid">
+      <div class="card">
+        <h4>Multishot Recv</h4>
+        <p>A single <code>io_uring_prep_recv_multishot()</code> call arms continuous receive on a socket. The kernel fires a CQE for each chunk of data that arrives, without the application resubmitting. The <code>IORING_CQE_F_MORE</code> flag on each CQE indicates whether the multishot is still armed. Only when it's not (socket closed, error, or buffer exhaustion) does the application need to rearm.</p>
+      </div>
+      <div class="card">
+        <h4>Provided Buffers</h4>
+        <p>Instead of specifying a buffer address in each recv SQE, the application registers a pool of buffers with the kernel upfront. The kernel picks a free buffer from the pool when data arrives and reports which one it chose via the <code>IORING_CQE_F_BUFFER</code> flag and buffer ID in the CQE. After processing, the application returns the buffer to the pool. No allocation, no copying.</p>
+      </div>
+    </div>
+
+    <p>
+      Combined, these mean a single SQE handles <strong>all future data</strong> on a connection, with zero-copy buffer management. The application only touches buffers when it has data to parse.
+    </p>
+
+    <h3>Pipeline Refill</h3>
+    <p>
+      Glass Cannon keeps the pipeline full at all times. When responses arrive, it immediately sends new requests to replace them:
+    </p>
+
+    <div class="diagram"><span class="hl">pipeline_depth = 4</span>
+
+  <span class="g">fire_requests(4)</span>          <span class="d">── initial fill: send 4 pipelined requests</span>
+  <span class="d">│</span>
+  <span class="d">│  pipeline_inflight = 4</span>
+  <span class="d">│</span>
+  <span class="y">RECV: 2 responses parsed</span>   <span class="d">── pipeline_inflight drops to 2</span>
+  <span class="d">│</span>
+  <span class="g">fire_requests(2)</span>          <span class="d">── refill: send 2 more to restore depth</span>
+  <span class="d">│</span>
+  <span class="d">│  pipeline_inflight = 4</span>   <span class="d">── always at target depth</span></div>
+
+    <p>
+      All requests in a pipeline batch are pre-built and concatenated at startup into a single buffer. Sending N pipelined requests is one <code>io_uring_prep_send()</code> call &mdash; no per-request formatting or allocation. If the kernel can't send the full buffer in one shot (partial send), the worker resubmits the remainder automatically.
+    </p>
+
+    <h3>Batch Processing</h3>
+    <p>
+      The key to Glass Cannon's throughput is <strong>batching at every level</strong>. Instead of processing one event at a time:
+    </p>
+
+    <div class="card-grid">
+      <div class="card">
+        <h4>CQE Batching</h4>
+        <p><code>io_uring_peek_batch_cqe()</code> drains up to 2048 completions in one call. All are processed before any new submissions, amortizing the cost of the kernel transition across thousands of operations.</p>
+      </div>
+      <div class="card">
+        <h4>SQE Batching</h4>
+        <p>New operations (sends, recv rearms, connects) are queued as SQEs during CQE processing, then flushed to the kernel in a single <code>io_uring_submit()</code> at the end of each batch. One syscall for potentially thousands of new operations.</p>
+      </div>
+      <div class="card">
+        <h4>Pipeline Batching</h4>
+        <p>N HTTP requests are concatenated and sent in a single send operation. The response parser handles multiple responses per recv buffer, matching them to pipelined requests in FIFO order.</p>
+      </div>
+    </div>
+
   </div>
 </section>
 
