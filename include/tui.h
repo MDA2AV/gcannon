@@ -20,4 +20,4 @@ void tui_progress_update(int elapsed_sec, int duration_sec,
 void tui_print_results(const worker_stats_t *s, double elapsed_sec,
                        int num_templates, int expected_status, int hist_buckets,
                        const run_record_t *prev_runs, int num_prev_runs,
-                       const run_record_t *current_run);
+                       const run_record_t *current_run, int ws_mode);

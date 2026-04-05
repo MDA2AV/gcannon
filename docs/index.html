@@ -469,6 +469,7 @@
   <div class="container">
     <div class="links">
       <a href="#tui">TUI Mode</a>
+      <a href="#json">JSON Mode</a>
       <a href="#commands">Commands</a>
       <a href="#latency">Latency</a>
       <a href="#performance">Performance</a>
@@ -683,6 +684,68 @@
   </div>
 </section>
 
+<!-- ════════════ JSON MODE ════════════ -->
+
+<section id="json">
+  <div class="container">
+    <h2><span>JSON</span> Mode</h2>
+    <p class="lead">
+      Machine-readable output for scripts, CI pipelines, and dashboards. Pass <code>--json</code> to get a single JSON object on stdout with no banner or progress output.
+    </p>
+
+    <div class="terminal">
+      <div class="terminal-bar">
+        <span class="terminal-title">json output</span>
+        <div class="terminal-btns"><div class="terminal-btn">&#8722;</div><div class="terminal-btn">&#9633;</div><div class="terminal-btn">&#10005;</div></div>
+      </div>
+      <div class="terminal-body"><span class="t-dim">$</span> <span class="t-green">gcannon</span> http://localhost:8080/ -c 512 -t 8 -d 10s <span class="t-cyan">--json</span>
+{
+  <span class="t-cyan">"target"</span>: <span class="t-green">"localhost:8080/"</span>,
+  <span class="t-cyan">"mode"</span>: <span class="t-green">"http"</span>,
+  <span class="t-cyan">"connections"</span>: 512,
+  <span class="t-cyan">"threads"</span>: 8,
+  <span class="t-cyan">"pipeline_depth"</span>: 1,
+  <span class="t-cyan">"duration_sec"</span>: 10,
+  <span class="t-cyan">"elapsed_sec"</span>: 10.001,
+  <span class="t-cyan">"requests"</span>: 9647800,
+  <span class="t-cyan">"responses"</span>: 9647800,
+  <span class="t-cyan">"rps"</span>: 964702.93,
+  <span class="t-cyan">"bandwidth_bps"</span>: 72352719.50,
+  <span class="t-cyan">"bytes_read"</span>: 723548160,
+  <span class="t-cyan">"latency_us"</span>: {
+    <span class="t-cyan">"avg"</span>: 530, <span class="t-cyan">"p50"</span>: 490, <span class="t-cyan">"p90"</span>: 820,
+    <span class="t-cyan">"p99"</span>: 1950, <span class="t-cyan">"p999"</span>: 4100, <span class="t-cyan">"samples"</span>: 9647780
+  },
+  <span class="t-cyan">"status"</span>: { <span class="t-cyan">"2xx"</span>: 9647800, <span class="t-cyan">"3xx"</span>: 0, <span class="t-cyan">"4xx"</span>: 0, <span class="t-cyan">"5xx"</span>: 0, <span class="t-cyan">"other"</span>: 0 },
+  <span class="t-cyan">"errors"</span>: { <span class="t-cyan">"connect"</span>: 0, <span class="t-cyan">"read"</span>: 0, <span class="t-cyan">"timeout"</span>: 0 },
+  <span class="t-cyan">"reconnects"</span>: 0
+}</div>
+    </div>
+
+    <p style="margin-top:16px">
+      In WebSocket mode (<code>--ws</code>), additional <code>ws_upgrades</code> and <code>ws_frames</code> fields are included. When using multiple <code>--raw</code> templates with <code>--per-tpl-latency</code>, a <code>per_template</code> array is added with per-template response counts and latency percentiles.
+    </p>
+
+    <p>Pipe to <code>jq</code> for filtering:</p>
+
+    <div class="terminal">
+      <div class="terminal-bar">
+        <span class="terminal-title">examples</span>
+        <div class="terminal-btns"><div class="terminal-btn">&#8722;</div><div class="terminal-btn">&#9633;</div><div class="terminal-btn">&#10005;</div></div>
+      </div>
+      <div class="terminal-body"><span class="t-dim"># Extract req/s</span>
+<span class="t-green">gcannon</span> http://localhost:8080/ -c 512 -t 8 -d 5s --json | <span class="t-cyan">jq</span> '.rps'
+
+<span class="t-dim"># Get p99 latency in microseconds</span>
+<span class="t-green">gcannon</span> http://localhost:8080/ -c 512 -t 8 -d 5s --json | <span class="t-cyan">jq</span> '.latency_us.p99'
+
+<span class="t-dim"># Save full results to file</span>
+<span class="t-green">gcannon</span> http://localhost:8080/ -c 512 -t 8 -d 5s --json <span class="t-cyan">&gt;</span> results.json</div>
+    </div>
+
+  </div>
+</section>
+
 <!-- ════════════ COMMANDS ════════════ -->
 
 <section id="commands">
@@ -767,6 +830,11 @@
           <td>--tui</td>
           <td></td>
           <td>Enable TUI mode. Shows a live progress bar with throughput sparkline during execution, and colored table-formatted results.</td>
+        </tr>
+        <tr>
+          <td>--json</td>
+          <td></td>
+          <td>JSON output mode. Prints a single machine-readable JSON object to stdout. No banner or progress output. Ideal for scripts, CI pipelines, and dashboards.</td>
         </tr>
         <tr>
           <td>-b &lt;N&gt;</td>

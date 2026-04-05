@@ -6,6 +6,7 @@ BUILDDIR = build
 
 SRC      = src/main.c src/worker.c src/http.c src/ws.c src/stats.c src/tui.c src/history.c
 OBJ      = $(patsubst src/%.c,$(BUILDDIR)/%.o,$(SRC))
+DEP      = $(OBJ:.o=.d)
 PICO_OBJ = $(BUILDDIR)/picohttpparser.o
 BIN      = gcannon
 
@@ -15,7 +16,7 @@ $(BIN): $(OBJ) $(PICO_OBJ)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 $(BUILDDIR)/%.o: src/%.c | $(BUILDDIR)
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 
 $(BUILDDIR)/picohttpparser.o: external/picohttpparser/picohttpparser.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -25,5 +26,7 @@ $(BUILDDIR):
 
 clean:
 	rm -rf $(BUILDDIR) $(BIN)
+
+-include $(DEP)
 
 .PHONY: all clean

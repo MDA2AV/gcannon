@@ -38,6 +38,7 @@ typedef struct worker_stats {
     uint64_t status_4xx;
     uint64_t status_5xx;
     uint64_t status_other;
+    uint64_t ws_upgrades;
     uint32_t tier1[TIER1_BUCKETS];
     uint32_t tier2[TIER2_BUCKETS];
     uint32_t overflow;
@@ -55,4 +56,9 @@ void hist_merge(latency_hist_t *dst, const latency_hist_t *src);
 uint64_t hist_percentile(const latency_hist_t *h, double pct);
 void stats_merge(worker_stats_t *dst, const worker_stats_t *src);
 uint64_t stats_percentile(const worker_stats_t *s, double pct);
-void stats_print(const worker_stats_t *s, double elapsed_sec, int num_templates);
+void stats_print(const worker_stats_t *s, double elapsed_sec, int num_templates,
+                 int ws_mode);
+void stats_print_json(const worker_stats_t *s, double elapsed_sec,
+                      int num_templates, int ws_mode,
+                      const char *target, int num_connections, int num_threads,
+                      int pipeline_depth, int duration_sec);

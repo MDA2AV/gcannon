@@ -46,6 +46,7 @@ gcannon http://localhost:8080 --raw get.raw,post.raw -c 256 -t 4 -d 5s
 | `--ws` | | WebSocket echo mode |
 | `--ws-msg` | `hello` | WebSocket message payload |
 | `--tui` | | TUI mode: progress bar, live sparkline, colored results |
+| `--json` | | JSON output mode: machine-readable results, no banner or progress |
 | `-b` | 10 | Histogram buckets in TUI mode (adaptive, max 100) |
 | `--cqe-latency` | | Measure latency at CQE arrival instead of after response parsing |
 | `--per-tpl-latency` | | Per-template latency histograms (with `--raw` and multiple templates) |
@@ -201,6 +202,48 @@ gcannon http://localhost:8080 --raw get.raw,post.raw --per-tpl-latency -c 256 -t
 ```
 
 Each template gets its own percentile breakdown (avg, p50, p90, p99, p99.9). Only allocated when the flag is passed — zero overhead otherwise.
+
+### JSON Mode (`--json`)
+
+Machine-readable output for scripts, CI pipelines, and dashboards. Prints a single JSON object to stdout with no banner or progress output.
+
+```bash
+gcannon http://localhost:8080/ -c 512 -t 8 -d 10s --json
+```
+
+```json
+{
+  "target": "localhost:8080/",
+  "mode": "http",
+  "connections": 512,
+  "threads": 8,
+  "pipeline_depth": 1,
+  "duration_sec": 10,
+  "elapsed_sec": 10.001,
+  "requests": 9647800,
+  "responses": 9647800,
+  "rps": 964702.93,
+  "bandwidth_bps": 72352719.50,
+  "bytes_read": 723548160,
+  "latency_us": {
+    "avg": 530,
+    "p50": 490,
+    "p90": 820,
+    "p99": 1950,
+    "p999": 4100,
+    "samples": 9647780
+  },
+  "status": { "2xx": 9647800, "3xx": 0, "4xx": 0, "5xx": 0, "other": 0 },
+  "errors": { "connect": 0, "read": 0, "timeout": 0 },
+  "reconnects": 0
+}
+```
+
+In WebSocket mode, additional `ws_upgrades` and `ws_frames` fields are included. Pipe to `jq` for filtering:
+
+```bash
+gcannon http://localhost:8080/ -c 512 -t 8 -d 5s --json | jq '.rps'
+```
 
 ## How It Works
 

@@ -427,7 +427,7 @@ void worker_loop(worker_t *w)
                     completed = http_parse_responses(&c->parser, buf, res);
                     if (completed > 0 && c->parser.completed_statuses[0] == 101) {
                         c->state = CONN_ACTIVE;
-                        w->stats.status_2xx++;
+                        w->stats.ws_upgrades++;
                         ws_parser_reset(&c->ws_parser);
                         return_buffer(w, bid);
                         if (!has_more) arm_recv_multishot(w, conn_idx);

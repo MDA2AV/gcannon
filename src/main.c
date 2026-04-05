@@ -169,6 +169,7 @@ int main(int argc, char **argv)
     int expected_status = 200; /* expected HTTP status code */
     int ws_mode = 0;
     int tui_mode = 0;
+    int json_mode = 0;
     int cqe_latency = 0;
     int per_tpl_latency = 0;
     int hist_buckets = 0; /* 0 = default (10) */
@@ -201,6 +202,8 @@ int main(int argc, char **argv)
             ws_mode = 1;
         } else if (strcmp(argv[i], "--tui") == 0) {
             tui_mode = 1;
+        } else if (strcmp(argv[i], "--json") == 0) {
+            json_mode = 1;
         } else if ((strcmp(argv[i], "--buckets") == 0 || strcmp(argv[i], "-b") == 0) && i + 1 < argc) {
             hist_buckets = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--cqe-latency") == 0) {
@@ -215,7 +218,7 @@ int main(int argc, char **argv)
             fprintf(stderr, "Usage: gcannon <url> -c <conns> -t <threads> "
                             "-d <duration> [-p <pipeline>] [-r <req/conn>] "
                             "[-s <status>] [-R|--raw file1,file2,...] "
-                            "[--ws [--ws-msg <message>]] [--tui] [-b <buckets>] [--cqe-latency]\n");
+                            "[--ws [--ws-msg <message>]] [--tui] [--json] [-b <buckets>] [--cqe-latency]\n");
             return 1;
         }
     }
@@ -223,7 +226,7 @@ int main(int argc, char **argv)
     if (!url && !raw_files) {
         fprintf(stderr, "Usage: gcannon <url> -c <conns> -t <threads> "
                         "-d <duration> [-p <pipeline>] [-r <req/conn>] "
-                        "[-R|--raw file1,file2,...] [--tui]\n");
+                        "[-R|--raw file1,file2,...] [--tui] [--json]\n");
         return 1;
     }
 
@@ -329,21 +332,23 @@ int main(int argc, char **argv)
     int conns_per_thread = num_connections / num_threads;
     int extra = num_connections % num_threads;
 
-    printf("gcannon — io_uring %s load generator\n", ws_mode ? "WebSocket" : "HTTP");
-    printf("  Target:    %s:%d%s\n", host, port, path);
-    printf("  Threads:   %d\n", num_threads);
-    printf("  Conns:     %d (%.0f/thread)\n", num_connections,
-           (double)num_connections / num_threads);
-    printf("  Pipeline:  %d\n", pipeline_depth);
-    if (requests_per_conn > 0)
-        printf("  Req/conn:  %d\n", requests_per_conn);
-    else
-        printf("  Req/conn:  unlimited (keep-alive)\n");
-    if (num_templates > 1)
-        printf("  Templates: %d\n", num_templates);
-    printf("  Expected:  %d\n", expected_status);
-    printf("  Duration:  %ds\n", duration_sec);
-    printf("\n");
+    if (!json_mode) {
+        printf("gcannon — io_uring %s load generator\n", ws_mode ? "WebSocket" : "HTTP");
+        printf("  Target:    %s:%d%s\n", host, port, path);
+        printf("  Threads:   %d\n", num_threads);
+        printf("  Conns:     %d (%.0f/thread)\n", num_connections,
+               (double)num_connections / num_threads);
+        printf("  Pipeline:  %d\n", pipeline_depth);
+        if (requests_per_conn > 0)
+            printf("  Req/conn:  %d\n", requests_per_conn);
+        else
+            printf("  Req/conn:  unlimited (keep-alive)\n");
+        if (num_templates > 1)
+            printf("  Templates: %d\n", num_templates);
+        printf("  Expected:  %d\n", expected_status);
+        printf("  Duration:  %ds\n", duration_sec);
+        printf("\n");
+    }
 
     signal(SIGINT, sigint_handler);
     signal(SIGPIPE, SIG_IGN);
@@ -386,7 +391,9 @@ int main(int argc, char **argv)
     for (int i = 0; i < num_threads; i++) {
         latency_hist_t *saved_tpl = ctxs[i].worker.stats.tpl_latency;
         int saved_n = ctxs[i].worker.stats.num_tpl_latency;
+        uint64_t saved_ws_upgrades = ctxs[i].worker.stats.ws_upgrades;
         memset(&ctxs[i].worker.stats, 0, sizeof(worker_stats_t));
+        ctxs[i].worker.stats.ws_upgrades = saved_ws_upgrades;
         if (saved_tpl) {
             memset(saved_tpl, 0, saved_n * sizeof(latency_hist_t));
             ctxs[i].worker.stats.tpl_latency = saved_tpl;
@@ -463,11 +470,21 @@ int main(int argc, char **argv)
                          pipeline_depth, duration_sec);
     if (history) history_save(history, &current_record);
 
-    if (tui_mode) {
+    if (json_mode) {
+        char target[512];
+        if (port == 80)
+            snprintf(target, sizeof(target), "%s%s", host, path);
+        else
+            snprintf(target, sizeof(target), "%s:%d%s", host, port, path);
+        stats_print_json(&total, elapsed, num_templates, ws_mode,
+                         target, num_connections, num_threads,
+                         pipeline_depth, duration_sec);
+    } else if (tui_mode) {
         tui_print_results(&total, elapsed, num_templates, expected_status,
-                          hist_buckets, prev_runs, num_prev, &current_record);
+                          hist_buckets, prev_runs, num_prev, &current_record,
+                          ws_mode);
     } else {
-        stats_print(&total, elapsed, num_templates);
+        stats_print(&total, elapsed, num_templates, ws_mode);
     }
 
     /* Check for unexpected status codes (exit code) */
@@ -480,7 +497,7 @@ int main(int argc, char **argv)
     uint64_t unexpected = total.responses - expected_count;
     int exit_code = 0;
     if (unexpected > 0 && total.responses > 0) {
-        if (!tui_mode)
+        if (!tui_mode && !json_mode)
             printf("\n  WARNING: %lu/%lu responses (%.1f%%) had unexpected status (expected %dxx)\n",
                    unexpected, total.responses,
                    100.0 * unexpected / total.responses, expected_status / 100);

@@ -254,28 +254,29 @@ static void print_histogram(const worker_stats_t *s, int num_buckets)
     if (num_buckets > 100) num_buckets = 100;
     const int N = num_buckets;
 
-    /* Find where the data actually lives */
-    uint64_t data_lo = stats_percentile(s, 0.0);
-    uint64_t data_hi = stats_percentile(s, 0.999);
-    if (data_hi <= data_lo)
-        data_hi = data_lo + 1;
+    /* Percentile-based bucket boundaries for meaningful distribution.
+       Use N+1 evenly-spaced percentile points from 0 to p99.9, then
+       deduplicate boundaries that land in the same histogram bin. */
+    uint64_t edges[102];
+    for (int i = 0; i <= N; i++)
+        edges[i] = stats_percentile(s, 0.999 * i / N);
 
-    uint64_t range = data_hi - data_lo;
-
-    /* N equal-width buckets spanning [data_lo, data_hi] + 1 tail */
+    /* Deduplicate: collapse identical adjacent boundaries */
     uint64_t b_lo[101], b_hi[101], b_count[101];
-
-    for (int i = 0; i < N; i++) {
-        b_lo[i] = data_lo + range * (uint64_t)i / N;
-        b_hi[i] = data_lo + range * (uint64_t)(i + 1) / N;
-    }
-    /* First bucket catches everything from 0 */
+    int nb = 0;
     b_lo[0] = 0;
+    for (int i = 1; i <= N; i++) {
+        if (edges[i] > edges[i - 1] || i == N) {
+            b_hi[nb] = edges[i];
+            nb++;
+            if (nb < N + 1)
+                b_lo[nb] = edges[i];
+        }
+    }
     /* Tail bucket for anything above p99.9 */
-    b_lo[N] = b_hi[N - 1];
-    b_hi[N] = 0;  /* sentinel = infinity */
-
-    int nb = N + 1;
+    b_lo[nb] = b_hi[nb - 1];
+    b_hi[nb] = 0;  /* sentinel = infinity */
+    nb++;
 
     /* Count samples per bucket */
     uint64_t max_count = 0;
@@ -319,8 +320,8 @@ static void print_histogram(const worker_stats_t *s, int num_buckets)
 /* ── run history bar graphs ── */
 
 #define HIST_GRAPH_HEIGHT 10
-#define HIST_BAR_W        5     /* block chars per bar */
-#define HIST_COL_W        6     /* bar + 1 gap */
+#define HIST_BAR_W        7     /* block chars per bar */
+#define HIST_COL_W        8     /* bar + 1 gap */
 #define HIST_MAX_VIS      10    /* max visible runs */
 
 static void adaptive_range(const double *vals, int n, double *out_lo, double *out_hi)
@@ -465,7 +466,7 @@ static void print_history_sparkline(const run_record_t *prev, int num_prev,
 void tui_print_results(const worker_stats_t *s, double elapsed_sec,
                        int num_templates, int expected_status, int hist_buckets,
                        const run_record_t *prev_runs, int num_prev_runs,
-                       const run_record_t *current_run)
+                       const run_record_t *current_run, int ws_mode)
 {
     char avg[32], p50[32], p90[32], p99[32], p999[32];
     char rps[32], bw[32], req[32], resp[32];
@@ -527,23 +528,38 @@ void tui_print_results(const worker_stats_t *s, double elapsed_sec,
 
     /* ── status codes table ── */
     printf("\n");
-    printf("  " BOLD "Status Codes" RST "\n");
-    printf("\n");
-    printf(STOP);
-    printf("    " GRAY BOX_V RST GREEN  "     2xx     " RST
-           GRAY BOX_V RST CYAN   "     3xx     " RST
-           GRAY BOX_V RST YELLOW "     4xx     " RST
-           GRAY BOX_V RST RED    "     5xx     " RST
-           GRAY BOX_V RST "\n");
-    printf(SMID);
-    printf("    " GRAY BOX_V RST " %11lu " GRAY BOX_V RST " %11lu " GRAY BOX_V RST " %11lu " GRAY BOX_V RST " %11lu " GRAY BOX_V RST "\n",
-           s->status_2xx, s->status_3xx, s->status_4xx, s->status_5xx);
-    if (s->status_other) {
+    if (ws_mode) {
+        printf("  " BOLD "WebSocket" RST "\n");
+        printf("\n");
+        printf(STOP);
+        printf("    " GRAY BOX_V RST GREEN  "  Upgrades   " RST
+               GRAY BOX_V RST CYAN   "   Frames    " RST
+               GRAY BOX_V RST YELLOW "     4xx     " RST
+               GRAY BOX_V RST RED    "     5xx     " RST
+               GRAY BOX_V RST "\n");
         printf(SMID);
-        printf("    " GRAY BOX_V RST "   other: %-3lu" GRAY BOX_V RST "             " GRAY BOX_V RST "             " GRAY BOX_V RST "             " GRAY BOX_V RST "\n",
-               s->status_other);
+        printf("    " GRAY BOX_V RST " %11lu " GRAY BOX_V RST " %11lu " GRAY BOX_V RST " %11lu " GRAY BOX_V RST " %11lu " GRAY BOX_V RST "\n",
+               s->ws_upgrades, s->status_2xx, s->status_4xx, s->status_5xx);
+        printf(SBOT);
+    } else {
+        printf("  " BOLD "Status Codes" RST "\n");
+        printf("\n");
+        printf(STOP);
+        printf("    " GRAY BOX_V RST GREEN  "     2xx     " RST
+               GRAY BOX_V RST CYAN   "     3xx     " RST
+               GRAY BOX_V RST YELLOW "     4xx     " RST
+               GRAY BOX_V RST RED    "     5xx     " RST
+               GRAY BOX_V RST "\n");
+        printf(SMID);
+        printf("    " GRAY BOX_V RST " %11lu " GRAY BOX_V RST " %11lu " GRAY BOX_V RST " %11lu " GRAY BOX_V RST " %11lu " GRAY BOX_V RST "\n",
+               s->status_2xx, s->status_3xx, s->status_4xx, s->status_5xx);
+        if (s->status_other) {
+            printf(SMID);
+            printf("    " GRAY BOX_V RST "   other: %-3lu" GRAY BOX_V RST "             " GRAY BOX_V RST "             " GRAY BOX_V RST "             " GRAY BOX_V RST "\n",
+                   s->status_other);
+        }
+        printf(SBOT);
     }
-    printf(SBOT);
 
     /* ── latency histogram ── */
     printf("\n");

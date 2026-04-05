@@ -76,6 +76,7 @@ void stats_merge(worker_stats_t *dst, const worker_stats_t *src)
     dst->status_4xx     += src->status_4xx;
     dst->status_5xx     += src->status_5xx;
     dst->status_other   += src->status_other;
+    dst->ws_upgrades    += src->ws_upgrades;
     dst->latency_count  += src->latency_count;
     dst->latency_sum_us += src->latency_sum_us;
     dst->overflow       += src->overflow;
@@ -152,7 +153,8 @@ static void format_bytes(char *buf, size_t sz, double bytes_per_sec)
         snprintf(buf, sz, "%.0fB/s", bytes_per_sec);
 }
 
-void stats_print(const worker_stats_t *s, double elapsed_sec, int num_templates)
+void stats_print(const worker_stats_t *s, double elapsed_sec, int num_templates,
+                 int ws_mode)
 {
     char p50[32], p90[32], p99[32], p999[32];
     char rps_buf[32], bw_buf[32], avg_buf[32];
@@ -174,16 +176,25 @@ void stats_print(const worker_stats_t *s, double elapsed_sec, int num_templates)
     printf("    Latency   %6s   %6s   %6s   %6s   %6s\n",
            avg_buf, p50, p90, p99, p999);
     printf("\n");
-    printf("  %lu requests in %.2fs, %lu responses\n",
-           s->requests, elapsed_sec, s->responses);
+    if (ws_mode)
+        printf("  %lu frames sent in %.2fs, %lu frames received\n",
+               s->requests, elapsed_sec, s->responses);
+    else
+        printf("  %lu requests in %.2fs, %lu responses\n",
+               s->requests, elapsed_sec, s->responses);
     printf("  Throughput: %s req/s\n", rps_buf);
     printf("  Bandwidth:  %s\n", bw_buf);
 
-    printf("  Status codes: 2xx=%lu, 3xx=%lu, 4xx=%lu, 5xx=%lu",
-           s->status_2xx, s->status_3xx, s->status_4xx, s->status_5xx);
-    if (s->status_other)
-        printf(", other=%lu", s->status_other);
-    printf("\n");
+    if (ws_mode) {
+        printf("  WS upgrades: %lu\n", s->ws_upgrades);
+        printf("  WS frames:   %lu\n", s->status_2xx);
+    } else {
+        printf("  Status codes: 2xx=%lu, 3xx=%lu, 4xx=%lu, 5xx=%lu",
+               s->status_2xx, s->status_3xx, s->status_4xx, s->status_5xx);
+        if (s->status_other)
+            printf(", other=%lu", s->status_other);
+        printf("\n");
+    }
 
     printf("  Latency samples: %lu / %lu responses (%.1f%%)\n",
            s->latency_count, s->responses,
@@ -230,4 +241,80 @@ void stats_print(const worker_stats_t *s, double elapsed_sec, int num_templates)
                    i, a, p5, p9, p99b, p999b);
         }
     }
+}
+
+void stats_print_json(const worker_stats_t *s, double elapsed_sec,
+                      int num_templates, int ws_mode,
+                      const char *target, int num_connections, int num_threads,
+                      int pipeline_depth, int duration_sec)
+{
+    const uint64_t avg_us = s->latency_count
+                            ? s->latency_sum_us / s->latency_count : 0;
+    const double rps = elapsed_sec > 0 ? s->responses / elapsed_sec : 0;
+    const double bw = elapsed_sec > 0 ? (double)s->bytes_read / elapsed_sec : 0;
+
+    printf("{\n");
+    printf("  \"target\": \"%s\",\n", target);
+    printf("  \"mode\": \"%s\",\n", ws_mode ? "websocket" : "http");
+    printf("  \"connections\": %d,\n", num_connections);
+    printf("  \"threads\": %d,\n", num_threads);
+    printf("  \"pipeline_depth\": %d,\n", pipeline_depth);
+    printf("  \"duration_sec\": %d,\n", duration_sec);
+    printf("  \"elapsed_sec\": %.3f,\n", elapsed_sec);
+
+    printf("  \"requests\": %lu,\n", s->requests);
+    printf("  \"responses\": %lu,\n", s->responses);
+    printf("  \"rps\": %.2f,\n", rps);
+    printf("  \"bandwidth_bps\": %.2f,\n", bw);
+    printf("  \"bytes_read\": %lu,\n", s->bytes_read);
+
+    printf("  \"latency_us\": {\n");
+    printf("    \"avg\": %lu,\n", avg_us);
+    printf("    \"p50\": %lu,\n", stats_percentile(s, 0.50));
+    printf("    \"p90\": %lu,\n", stats_percentile(s, 0.90));
+    printf("    \"p99\": %lu,\n", stats_percentile(s, 0.99));
+    printf("    \"p999\": %lu,\n", stats_percentile(s, 0.999));
+    printf("    \"samples\": %lu\n", s->latency_count);
+    printf("  },\n");
+
+    if (ws_mode) {
+        printf("  \"ws_upgrades\": %lu,\n", s->ws_upgrades);
+        printf("  \"ws_frames\": %lu,\n", s->status_2xx);
+    }
+
+    printf("  \"status\": {\n");
+    printf("    \"2xx\": %lu,\n", s->status_2xx);
+    printf("    \"3xx\": %lu,\n", s->status_3xx);
+    printf("    \"4xx\": %lu,\n", s->status_4xx);
+    printf("    \"5xx\": %lu,\n", s->status_5xx);
+    printf("    \"other\": %lu\n", s->status_other);
+    printf("  },\n");
+
+    printf("  \"errors\": {\n");
+    printf("    \"connect\": %lu,\n", s->connect_errors);
+    printf("    \"read\": %lu,\n", s->read_errors);
+    printf("    \"timeout\": %lu\n", s->timeouts);
+    printf("  },\n");
+
+    printf("  \"reconnects\": %lu", s->reconnects);
+
+    if (num_templates > 1) {
+        printf(",\n  \"per_template\": [");
+        for (int i = 0; i < num_templates; i++) {
+            if (i > 0) printf(",");
+            printf("\n    {\"responses\": %lu, \"2xx\": %lu",
+                   s->tpl_responses[i], s->tpl_responses_2xx[i]);
+            if (s->tpl_latency && i < s->num_tpl_latency && s->tpl_latency[i].count > 0) {
+                const latency_hist_t *h = &s->tpl_latency[i];
+                printf(", \"latency_us\": {\"avg\": %lu, \"p50\": %lu, \"p99\": %lu}",
+                       h->sum_us / h->count,
+                       hist_percentile(h, 0.50),
+                       hist_percentile(h, 0.99));
+            }
+            printf("}");
+        }
+        printf("\n  ]");
+    }
+
+    printf("\n}\n");
 }
