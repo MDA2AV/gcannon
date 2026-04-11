@@ -893,6 +893,16 @@
           <td>Number of latency histogram buckets in TUI mode (max 100). Buckets are computed adaptively from the actual data range, not fixed thresholds.</td>
         </tr>
         <tr>
+          <td>--recv-buf &lt;bytes&gt;</td>
+          <td>4096</td>
+          <td>Receive buffer size in bytes (minimum 512). Each worker allocates 4096 buffers of this size. Larger values suit big response bodies; smaller values save memory with many connections.</td>
+        </tr>
+        <tr>
+          <td>--inc-buf</td>
+          <td></td>
+          <td>Enable incremental buffer consumption (kernel 6.10+). Instead of consuming a full buffer per recv, the kernel fills buffers sequentially across multiple completions. Reduces buffer ring churn and improves cache locality.</td>
+        </tr>
+        <tr>
           <td>--cqe-latency</td>
           <td></td>
           <td>Measure latency at io_uring CQE arrival (when the kernel signals data is ready) instead of after the full HTTP response is parsed. Gives a lower-level "time to first data" measurement that excludes userspace parse time.</td>
@@ -1057,7 +1067,7 @@
     <div class="card-grid">
       <div class="card">
         <h4>Provided Buffer Rings</h4>
-        <p>Pre-registered buffer pool managed by the kernel. Eliminates per-recv buffer allocation and reduces submission overhead.</p>
+        <p>Pre-registered buffer pool managed by the kernel. Eliminates per-recv buffer allocation and reduces submission overhead. Buffer size is configurable via <code>--recv-buf</code>. With <code>--inc-buf</code>, the kernel fills buffers incrementally across multiple recvs instead of consuming one buffer per completion.</p>
       </div>
       <div class="card">
         <h4>Multishot Receive</h4>
@@ -1092,7 +1102,7 @@
         <div class="step-num">2</div>
         <div class="step-text">
           <h4>Set up the provided buffer ring</h4>
-          <p>4096 receive buffers (4KB each, ~16MB total) are pre-registered with the kernel via <code>io_uring_setup_buf_ring()</code>. When a recv completion fires, the kernel picks a buffer from this pool automatically &mdash; no userspace allocation or buffer address needed in the submission. After processing, the buffer is returned to the ring for reuse.</p>
+          <p>4096 receive buffers (4KB each by default, configurable via <code>--recv-buf</code>) are pre-registered with the kernel. When a recv completion fires, the kernel picks a buffer from this pool automatically &mdash; no userspace allocation or buffer address needed in the submission. After processing, the buffer is returned to the ring for reuse. With <code>--inc-buf</code>, the ring is registered with <code>IOU_PBUF_RING_INC</code> so the kernel fills each buffer sequentially across multiple recv completions before advancing to the next, reducing buffer ring operations.</p>
         </div>
       </div>
       <div class="latency-step">
