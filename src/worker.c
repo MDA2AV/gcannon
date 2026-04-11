@@ -454,6 +454,19 @@ void worker_loop(worker_t *w)
                     break;
                 }
 
+                /* Fast path: mid-body CQE that won't complete the response.
+                   Skip the function call, timestamp, and stats loop entirely. */
+                if (c->parser.state == 1 && !w->ws_mode) {
+                    const int remaining = c->parser.content_length - c->parser.body_received;
+                    if (res < remaining) {
+                        c->parser.body_received += res;
+                        w->stats.bytes_read += res;
+                        return_buffer(w, bid);
+                        if (!has_more) arm_recv_multishot(w, conn_idx);
+                        break;
+                    }
+                }
+
                 /* In CQE latency mode, timestamp before parsing */
                 struct timespec now;
                 if (w->cqe_latency)
