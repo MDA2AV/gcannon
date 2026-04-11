@@ -31,7 +31,6 @@ typedef struct thread_ctx {
     int              expected_status;
     int              ws_mode;
     int              recv_buf_size;
-    int              inc_buf;
     int              cqe_latency;
     int              per_tpl_latency;
     const char      *ws_host;
@@ -145,7 +144,7 @@ static void *worker_thread(void *arg)
                 ctx->requests_per_conn, ctx->expected_status,
                 ctx->ws_mode, ctx->ws_host, ctx->ws_port, ctx->ws_path,
                 ctx->ws_payload, ctx->ws_payload_len,
-                ctx->recv_buf_size, ctx->inc_buf,
+                ctx->recv_buf_size,
                 ctx->cqe_latency, ctx->per_tpl_latency,
                 &g_running);
     worker_loop(&ctx->worker);
@@ -173,7 +172,6 @@ int main(int argc, char **argv)
     int ws_mode = 0;
     int tui_mode = 0;
     int json_mode = 0;
-    int inc_buf = 0;
     int cqe_latency = 0;
     int per_tpl_latency = 0;
     int recv_buf_size = RECV_BUF_SIZE_DEFAULT;
@@ -211,8 +209,6 @@ int main(int argc, char **argv)
             json_mode = 1;
         } else if ((strcmp(argv[i], "--buckets") == 0 || strcmp(argv[i], "-b") == 0) && i + 1 < argc) {
             hist_buckets = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "--inc-buf") == 0) {
-            inc_buf = 1;
         } else if (strcmp(argv[i], "--cqe-latency") == 0) {
             cqe_latency = 1;
         } else if (strcmp(argv[i], "--recv-buf") == 0 && i + 1 < argc) {
@@ -349,12 +345,11 @@ int main(int argc, char **argv)
 
     if (!json_mode) {
         printf("gcannon v%s", GCANNON_VERSION);
-        if (ws_mode || tui_mode || inc_buf || cqe_latency || per_tpl_latency) {
+        if (ws_mode || tui_mode || cqe_latency || per_tpl_latency) {
             printf(" [");
             int first = 1;
             if (ws_mode)        { printf("WS");             first = 0; }
             if (tui_mode)       { printf("%sTUI",   first ? "" : ", "); first = 0; }
-            if (inc_buf)        { printf("%sINC",   first ? "" : ", "); first = 0; }
             if (cqe_latency)    { printf("%sCQE",   first ? "" : ", "); first = 0; }
             if (per_tpl_latency){ printf("%sTPL",   first ? "" : ", "); first = 0; }
             printf("]");
@@ -399,7 +394,6 @@ int main(int argc, char **argv)
         ctxs[i].expected_status   = expected_status;
         ctxs[i].ws_mode           = ws_mode;
         ctxs[i].recv_buf_size    = recv_buf_size;
-        ctxs[i].inc_buf          = inc_buf;
         ctxs[i].cqe_latency      = cqe_latency;
         ctxs[i].per_tpl_latency  = per_tpl_latency;
         ctxs[i].ws_host           = host;

@@ -29,32 +29,6 @@ static inline void return_buffer(worker_t *w, uint16_t bid)
     io_uring_buf_ring_advance(w->buf_ring, 1);
 }
 
-/* Incremental buffer: consume `len` bytes from buffer `bid`.
-   Returns pointer to the data.  Handles buffer transitions and
-   returns completed buffers to the ring automatically. */
-static inline const uint8_t *inc_consume(worker_t *w, uint16_t bid, int len)
-{
-    if (w->inc_tracking && bid != w->inc_bid) {
-        /* Kernel moved to a new buffer — return the previous one */
-        return_buffer(w, w->inc_bid);
-        w->inc_off = 0;
-    }
-
-    const uint32_t off = w->inc_off;
-    w->inc_bid      = bid;
-    w->inc_off     += (uint32_t)len;
-    w->inc_tracking = 1;
-
-    /* Buffer completely filled — return it now */
-    if (w->inc_off >= (uint32_t)w->recv_buf_size) {
-        return_buffer(w, bid);
-        w->inc_tracking = 0;
-        w->inc_off      = 0;
-    }
-
-    return w->buf_slab + (size_t)bid * w->recv_buf_size + off;
-}
-
 static inline void arm_recv_multishot(worker_t *w, const int conn_idx)
 {
     const gc_conn_t *c = &w->conns[conn_idx];
@@ -224,7 +198,6 @@ void worker_init(worker_t *w,
                  const uint8_t *ws_payload,
                  const int ws_payload_len,
                  const int recv_buf_size,
-                 const int inc_buf,
                  const int cqe_latency,
                  const int per_tpl_latency,
                  volatile int *running)
@@ -248,7 +221,6 @@ void worker_init(worker_t *w,
     w->expected_status   = expected_status;
     w->ws_mode           = ws_mode;
     w->recv_buf_size     = recv_buf_size;
-    w->inc_buf           = inc_buf;
     w->cqe_latency       = cqe_latency;
     w->per_tpl_latency   = per_tpl_latency;
     w->running           = running;
@@ -292,28 +264,7 @@ void worker_init(worker_t *w,
     }
 
     /* Provided buffer ring */
-    if (inc_buf) {
-        /* Manual registration with IOU_PBUF_RING_INC flag —
-           liburing 2.5 io_uring_setup_buf_ring doesn't forward
-           arbitrary flags to reg.flags, so we register directly. */
-        const size_t ring_size = (BUF_RING_ENTRIES + 1) * sizeof(struct io_uring_buf);
-        if (posix_memalign((void **)&w->buf_ring, getpagesize(), ring_size) != 0) {
-            fprintf(stderr, "[w%d] posix_memalign buf_ring: out of memory\n", id);
-            exit(1);
-        }
-        memset(w->buf_ring, 0, ring_size);
-        struct io_uring_buf_reg reg = {
-            .ring_addr   = (unsigned long)w->buf_ring,
-            .ring_entries = BUF_RING_ENTRIES,
-            .bgid        = BUFFER_RING_BGID,
-            .flags       = IOU_PBUF_RING_INC,
-        };
-        const int bret = io_uring_register_buf_ring(&w->ring, &reg, 0);
-        if (bret < 0) {
-            fprintf(stderr, "[w%d] register_buf_ring (INC): %s\n", id, strerror(-bret));
-            exit(1);
-        }
-    } else {
+    {
         int bret;
         w->buf_ring = io_uring_setup_buf_ring(&w->ring, BUF_RING_ENTRIES,
                                                BUFFER_RING_BGID, 0, &bret);
@@ -388,10 +339,7 @@ void worker_loop(worker_t *w)
             if (cqe_gen != c->gen) {
                 if (kind == UD_RECV && (cqe->flags & IORING_CQE_F_BUFFER)) {
                     const uint16_t bid = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
-                    if (w->inc_buf && res > 0)
-                        inc_consume(w, bid, res); /* advance offset, discard data */
-                    else if (!w->inc_buf)
-                        return_buffer(w, bid);
+                    return_buffer(w, bid);
                 }
                 continue;
             }
@@ -460,7 +408,7 @@ void worker_loop(worker_t *w)
                 const int has_more   = (cqe->flags & IORING_CQE_F_MORE)   != 0;
 
                 if (res <= 0) {
-                    if (has_buffer && !w->inc_buf) {
+                    if (has_buffer) {
                         const uint16_t bid = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
                         return_buffer(w, bid);
                     }
@@ -471,9 +419,7 @@ void worker_loop(worker_t *w)
                 if (!has_buffer) break;
 
                 const uint16_t bid = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
-                const uint8_t *buf = w->inc_buf
-                    ? inc_consume(w, bid, res)
-                    : w->buf_slab + (size_t)bid * w->recv_buf_size;
+                const uint8_t *buf = w->buf_slab + (size_t)bid * w->recv_buf_size;
 
                 w->stats.bytes_read += res;
 
@@ -486,7 +432,7 @@ void worker_loop(worker_t *w)
                         c->state = CONN_ACTIVE;
                         w->stats.ws_upgrades++;
                         ws_parser_reset(&c->ws_parser);
-                        if (!w->inc_buf) return_buffer(w, bid);
+                        return_buffer(w, bid);
                         if (!has_more) arm_recv_multishot(w, conn_idx);
                         fire_requests(w, c, conn_idx, w->pipeline_depth);
                         break;
@@ -498,12 +444,12 @@ void worker_loop(worker_t *w)
                         else if (sc >= 400 && sc < 500) w->stats.status_4xx++;
                         else if (sc >= 500 && sc < 600) w->stats.status_5xx++;
                         else                            w->stats.status_other++;
-                        if (!w->inc_buf) return_buffer(w, bid);
+                        return_buffer(w, bid);
                         reconnect(w, conn_idx);
                         break;
                     }
                     /* Incomplete upgrade response — wait for more data */
-                    if (!w->inc_buf) return_buffer(w, bid);
+                    return_buffer(w, bid);
                     if (!has_more) arm_recv_multishot(w, conn_idx);
                     break;
                 }
@@ -561,7 +507,7 @@ void worker_loop(worker_t *w)
                     }
                 }
 
-                if (!w->inc_buf) return_buffer(w, bid);
+                return_buffer(w, bid);
 
                 /* Check if this connection's quota is fully drained */
                 const int quota_sent = w->requests_per_conn > 0 &&
@@ -601,13 +547,8 @@ void worker_destroy(worker_t *w)
             close(w->conns[i].fd);
     }
 
-    if (w->inc_buf) {
-        io_uring_unregister_buf_ring(&w->ring, BUFFER_RING_BGID);
-        free(w->buf_ring);
-    } else {
-        io_uring_free_buf_ring(&w->ring, w->buf_ring,
-                               BUF_RING_ENTRIES, BUFFER_RING_BGID);
-    }
+    io_uring_free_buf_ring(&w->ring, w->buf_ring,
+                           BUF_RING_ENTRIES, BUFFER_RING_BGID);
     io_uring_queue_exit(&w->ring);
     free(w->buf_slab);
     free(w->conns);

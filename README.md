@@ -49,7 +49,6 @@ gcannon http://localhost:8080 --raw get.raw,post.raw -c 256 -t 4 -d 5s
 | `--json` | | JSON output mode: machine-readable results, no banner or progress |
 | `-b` | 10 | Histogram buckets in TUI mode (adaptive, max 100) |
 | `--recv-buf` | 4096 | Receive buffer size in bytes (min 512). Each worker allocates 4096 buffers of this size. Larger values suit big responses; smaller values save memory. |
-| `--inc-buf` | | Incremental buffer consumption (kernel 6.10+). The kernel fills buffers sequentially across recv completions instead of consuming a whole buffer per recv. Reduces buffer ring churn. |
 | `--cqe-latency` | | Measure latency at CQE arrival instead of after response parsing |
 | `--per-tpl-latency` | | Per-template latency histograms (with `--raw` and multiple templates) |
 | `--clear-history` | | Clear saved run history and exit |
@@ -72,9 +71,6 @@ gcannon http://localhost:8080 --raw get.raw,post.raw,upload.raw -c 256 -t 4 -d 5
 
 # Larger recv buffers for big responses
 gcannon http://localhost:8080/ -c 512 -t 8 -d 10s --recv-buf 16384
-
-# Incremental buffer consumption (reduces buffer ring churn)
-gcannon http://localhost:8080/ -c 512 -t 8 -d 10s --inc-buf
 ```
 
 ### WebSocket
@@ -258,7 +254,7 @@ gcannon http://localhost:8080/ -c 512 -t 8 -d 5s --json | jq '.rps'
 Each worker thread runs an independent io_uring event loop with zero cross-thread communication.
 
 - **io_uring** with `SINGLE_ISSUER` + `DEFER_TASKRUN` for minimal kernel transitions
-- **Provided buffer rings** for efficient recv (kernel picks buffers from a pre-registered pool), with optional **incremental consumption** (`--inc-buf`) where the kernel fills buffers sequentially across multiple recvs instead of one-buffer-per-recv
+- **Provided buffer rings** for efficient recv (kernel picks buffers from a pre-registered pool)
 - **Multishot recv** (one SQE arms continuous receive per connection)
 - **Batch CQE processing** (up to 2048 completions per loop iteration)
 - **Pre-built request buffers** (no per-request formatting)
