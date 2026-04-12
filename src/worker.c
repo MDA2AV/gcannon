@@ -8,7 +8,6 @@
 #include <sys/socket.h>
 #include <netinet/tcp.h>
 #include <fcntl.h>
-
 /* io_uring implementation inspired by zerg - https://github.com/MDA2AV/zerg */
 
 static inline struct io_uring_sqe *sqe_get(struct io_uring *ring)
@@ -452,18 +451,6 @@ void worker_loop(worker_t *w)
                     return_buffer(w, bid);
                     if (!has_more) arm_recv_multishot(w, conn_idx);
                     break;
-                }
-
-                /* Fast path: mid-body CQE that won't complete the response.
-                   Skip the function call, timestamp, and stats loop entirely. */
-                if (c->parser.state == 1 && !w->ws_mode) {
-                    const int remaining = c->parser.content_length - c->parser.body_received;
-                    if (res < remaining) {
-                        c->parser.body_received += res;
-                        return_buffer(w, bid);
-                        if (!has_more) arm_recv_multishot(w, conn_idx);
-                        break;
-                    }
                 }
 
                 /* In CQE latency mode, timestamp before parsing */
