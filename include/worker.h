@@ -42,7 +42,6 @@ typedef struct worker {
     uint8_t                  *buf_slab;
     uint32_t                  buf_index;
     uint32_t                  buf_mask;
-
     gc_conn_t                *conns;
     int                       num_conns;
 
