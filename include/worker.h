@@ -2,6 +2,7 @@
 
 #include <liburing.h>
 #include <netinet/in.h>
+#include <stdatomic.h>
 #include <time.h>
 
 #include "constants.h"
@@ -11,11 +12,24 @@
 
 typedef enum { CONN_CONNECTING, CONN_WS_UPGRADING, CONN_ACTIVE, CONN_CLOSED } conn_state_t;
 
+/* Placeholder substitution types for {RAND:min:max} and {SEQ:start} in raw templates */
+typedef enum { SUB_NONE = 0, SUB_RAND, SUB_SEQ } sub_type_t;
+
+typedef struct {
+    sub_type_t type;
+    int        offset;      /* byte offset in the single-request buffer */
+    int        width;       /* zero-padded digit width (e.g. 6 for 000001-999999) */
+    uint64_t   min;         /* RAND lower bound (inclusive) */
+    uint64_t   max;         /* RAND upper bound (inclusive) */
+    _Atomic uint64_t seq;   /* SEQ: shared atomic counter across all threads */
+} placeholder_t;
+
 /* Request template — one per raw request file (or the auto-generated GET) */
 typedef struct {
     char *pipeline_buf;   /* pipeline_depth copies concatenated */
     int   request_len;    /* single request length */
     int   pipeline_len;   /* pipeline_depth * request_len */
+    placeholder_t ph;     /* {RAND} or {SEQ} placeholder (ph.type == SUB_NONE if none) */
 } request_tpl_t;
 
 typedef struct gc_conn {
@@ -34,6 +48,9 @@ typedef struct gc_conn {
     int              send_done;      /* bytes confirmed sent so far */
     int              requests_sent;  /* total requests sent on this connection */
     int              responses_recv; /* total responses received on this connection */
+    char            *scratch_buf;    /* per-conn buffer for placeholder substitution */
+    int              scratch_len;    /* allocated size of scratch_buf */
+    uint64_t         rng_state;      /* xorshift64 state for RAND placeholders */
 } gc_conn_t;
 
 typedef struct worker {

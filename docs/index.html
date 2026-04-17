@@ -732,6 +732,61 @@
       When using multiple <code>--raw</code> request files, pass <code>--per-tpl-latency</code> to track latency histograms per template. Each template gets its own percentile breakdown (avg, p50, p99, p99.9). Zero overhead when not enabled.
     </p>
 
+    <h3>Dynamic Placeholders</h3>
+    <p>
+      Raw request templates support per-request value substitution via two placeholder types. This enables CRUD benchmarks where each request targets a different database row — no static-ID contention, no dataset exhaustion.
+    </p>
+
+    <h4 style="margin-top:1rem;"><code>{RAND:min:max}</code> — random number in range</h4>
+    <p>
+      Replaced with a random value between <code>min</code> and <code>max</code> (inclusive) on every request. Uses a per-connection xorshift64 PRNG — zero cross-thread contention. Ideal for distributing reads, updates, and deletes across a large ID space.
+    </p>
+    <div class="code-block">
+      <pre><span class="t-green">GET</span> /items/<span class="t-cyan">{RAND:1:100000}</span> HTTP/1.1
+Host: localhost:8080
+</pre>
+    </div>
+    <p style="margin-top:0.5rem;">At runtime: <code>/items/042357</code>, <code>/items/089124</code>, <code>/items/000017</code>, ...</p>
+
+    <h4 style="margin-top:1rem;"><code>{SEQ:start}</code> — globally incrementing counter</h4>
+    <p>
+      Replaced with a unique, monotonically increasing value starting at <code>start</code>. Uses a shared atomic counter across all threads — every request gets a different ID, guaranteed. Ideal for INSERT operations where each row needs a distinct primary key.
+    </p>
+    <div class="code-block">
+      <pre><span class="t-green">POST</span> /items HTTP/1.1
+Host: localhost:8080
+Content-Type: application/json
+Content-Length: 72
+
+{"id":<span class="t-cyan">{SEQ:100001}</span>,"name":"Bench","category":"test","price":100,"qty":50}</pre>
+    </div>
+    <p style="margin-top:0.5rem;">At runtime: <code>"id":100001</code>, <code>"id":100002</code>, <code>"id":100003</code>, ... (never repeats)</p>
+
+    <h4 style="margin-top:1rem;">How it works</h4>
+    <ul>
+      <li>Values are <strong>zero-padded</strong> to the digit width of the max value, so buffer size and <code>Content-Length</code> never change</li>
+      <li><code>{RAND}</code> uses per-connection state — no atomic operations, no lock contention</li>
+      <li><code>{SEQ}</code> uses a single <code>atomic_fetch_add</code> per request (~10 ns overhead)</li>
+      <li>One placeholder per template (first <code>{RAND:</code> or <code>{SEQ:</code> found)</li>
+      <li>A per-connection scratch buffer (memcpy + overwrite) keeps the shared template buffer unmodified</li>
+    </ul>
+
+    <h4 style="margin-top:1rem;">CRUD example</h4>
+    <div class="code-block">
+      <pre><span class="t-green">gcannon</span> http://localhost:8080 \
+  --raw crud-read.raw,crud-update.raw,crud-create.raw,crud-delete.raw \
+  -c 512 -t 64 -d 5s</pre>
+    </div>
+    <table style="margin-top:0.75rem;">
+      <thead><tr><th>Template</th><th>Placeholder</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td><code>GET /crud/{RAND:1:100000}</code></td><td>RAND</td><td>Reads random existing rows</td></tr>
+        <tr><td><code>PUT /crud/{RAND:1:50000}</code></td><td>RAND</td><td>Updates random rows (first half)</td></tr>
+        <tr><td><code>POST /crud</code> + <code>{SEQ:100001}</code> in body</td><td>SEQ</td><td>Creates unique rows (auto-increment)</td></tr>
+        <tr><td><code>DELETE /crud/{RAND:50000:100000}</code></td><td>RAND</td><td>Deletes random rows (second half)</td></tr>
+      </tbody>
+    </table>
+
   </div>
 </section>
 

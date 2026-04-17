@@ -88,6 +88,106 @@ static int parse_duration(const char *s)
     return val;
 }
 
+/* ── placeholder scanning for {RAND:min:max} and {SEQ:start} ──────── */
+
+static int count_digits(uint64_t n)
+{
+    if (n == 0) return 1;
+    int d = 0;
+    while (n > 0) { d++; n /= 10; }
+    return d;
+}
+
+/*
+ * Scan raw template bytes for a single {RAND:min:max} or {SEQ:start}
+ * placeholder. If found, replace it in-place with zero-padded digits
+ * and populate ph. Returns 0 on success, -1 on parse error.
+ * The buffer may be resized if the placeholder text and the padded
+ * width differ — caller must use the returned buf/len.
+ */
+static int scan_placeholder(char **buf, int *len, placeholder_t *ph)
+{
+    memset(ph, 0, sizeof(*ph));
+    ph->type = SUB_NONE;
+
+    /* find {RAND: or {SEQ: */
+    char *p = NULL;
+    for (int i = 0; i < *len - 5; i++) {
+        if ((*buf)[i] == '{' &&
+            (memcmp(*buf + i, "{RAND:", 6) == 0 ||
+             memcmp(*buf + i, "{SEQ:",  5) == 0)) {
+            p = *buf + i;
+            break;
+        }
+    }
+    if (!p) return 0; /* no placeholder */
+
+    /* find closing } */
+    char *end = memchr(p, '}', *len - (int)(p - *buf));
+    if (!end) {
+        fprintf(stderr, "Error: unclosed placeholder in raw template\n");
+        return -1;
+    }
+
+    int ph_start = (int)(p - *buf);
+    int ph_len   = (int)(end - p) + 1; /* includes { and } */
+
+    /* parse type and params */
+    char tmp[128];
+    int tlen = ph_len < (int)sizeof(tmp) ? ph_len : (int)sizeof(tmp) - 1;
+    memcpy(tmp, p, tlen);
+    tmp[tlen] = '\0';
+
+    if (strncmp(tmp, "{RAND:", 6) == 0) {
+        ph->type = SUB_RAND;
+        uint64_t mn = 0, mx = 0;
+        if (sscanf(tmp, "{RAND:%lu:%lu}", &mn, &mx) != 2 || mx < mn) {
+            fprintf(stderr, "Error: bad {RAND:min:max} syntax: %s\n", tmp);
+            return -1;
+        }
+        ph->min = mn;
+        ph->max = mx;
+        ph->width = count_digits(mx);
+    } else if (strncmp(tmp, "{SEQ:", 5) == 0) {
+        ph->type = SUB_SEQ;
+        uint64_t start = 0;
+        if (sscanf(tmp, "{SEQ:%lu}", &start) != 1) {
+            fprintf(stderr, "Error: bad {SEQ:start} syntax: %s\n", tmp);
+            return -1;
+        }
+        ph->min = start;
+        ph->max = 0;
+        atomic_store(&ph->seq, start);
+        ph->width = count_digits(start + 10000000); /* room for growth */
+        if (ph->width < 6) ph->width = 6;
+    } else {
+        return 0;
+    }
+
+    ph->offset = ph_start;
+
+    /* replace placeholder text with zero-padded digits in the buffer.
+     * If ph_len != ph->width, we need to shift the rest of the buffer. */
+    int delta = ph->width - ph_len;
+    int new_len = *len + delta;
+    if (delta != 0) {
+        char *new_buf = malloc(new_len);
+        if (!new_buf) return -1;
+        memcpy(new_buf, *buf, ph_start);
+        memset(new_buf + ph_start, '0', ph->width);
+        memcpy(new_buf + ph_start + ph->width,
+               *buf + ph_start + ph_len,
+               *len - ph_start - ph_len);
+        free(*buf);
+        *buf = new_buf;
+        *len = new_len;
+    } else {
+        memset(*buf + ph_start, '0', ph->width);
+    }
+
+    return 0;
+}
+
 /* ── raw request file loading ──────────────────────────────────────── */
 
 static char *load_file(const char *path, int *out_len)
@@ -316,7 +416,15 @@ int main(int argc, char **argv)
                 }
             }
 
+            /* Scan for {RAND:min:max} or {SEQ:start} placeholder.
+             * Modifies raw in-place (may realloc) and populates .ph */
+            placeholder_t ph;
+            if (scan_placeholder(&raw, &raw_len, &ph) != 0) {
+                free(raw); free(files_dup); return 1;
+            }
+
             build_pipeline_from_raw(raw, raw_len, pipeline_depth, &templates[num_templates]);
+            templates[num_templates].ph = ph;
             num_templates++;
             free(raw);
             tok = strtok_r(NULL, ",", &saveptr);

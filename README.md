@@ -53,6 +53,61 @@ gcannon http://localhost:8080 --raw get.raw,post.raw -c 256 -t 4 -d 5s
 | `--per-tpl-latency` | | Per-template latency histograms (with `--raw` and multiple templates) |
 | `--clear-history` | | Clear saved run history and exit |
 
+## Dynamic Placeholders
+
+Raw request templates support `{RAND:min:max}` and `{SEQ:start}` placeholders that are substituted per-request at send time. This enables CRUD benchmarks where each request targets a different database row.
+
+### `{RAND:min:max}` — random number in range
+
+Each request gets a random value between `min` and `max` (inclusive). Uses a per-connection xorshift64 PRNG — zero cross-thread contention.
+
+```http
+GET /items/{RAND:1:100000} HTTP/1.1
+Host: localhost:8080
+
+```
+
+At runtime: `/items/042357`, `/items/089124`, `/items/000017`, ...
+
+### `{SEQ:start}` — globally incrementing counter
+
+Each request gets a unique, monotonically increasing value starting at `start`. Uses a shared atomic counter across all threads — every request gets a different ID, guaranteed.
+
+```http
+POST /items HTTP/1.1
+Host: localhost:8080
+Content-Type: application/json
+Content-Length: 72
+
+{"id":{SEQ:100001},"name":"Bench","category":"test","price":100,"qty":50}
+```
+
+At runtime: `"id":100001`, `"id":100002`, `"id":100003`, ... (never repeats)
+
+### How it works
+
+- Values are **zero-padded** to a fixed width (digits of max value), so Content-Length stays correct and buffer size never changes
+- `{RAND}` uses per-connection state — no atomic operations, no lock contention
+- `{SEQ}` uses a single `atomic_fetch_add` per request — ~10 ns overhead
+- One placeholder per template (first `{RAND:` or `{SEQ:` found)
+- Each template uses a per-connection scratch buffer (memcpy + overwrite at the placeholder offset before each send)
+
+### CRUD example
+
+```bash
+gcannon http://localhost:8080 \
+  --raw crud-read.raw,crud-read2.raw,crud-update.raw,crud-create.raw,crud-delete.raw \
+  -c 512 -t 64 -d 5s
+```
+
+Where:
+- `crud-read.raw`: `GET /crud/{RAND:1:100000}` — reads random existing rows
+- `crud-update.raw`: `PUT /crud/{RAND:1:50000}` — updates random rows (first half)
+- `crud-create.raw`: `POST /crud` with `{SEQ:100001}` in body — creates unique rows
+- `crud-delete.raw`: `DELETE /crud/{RAND:50000:100000}` — deletes random rows (second half)
+
+Each request hits a different ID. No contention, no exhaustion, no 404 storms.
+
 ## Modes
 
 ### HTTP (default)
