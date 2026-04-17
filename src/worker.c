@@ -49,6 +49,27 @@ static inline void fire_ws_upgrade(worker_t *w, gc_conn_t *c, const int conn_idx
     c->send_done  = 0;
 }
 
+/* Fast xorshift64 PRNG — one per connection, no shared state */
+static inline uint64_t xorshift64(uint64_t *state)
+{
+    uint64_t x = *state;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *state = x;
+    return x;
+}
+
+/* Write a zero-padded decimal number into buf at the given width.
+ * E.g. write_padded(buf, 6, 42357) writes "042357". */
+static inline void write_padded(char *buf, int width, uint64_t val)
+{
+    for (int i = width - 1; i >= 0; i--) {
+        buf[i] = '0' + (char)(val % 10);
+        val /= 10;
+    }
+}
+
 static inline void fire_requests(worker_t *w, gc_conn_t *c, int conn_idx, int count)
 {
     if (count <= 0 || c->send_inflight || c->state != CONN_ACTIVE)
@@ -72,8 +93,38 @@ static inline void fire_requests(worker_t *w, gc_conn_t *c, int conn_idx, int co
         buf = (const char *)w->ws_frame_buf;
     } else {
         const request_tpl_t *tpl = &w->templates[c->tpl_idx];
-        buf = tpl->pipeline_buf;
-        send_len = count * tpl->request_len;
+
+        if (tpl->ph.type != SUB_NONE) {
+            /* Template has a placeholder — copy to scratch buffer and
+             * substitute the value before sending. Each pipelined copy
+             * in the batch gets its own substituted value. */
+            send_len = count * tpl->request_len;
+
+            /* Ensure scratch buffer is large enough */
+            if (c->scratch_len < send_len) {
+                free(c->scratch_buf);
+                c->scratch_buf = malloc(send_len);
+                c->scratch_len = send_len;
+            }
+
+            for (int k = 0; k < count; k++) {
+                char *dst = c->scratch_buf + k * tpl->request_len;
+                memcpy(dst, tpl->pipeline_buf, tpl->request_len);
+
+                uint64_t val;
+                if (tpl->ph.type == SUB_RAND) {
+                    uint64_t range = tpl->ph.max - tpl->ph.min + 1;
+                    val = tpl->ph.min + (xorshift64(&c->rng_state) % range);
+                } else { /* SUB_SEQ */
+                    val = atomic_fetch_add(&((request_tpl_t *)tpl)->ph.seq, 1);
+                }
+                write_padded(dst + tpl->ph.offset, tpl->ph.width, val);
+            }
+            buf = c->scratch_buf;
+        } else {
+            buf = tpl->pipeline_buf;
+            send_len = count * tpl->request_len;
+        }
     }
 
     struct io_uring_sqe *sqe = sqe_get(&w->ring);
@@ -134,6 +185,13 @@ static void start_connect(worker_t *w, const int conn_idx)
     if (c->gen == 1) {
         /* First connect — distribute evenly across templates */
         c->tpl_idx = (w->conn_offset + conn_idx) % w->num_templates;
+        /* Seed per-connection RNG for {RAND} placeholders. Mix thread
+         * id, connection index, and a time component so each connection
+         * gets a unique stream. */
+        c->rng_state = (uint64_t)(w->id + 1) * 6364136223846793005ULL
+                      + (uint64_t)(conn_idx + 1) * 1442695040888963407ULL
+                      + (uint64_t)clock();
+        if (c->rng_state == 0) c->rng_state = 1;
     } else {
         /* Reconnect — rotate to next template */
         c->tpl_idx = (c->tpl_idx + 1) % w->num_templates;
@@ -544,6 +602,7 @@ void worker_destroy(worker_t *w)
     for (int i = 0; i < w->num_conns; i++) {
         if (w->conns[i].fd >= 0)
             close(w->conns[i].fd);
+        free(w->conns[i].scratch_buf);
     }
 
     io_uring_free_buf_ring(&w->ring, w->buf_ring,
