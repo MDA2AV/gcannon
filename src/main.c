@@ -158,8 +158,13 @@ static int scan_placeholder(char **buf, int *len, placeholder_t *ph)
         ph->min = start;
         ph->max = 0;
         atomic_store(&ph->seq, start);
-        ph->width = count_digits(start + 10000000); /* room for growth */
-        if (ph->width < 6) ph->width = 6;
+        /* Width matches digits(start) so the first emitted value has no
+         * leading zeros. JSON number fields reject leading zeros per
+         * RFC 8259, so anything else silently corrupts POST bodies.
+         * Users who need the counter to grow past 10^digits(start)
+         * must pick a start with enough digit headroom — e.g.
+         * {SEQ:10000001} covers ~89M increments with 8-digit width. */
+        ph->width = count_digits(start);
     } else {
         return 0;
     }
