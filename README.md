@@ -84,9 +84,12 @@ Content-Length: 72
 
 At runtime: `"id":100001`, `"id":100002`, `"id":100003`, ... (never repeats)
 
+The width of the emitted value equals `digits(start)`, so the counter can grow within that digit band without changing Content-Length. Pick a `start` with enough digits to cover the expected number of increments — e.g. `{SEQ:10000001}` supports ~89M increments with 8-digit width. Starting near a power of ten (e.g. `{SEQ:999995}`) is not recommended, since the counter will quickly roll past the width.
+
 ### How it works
 
-- Values are **zero-padded** to a fixed width (digits of max value), so Content-Length stays correct and buffer size never changes
+- `{RAND}` values are **zero-padded** to `digits(max)`, keeping Content-Length stable. Safe for URL path segments; avoid placing `{RAND}` inside a JSON number field unless `min` and `max` share the same digit count, since leading zeros are invalid JSON numbers per RFC 8259.
+- `{SEQ}` values are written at `digits(start)` width — no leading zeros, so `{SEQ:start}` is safe inside JSON number fields.
 - `{RAND}` uses per-connection state — no atomic operations, no lock contention
 - `{SEQ}` uses a single `atomic_fetch_add` per request — ~10 ns overhead
 - One placeholder per template (first `{RAND:` or `{SEQ:` found)
