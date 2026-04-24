@@ -30,6 +30,7 @@ static inline void return_buffer(worker_t *w, uint16_t bid)
 
 static inline void arm_recv_multishot(worker_t *w, const int conn_idx)
 {
+    if (!*w->running) return;
     const gc_conn_t *c = &w->conns[conn_idx];
     struct io_uring_sqe *sqe = sqe_get(&w->ring);
     io_uring_prep_recv_multishot(sqe, c->fd, NULL, 0, 0);
@@ -40,6 +41,7 @@ static inline void arm_recv_multishot(worker_t *w, const int conn_idx)
 
 static inline void fire_ws_upgrade(worker_t *w, gc_conn_t *c, const int conn_idx)
 {
+    if (!*w->running) return;
     if (c->send_inflight) return;
     struct io_uring_sqe *sqe = sqe_get(&w->ring);
     io_uring_prep_send(sqe, c->fd, w->ws_upgrade_buf, w->ws_upgrade_len, MSG_NOSIGNAL);
@@ -72,6 +74,7 @@ static inline void write_padded(char *buf, int width, uint64_t val)
 
 static inline void fire_requests(worker_t *w, gc_conn_t *c, int conn_idx, int count)
 {
+    if (!*w->running) return;
     if (count <= 0 || c->send_inflight || c->state != CONN_ACTIVE)
         return;
 
