@@ -131,6 +131,16 @@ int http_parse_responses(http_parser_t *p, const uint8_t *data, int len)
     const uint8_t *end = data + len;
 
     while (ptr < end) {
+        /* Detect stuck iterations: if one full pass through the state blocks
+         * neither advances ptr nor changes state, we need more data — bail
+         * instead of spinning. E.g. chunked response splits the post-chunk
+         * "\r\n" across recv boundaries: chunk_state==2 with 1 byte left
+         * breaks out of the middle while but ptr<end keeps the outer loop
+         * alive forever. */
+        const uint8_t *iter_start_ptr = ptr;
+        const int iter_start_state = p->state;
+        const int iter_start_chunk_state = p->chunk_state;
+
         if (p->state == 0) {
             /* Scanning headers */
             const uint8_t *body_start = parse_headers(p, ptr, (int)(end - ptr));
@@ -221,7 +231,12 @@ int http_parse_responses(http_parser_t *p, const uint8_t *data, int len)
                 }
             }
         }
-next_response:;
+next_response:
+        if (ptr == iter_start_ptr &&
+            p->state == iter_start_state &&
+            p->chunk_state == iter_start_chunk_state) {
+            break;
+        }
     }
 
     return completed;

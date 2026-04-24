@@ -370,11 +370,13 @@ void worker_loop(worker_t *w)
     struct __kernel_timespec ts = { .tv_sec = 0, .tv_nsec = 1000000 }; /* 1ms */
 
     for (;;) {
+        /* Exit check must be unconditional: under sustained load, peek always
+         * returns > 0, so a check gated on `got == 0` never fires and the
+         * worker spins past shutdown. */
+        if (!*w->running) break;
 
         unsigned got = io_uring_peek_batch_cqe(&w->ring, cqes, BATCH_CQES);
         if (got == 0) {
-            /* Nothing pending — if shutting down, exit now */
-            if (!*w->running) break;
             struct io_uring_cqe *wait_cqe;
             io_uring_submit_and_wait_timeout(&w->ring, &wait_cqe, 1, &ts, NULL);
             got = io_uring_peek_batch_cqe(&w->ring, cqes, BATCH_CQES);
