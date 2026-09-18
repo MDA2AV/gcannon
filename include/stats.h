@@ -39,6 +39,9 @@ typedef struct worker_stats {
     uint64_t status_5xx;
     uint64_t status_other;
     uint64_t ws_upgrades;
+    uint64_t ws_upgrade_failures;  /* upgrades the server refused; kept out of
+                                      status_* because those double as the frame
+                                      count in WebSocket mode */
     uint32_t tier1[TIER1_BUCKETS];
     uint32_t tier2[TIER2_BUCKETS];
     uint32_t overflow;
