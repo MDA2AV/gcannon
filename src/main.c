@@ -348,6 +348,15 @@ int main(int argc, char **argv)
         fprintf(stderr, "Error: --recv-buf must be at least 512\n");
         return 1;
     }
+    if (recv_buf_size > 4 * 1024 * 1024) {
+        /* Each worker pre-allocates BUF_RING_ENTRIES buffers of this size, so an
+           unbounded value (e.g. --recv-buf 1000000000) asks for hundreds of GB
+           per worker. Reject obviously-wrong sizes up front. */
+        fprintf(stderr, "Error: --recv-buf must be at most %d (each worker "
+                        "pre-allocates %d buffers of this size)\n",
+                        4 * 1024 * 1024, BUF_RING_ENTRIES);
+        return 1;
+    }
 
     /* Resolve target host */
     char host[256] = {0}, path[1024] = "/";
@@ -522,19 +531,15 @@ int main(int argc, char **argv)
     /* Warmup — let connections establish */
     nanosleep(&(struct timespec){ .tv_sec = 0, .tv_nsec = 100000000 }, NULL); /* 100ms */
 
-    /* Reset counters after warmup (including latency histogram) */
-    for (int i = 0; i < num_threads; i++) {
-        latency_hist_t *saved_tpl = ctxs[i].worker.stats.tpl_latency;
-        int saved_n = ctxs[i].worker.stats.num_tpl_latency;
-        uint64_t saved_ws_upgrades = ctxs[i].worker.stats.ws_upgrades;
-        memset(&ctxs[i].worker.stats, 0, sizeof(worker_stats_t));
-        ctxs[i].worker.stats.ws_upgrades = saved_ws_upgrades;
-        if (saved_tpl) {
-            memset(saved_tpl, 0, saved_n * sizeof(latency_hist_t));
-            ctxs[i].worker.stats.tpl_latency = saved_tpl;
-            ctxs[i].worker.stats.num_tpl_latency = saved_n;
-        }
-    }
+    /* Reset counters after warmup. Signal each worker to zero its own stats
+     * from its own thread; memset-ing them here would race with the workers
+     * still incrementing those same counters (a data race / undefined behavior). */
+    for (int i = 0; i < num_threads; i++)
+        ctxs[i].worker.reset_request = 1;
+    /* Wait until every worker has acknowledged before we start the clock. */
+    for (int i = 0; i < num_threads; i++)
+        while (ctxs[i].worker.reset_request)
+            nanosleep(&(struct timespec){ .tv_sec = 0, .tv_nsec = 100000 }, NULL); /* 100us */
 
     struct timespec start_time;
     clock_gettime(CLOCK_MONOTONIC, &start_time);

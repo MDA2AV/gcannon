@@ -21,12 +21,19 @@ typedef struct http_parser {
     int  chunk_state;     /* 0 = reading size line, 1 = data, 2 = post-chunk CRLF */
     char chunk_line[20];  /* accumulates hex size line across recv boundaries */
     int  chunk_line_len;
+    int  parse_error;     /* 1 = unrecoverable (malformed response or headers
+                             exceed header_buf) — caller must reconnect */
     /* Status codes of completed responses (filled by http_parse_responses) */
     int  completed_statuses[256];
     int  completed_count;
+    /* Per-call status-class tallies. Unlike completed_statuses (capped at 256
+       entries), these are unbounded, so status accounting stays correct when a
+       single recv carries more than 256 pipelined responses. */
+    int  cls_2xx, cls_3xx, cls_4xx, cls_5xx, cls_other;
 } http_parser_t;
 
-/* Feed data into the parser. Returns number of complete responses found.
+/* Feed data into the parser. Returns number of complete responses found,
+ * or -1 on unrecoverable parse failure (caller must drop the connection).
  * Parser state is updated in-place for partial responses across buffers. */
 int http_parse_responses(http_parser_t *p, const uint8_t *data, int len);
 
