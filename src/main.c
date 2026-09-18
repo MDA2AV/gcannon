@@ -341,6 +341,38 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    /* Validate counts before anything derives from them. num_threads in
+       particular is a divisor below, so -t 0 used to die with SIGFPE. */
+    if (num_threads < 1) {
+        fprintf(stderr, "Error: -t must be at least 1 (got %d)\n", num_threads);
+        return 1;
+    }
+    if (num_connections < 1) {
+        fprintf(stderr, "Error: -c must be at least 1 (got %d)\n", num_connections);
+        return 1;
+    }
+    if (pipeline_depth < 1) {
+        fprintf(stderr, "Error: -p must be at least 1 (got %d)\n", pipeline_depth);
+        return 1;
+    }
+    if (duration_sec < 1) {
+        fprintf(stderr, "Error: -d must be at least 1 second (got %d)\n", duration_sec);
+        return 1;
+    }
+    if (requests_per_conn < 0) {
+        fprintf(stderr, "Error: -r must not be negative (got %d)\n", requests_per_conn);
+        return 1;
+    }
+    if (num_connections < num_threads) {
+        /* Threads past the remainder would get zero connections and spin in
+           the event loop doing nothing, quietly producing a slower run than
+           the flags suggest. */
+        fprintf(stderr, "Error: -c (%d) must be at least -t (%d); every thread "
+                        "needs at least one connection\n",
+                num_connections, num_threads);
+        return 1;
+    }
+
     if (pipeline_depth > PIPELINE_DEPTH_MAX)
         pipeline_depth = PIPELINE_DEPTH_MAX;
 
