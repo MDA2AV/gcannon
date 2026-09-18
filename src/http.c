@@ -52,6 +52,8 @@ void http_parser_reset(http_parser_t *p)
     p->chunk_remaining = 0;
     p->chunk_state = 0;
     p->chunk_line_len = 0;
+    p->crlf_seen = 0;
+    p->parse_error = 0;
 }
 
 /*
@@ -76,10 +78,19 @@ static const uint8_t *parse_headers(http_parser_t *p, const uint8_t *data, int l
     int ret = phr_parse_response(p->header_buf, (size_t)p->header_buf_len,
                                  &minor_version, &status, &msg, &msg_len,
                                  headers, &num_headers, 0);
-    if (ret == -2)
-        return NULL; /* incomplete */
-    if (ret == -1)
-        return NULL; /* parse error, treat as incomplete */
+    if (ret == -2) {
+        /* Incomplete — but if header_buf is already full, more data can
+           never complete the parse: the connection would wedge silently.
+           Headers larger than sizeof(header_buf) are unrecoverable. */
+        if (p->header_buf_len >= (int)sizeof(p->header_buf) - 1)
+            p->parse_error = 1;
+        return NULL;
+    }
+    if (ret == -1) {
+        /* Malformed response — no way to resync to the next response. */
+        p->parse_error = 1;
+        return NULL;
+    }
 
     int header_len = ret;
     p->status_code = status;
@@ -113,6 +124,7 @@ static const uint8_t *parse_headers(http_parser_t *p, const uint8_t *data, int l
         p->chunk_state = 0;
         p->chunk_remaining = 0;
         p->chunk_line_len = 0;
+        p->crlf_seen = 0;
     } else {
         p->state = 1;
     }
@@ -123,10 +135,21 @@ static const uint8_t *parse_headers(http_parser_t *p, const uint8_t *data, int l
     return data + consumed_from_data;
 }
 
+/* Tally one completed response into the unbounded per-call class counters. */
+static inline void classify_status(http_parser_t *p, int sc)
+{
+    if      (sc >= 200 && sc < 300) p->cls_2xx++;
+    else if (sc >= 300 && sc < 400) p->cls_3xx++;
+    else if (sc >= 400 && sc < 500) p->cls_4xx++;
+    else if (sc >= 500 && sc < 600) p->cls_5xx++;
+    else                            p->cls_other++;
+}
+
 int http_parse_responses(http_parser_t *p, const uint8_t *data, int len)
 {
     int completed = 0;
     p->completed_count = 0;
+    p->cls_2xx = p->cls_3xx = p->cls_4xx = p->cls_5xx = p->cls_other = 0;
     const uint8_t *ptr = data;
     const uint8_t *end = data + len;
 
@@ -144,8 +167,11 @@ int http_parse_responses(http_parser_t *p, const uint8_t *data, int len)
         if (p->state == 0) {
             /* Scanning headers */
             const uint8_t *body_start = parse_headers(p, ptr, (int)(end - ptr));
-            if (!body_start)
+            if (!body_start) {
+                if (p->parse_error)
+                    return -1;
                 break; /* Need more data */
+            }
             ptr = body_start;
         }
 
@@ -160,6 +186,7 @@ int http_parse_responses(http_parser_t *p, const uint8_t *data, int len)
             if (p->body_received >= p->content_length) {
                 if (p->completed_count < 256)
                     p->completed_statuses[p->completed_count++] = p->status_code;
+                classify_status(p, p->status_code);
                 completed++;
                 p->state = 0;
                 p->content_length = -1;
@@ -181,20 +208,15 @@ int http_parse_responses(http_parser_t *p, const uint8_t *data, int len)
                             long size = strtol(p->chunk_line, NULL, 16);
                             p->chunk_line_len = 0;
                             if (size == 0) {
-                                /* Final chunk — skip optional trailing CRLF */
-                                if (ptr + 1 < end && ptr[0] == '\r' && ptr[1] == '\n')
-                                    ptr += 2;
-                                if (p->completed_count < 256)
-                                    p->completed_statuses[p->completed_count++] = p->status_code;
-                                completed++;
-                                p->state = 0;
-                                p->content_length = -1;
-                                p->body_received = 0;
-                                p->status_code = 0;
-                                p->chunked = 0;
-                                p->chunk_remaining = 0;
-                                p->chunk_state = 0;
-                                goto next_response;
+                                /* Last chunk. What follows is the trailer
+                                   section, and it has to be consumed here —
+                                   leaving it for the next call means it gets
+                                   parsed as the start of the next response's
+                                   status line, which picohttpparser rejects
+                                   (it only tolerates a leading empty line for
+                                   requests, not responses). */
+                                p->chunk_state = 3;
+                                break;
                             }
                             p->chunk_remaining = (int)size;
                             p->chunk_state = 1;
@@ -213,21 +235,67 @@ int http_parse_responses(http_parser_t *p, const uint8_t *data, int len)
                     int consume = available < p->chunk_remaining ? available : p->chunk_remaining;
                     ptr += consume;
                     p->chunk_remaining -= consume;
-                    if (p->chunk_remaining == 0)
+                    if (p->chunk_remaining == 0) {
                         p->chunk_state = 2;
-                    else
+                        p->crlf_seen = 0;
+                    } else {
                         break; /* need more data */
+                    }
                 }
 
                 if (p->chunk_state == 2) {
-                    /* Consume post-chunk CRLF */
-                    int available = (int)(end - ptr);
-                    if (available >= 2) {
-                        ptr += 2; /* skip \r\n */
-                        p->chunk_state = 0;
-                    } else {
-                        break; /* need more data for CRLF */
+                    /* Consume the CRLF terminating the chunk data. Counted,
+                       because a recv boundary can land between the CR and the
+                       LF: skipping a fixed two bytes on the next call would
+                       swallow the first byte of the following chunk-size line
+                       and desynchronise the rest of the body. */
+                    while (p->crlf_seen < 2 && ptr < end) {
+                        ptr++;
+                        p->crlf_seen++;
                     }
+                    if (p->crlf_seen < 2)
+                        break; /* need more data for the CRLF */
+                    p->crlf_seen = 0;
+                    p->chunk_state = 0;
+                }
+
+                if (p->chunk_state == 3) {
+                    /* Trailer section: zero or more header lines, then an
+                       empty line. chunk_line_len counts the bytes seen so far
+                       on the current line and persists across calls, so a
+                       recv boundary anywhere in here — including between the
+                       CR and LF of the final empty line — is handled. */
+                    int done = 0;
+                    while (ptr < end) {
+                        const char c = (char)*ptr++;
+                        if (c == '\n') {
+                            const int empty = p->chunk_line_len <= 1; /* CR only */
+                            p->chunk_line_len = 0;
+                            if (empty) { done = 1; break; }
+                        } else if (p->chunk_line_len < 2) {
+                            /* Saturating: two or more bytes before the LF
+                               already proves this is a trailer header rather
+                               than the terminating empty line. */
+                            p->chunk_line_len++;
+                        }
+                    }
+                    if (!done)
+                        break; /* need more data for the trailer */
+
+                    if (p->completed_count < 256)
+                        p->completed_statuses[p->completed_count++] = p->status_code;
+                    classify_status(p, p->status_code);
+                    completed++;
+                    p->state = 0;
+                    p->content_length = -1;
+                    p->body_received = 0;
+                    p->status_code = 0;
+                    p->chunked = 0;
+                    p->chunk_remaining = 0;
+                    p->chunk_state = 0;
+                    p->chunk_line_len = 0;
+                    p->crlf_seen = 0;
+                    goto next_response;
                 }
             }
         }

@@ -341,11 +341,52 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    /* Validate counts before anything derives from them. num_threads in
+       particular is a divisor below, so -t 0 used to die with SIGFPE. */
+    if (num_threads < 1) {
+        fprintf(stderr, "Error: -t must be at least 1 (got %d)\n", num_threads);
+        return 1;
+    }
+    if (num_connections < 1) {
+        fprintf(stderr, "Error: -c must be at least 1 (got %d)\n", num_connections);
+        return 1;
+    }
+    if (pipeline_depth < 1) {
+        fprintf(stderr, "Error: -p must be at least 1 (got %d)\n", pipeline_depth);
+        return 1;
+    }
+    if (duration_sec < 1) {
+        fprintf(stderr, "Error: -d must be at least 1 second (got %d)\n", duration_sec);
+        return 1;
+    }
+    if (requests_per_conn < 0) {
+        fprintf(stderr, "Error: -r must not be negative (got %d)\n", requests_per_conn);
+        return 1;
+    }
+    if (num_connections < num_threads) {
+        /* Threads past the remainder would get zero connections and spin in
+           the event loop doing nothing, quietly producing a slower run than
+           the flags suggest. */
+        fprintf(stderr, "Error: -c (%d) must be at least -t (%d); every thread "
+                        "needs at least one connection\n",
+                num_connections, num_threads);
+        return 1;
+    }
+
     if (pipeline_depth > PIPELINE_DEPTH_MAX)
         pipeline_depth = PIPELINE_DEPTH_MAX;
 
     if (recv_buf_size < 512) {
         fprintf(stderr, "Error: --recv-buf must be at least 512\n");
+        return 1;
+    }
+    if (recv_buf_size > 4 * 1024 * 1024) {
+        /* Each worker pre-allocates BUF_RING_ENTRIES buffers of this size, so an
+           unbounded value (e.g. --recv-buf 1000000000) asks for hundreds of GB
+           per worker. Reject obviously-wrong sizes up front. */
+        fprintf(stderr, "Error: --recv-buf must be at most %d (each worker "
+                        "pre-allocates %d buffers of this size)\n",
+                        4 * 1024 * 1024, BUF_RING_ENTRIES);
         return 1;
     }
 
@@ -378,6 +419,15 @@ int main(int argc, char **argv)
         int count = 1;
         for (const char *p = raw_files; *p; p++)
             if (*p == ',') count++;
+
+        /* worker_stats_t indexes tpl_responses[]/tpl_responses_2xx[] by
+           template, and both are fixed at MAX_TEMPLATES. Going past that
+           writes over the adjacent tpl_latency pointer. */
+        if (count > MAX_TEMPLATES) {
+            fprintf(stderr, "Error: at most %d --raw templates supported "
+                            "(got %d)\n", MAX_TEMPLATES, count);
+            return 1;
+        }
 
         templates = calloc(count, sizeof(request_tpl_t));
         if (!templates) { fprintf(stderr, "Error: out of memory\n"); return 1; }
@@ -435,6 +485,15 @@ int main(int argc, char **argv)
             tok = strtok_r(NULL, ",", &saveptr);
         }
         free(files_dup);
+
+        /* strtok_r skips empty fields, so --raw "" and --raw ",,," both get
+           here with nothing loaded. num_templates is a divisor in
+           start_connect's template assignment, so zero is a SIGFPE. */
+        if (num_templates == 0) {
+            fprintf(stderr, "Error: --raw listed no template files\n");
+            free(templates);
+            return 1;
+        }
     } else {
         /* Build GET request from URL */
         templates = calloc(1, sizeof(request_tpl_t));
@@ -522,19 +581,15 @@ int main(int argc, char **argv)
     /* Warmup — let connections establish */
     nanosleep(&(struct timespec){ .tv_sec = 0, .tv_nsec = 100000000 }, NULL); /* 100ms */
 
-    /* Reset counters after warmup (including latency histogram) */
-    for (int i = 0; i < num_threads; i++) {
-        latency_hist_t *saved_tpl = ctxs[i].worker.stats.tpl_latency;
-        int saved_n = ctxs[i].worker.stats.num_tpl_latency;
-        uint64_t saved_ws_upgrades = ctxs[i].worker.stats.ws_upgrades;
-        memset(&ctxs[i].worker.stats, 0, sizeof(worker_stats_t));
-        ctxs[i].worker.stats.ws_upgrades = saved_ws_upgrades;
-        if (saved_tpl) {
-            memset(saved_tpl, 0, saved_n * sizeof(latency_hist_t));
-            ctxs[i].worker.stats.tpl_latency = saved_tpl;
-            ctxs[i].worker.stats.num_tpl_latency = saved_n;
-        }
-    }
+    /* Reset counters after warmup. Signal each worker to zero its own stats
+     * from its own thread; memset-ing them here would race with the workers
+     * still incrementing those same counters (a data race / undefined behavior). */
+    for (int i = 0; i < num_threads; i++)
+        ctxs[i].worker.reset_request = 1;
+    /* Wait until every worker has acknowledged before we start the clock. */
+    for (int i = 0; i < num_threads; i++)
+        while (ctxs[i].worker.reset_request)
+            nanosleep(&(struct timespec){ .tv_sec = 0, .tv_nsec = 100000 }, NULL); /* 100us */
 
     struct timespec start_time;
     clock_gettime(CLOCK_MONOTONIC, &start_time);

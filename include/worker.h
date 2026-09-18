@@ -46,6 +46,7 @@ typedef struct gc_conn {
     int              send_inflight;
     int              send_total;     /* total bytes we intended to send */
     int              send_done;      /* bytes confirmed sent so far */
+    const char      *send_buf;       /* buffer currently in flight (for partial-send resubmit) */
     int              requests_sent;  /* total requests sent on this connection */
     int              responses_recv; /* total responses received on this connection */
     char            *scratch_buf;    /* per-conn buffer for placeholder substitution */
@@ -81,6 +82,8 @@ typedef struct worker {
     int                       per_tpl_latency;   /* 1 = per-template latency histograms */
     worker_stats_t            stats;
     volatile int             *running;
+    volatile int              reset_request;     /* main sets after warmup; worker
+                                                    zeroes its own stats and clears */
     int                       id;
 } worker_t;
 

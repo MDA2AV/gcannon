@@ -47,6 +47,7 @@ static inline void fire_ws_upgrade(worker_t *w, gc_conn_t *c, const int conn_idx
     c->send_inflight = 1;
     c->send_total = w->ws_upgrade_len;
     c->send_done  = 0;
+    c->send_buf   = w->ws_upgrade_buf;
 }
 
 /* Fast xorshift64 PRNG — one per connection, no shared state */
@@ -102,8 +103,11 @@ static inline void fire_requests(worker_t *w, gc_conn_t *c, int conn_idx, int co
 
             /* Ensure scratch buffer is large enough */
             if (c->scratch_len < send_len) {
+                char *nb = malloc(send_len);
+                if (!nb) return;   /* OOM — skip this batch; retry on next event
+                                      (keeps the old buffer; never deref NULL) */
                 free(c->scratch_buf);
-                c->scratch_buf = malloc(send_len);
+                c->scratch_buf = nb;
                 c->scratch_len = send_len;
             }
 
@@ -144,6 +148,7 @@ static inline void fire_requests(worker_t *w, gc_conn_t *c, int conn_idx, int co
     c->send_inflight = 1;
     c->send_total = send_len;
     c->send_done  = 0;
+    c->send_buf   = buf;
     c->pipeline_inflight += count;
     c->requests_sent += count;
     w->stats.requests += count;
@@ -375,6 +380,23 @@ void worker_loop(worker_t *w)
          * worker spins past shutdown. */
         if (!*w->running) break;
 
+        /* Warmup reset: zero our own stats from this thread. Doing it from the
+         * main thread (as before) raced with these same counters being
+         * incremented here — a concurrent memset vs ++ is undefined behavior. */
+        if (w->reset_request) {
+            latency_hist_t *saved_tpl = w->stats.tpl_latency;
+            int saved_n = w->stats.num_tpl_latency;
+            uint64_t saved_ws = w->stats.ws_upgrades;
+            memset(&w->stats, 0, sizeof(w->stats));
+            if (saved_tpl) {
+                memset(saved_tpl, 0, (size_t)saved_n * sizeof(latency_hist_t));
+                w->stats.tpl_latency = saved_tpl;
+                w->stats.num_tpl_latency = saved_n;
+            }
+            w->stats.ws_upgrades = saved_ws;
+            w->reset_request = 0;
+        }
+
         unsigned got = io_uring_peek_batch_cqe(&w->ring, cqes, BATCH_CQES);
         if (got == 0) {
             struct io_uring_cqe *wait_cqe;
@@ -432,19 +454,16 @@ void worker_loop(worker_t *w)
 
                 c->send_done += res;
                 if (c->send_done < c->send_total) {
-                    /* Partial send — resubmit remainder */
-                    const char *base;
-                    if (c->state == CONN_WS_UPGRADING) {
-                        base = w->ws_upgrade_buf;
-                    } else if (w->ws_mode) {
-                        base = (const char *)w->ws_frame_buf;
-                    } else {
-                        base = w->templates[c->tpl_idx].pipeline_buf;
-                    }
+                    /* Partial send — resubmit remainder from the exact buffer
+                       that was sent. For placeholder templates this is the
+                       per-conn scratch buffer holding the substituted value,
+                       not the template's pipeline_buf (which still carries the
+                       zero padding). send_buf stays valid because fire_requests
+                       early-returns while send_inflight is set. */
                     const int off = c->send_done;
                     struct io_uring_sqe *sqe = sqe_get(&w->ring);
                     io_uring_prep_send(sqe, c->fd,
-                                       base + off,
+                                       c->send_buf + off,
                                        c->send_total - off, MSG_NOSIGNAL);
                     io_uring_sqe_set_data64(sqe, PACK_UD(UD_SEND, c->gen, conn_idx));
                 } else {
@@ -487,6 +506,13 @@ void worker_loop(worker_t *w)
                 if (c->state == CONN_WS_UPGRADING) {
                     /* Parse HTTP upgrade response — look for 101 */
                     completed = http_parse_responses(&c->parser, buf, res);
+                    if (completed < 0) {
+                        /* Unrecoverable parse failure — drop and reconnect */
+                        w->stats.read_errors++;
+                        return_buffer(w, bid);
+                        reconnect(w, conn_idx);
+                        break;
+                    }
                     if (completed > 0 && c->parser.completed_statuses[0] == 101) {
                         c->state = CONN_ACTIVE;
                         w->stats.ws_upgrades++;
@@ -522,6 +548,14 @@ void worker_loop(worker_t *w)
                     completed = ws_parse_frames(&c->ws_parser, buf, res);
                 } else {
                     completed = http_parse_responses(&c->parser, buf, res);
+                    if (completed < 0) {
+                        /* Unrecoverable parse failure (oversized headers or
+                           malformed response) — drop and reconnect */
+                        w->stats.read_errors++;
+                        return_buffer(w, bid);
+                        reconnect(w, conn_idx);
+                        break;
+                    }
                 }
 
                 /* In default mode, timestamp after parsing */
@@ -540,19 +574,6 @@ void worker_loop(worker_t *w)
                     if (w->ws_mode) {
                         w->stats.status_2xx++;
                         w->stats.tpl_responses_2xx[c->tpl_idx]++;
-                    } else {
-                        /* Track status codes */
-                        if (j < c->parser.completed_count) {
-                            const int sc = c->parser.completed_statuses[j];
-                            if (sc >= 200 && sc < 300) {
-                                w->stats.status_2xx++;
-                                w->stats.tpl_responses_2xx[c->tpl_idx]++;
-                            }
-                            else if (sc >= 300 && sc < 400)  w->stats.status_3xx++;
-                            else if (sc >= 400 && sc < 500)  w->stats.status_4xx++;
-                            else if (sc >= 500 && sc < 600)  w->stats.status_5xx++;
-                            else                             w->stats.status_other++;
-                        }
                     }
 
                     if (c->send_time_head < c->send_time_tail) {
@@ -564,6 +585,19 @@ void worker_loop(worker_t *w)
                             hist_record(&w->stats.tpl_latency[c->tpl_idx], lat);
                         c->send_time_head++;
                     }
+                }
+
+                /* HTTP status classes: add the parser's per-call tallies in
+                   bulk. These are unbounded, so accounting stays exact even
+                   when one recv carried more than 256 responses (the cap on
+                   completed_statuses[] would otherwise drop the overflow). */
+                if (!w->ws_mode) {
+                    w->stats.status_2xx   += c->parser.cls_2xx;
+                    w->stats.status_3xx   += c->parser.cls_3xx;
+                    w->stats.status_4xx   += c->parser.cls_4xx;
+                    w->stats.status_5xx   += c->parser.cls_5xx;
+                    w->stats.status_other += c->parser.cls_other;
+                    w->stats.tpl_responses_2xx[c->tpl_idx] += c->parser.cls_2xx;
                 }
 
                 return_buffer(w, bid);
