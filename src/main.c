@@ -341,6 +341,38 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    /* Validate counts before anything derives from them. num_threads in
+       particular is a divisor below, so -t 0 used to die with SIGFPE. */
+    if (num_threads < 1) {
+        fprintf(stderr, "Error: -t must be at least 1 (got %d)\n", num_threads);
+        return 1;
+    }
+    if (num_connections < 1) {
+        fprintf(stderr, "Error: -c must be at least 1 (got %d)\n", num_connections);
+        return 1;
+    }
+    if (pipeline_depth < 1) {
+        fprintf(stderr, "Error: -p must be at least 1 (got %d)\n", pipeline_depth);
+        return 1;
+    }
+    if (duration_sec < 1) {
+        fprintf(stderr, "Error: -d must be at least 1 second (got %d)\n", duration_sec);
+        return 1;
+    }
+    if (requests_per_conn < 0) {
+        fprintf(stderr, "Error: -r must not be negative (got %d)\n", requests_per_conn);
+        return 1;
+    }
+    if (num_connections < num_threads) {
+        /* Threads past the remainder would get zero connections and spin in
+           the event loop doing nothing, quietly producing a slower run than
+           the flags suggest. */
+        fprintf(stderr, "Error: -c (%d) must be at least -t (%d); every thread "
+                        "needs at least one connection\n",
+                num_connections, num_threads);
+        return 1;
+    }
+
     if (pipeline_depth > PIPELINE_DEPTH_MAX)
         pipeline_depth = PIPELINE_DEPTH_MAX;
 
@@ -387,6 +419,15 @@ int main(int argc, char **argv)
         int count = 1;
         for (const char *p = raw_files; *p; p++)
             if (*p == ',') count++;
+
+        /* worker_stats_t indexes tpl_responses[]/tpl_responses_2xx[] by
+           template, and both are fixed at MAX_TEMPLATES. Going past that
+           writes over the adjacent tpl_latency pointer. */
+        if (count > MAX_TEMPLATES) {
+            fprintf(stderr, "Error: at most %d --raw templates supported "
+                            "(got %d)\n", MAX_TEMPLATES, count);
+            return 1;
+        }
 
         templates = calloc(count, sizeof(request_tpl_t));
         if (!templates) { fprintf(stderr, "Error: out of memory\n"); return 1; }
@@ -444,6 +485,15 @@ int main(int argc, char **argv)
             tok = strtok_r(NULL, ",", &saveptr);
         }
         free(files_dup);
+
+        /* strtok_r skips empty fields, so --raw "" and --raw ",,," both get
+           here with nothing loaded. num_templates is a divisor in
+           start_connect's template assignment, so zero is a SIGFPE. */
+        if (num_templates == 0) {
+            fprintf(stderr, "Error: --raw listed no template files\n");
+            free(templates);
+            return 1;
+        }
     } else {
         /* Build GET request from URL */
         templates = calloc(1, sizeof(request_tpl_t));
