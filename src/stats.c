@@ -77,6 +77,7 @@ void stats_merge(worker_stats_t *dst, const worker_stats_t *src)
     dst->status_5xx     += src->status_5xx;
     dst->status_other   += src->status_other;
     dst->ws_upgrades    += src->ws_upgrades;
+    dst->ws_upgrade_failures += src->ws_upgrade_failures;
     dst->latency_count  += src->latency_count;
     dst->latency_sum_us += src->latency_sum_us;
     dst->overflow       += src->overflow;
@@ -187,6 +188,8 @@ void stats_print(const worker_stats_t *s, double elapsed_sec, int num_templates,
 
     if (ws_mode) {
         printf("  WS upgrades: %lu\n", s->ws_upgrades);
+        if (s->ws_upgrade_failures)
+            printf("  WS upgrades refused: %lu\n", s->ws_upgrade_failures);
         printf("  WS frames:   %lu\n", s->status_2xx);
     } else {
         printf("  Status codes: 2xx=%lu, 3xx=%lu, 4xx=%lu, 5xx=%lu",
@@ -280,6 +283,7 @@ void stats_print_json(const worker_stats_t *s, double elapsed_sec,
 
     if (ws_mode) {
         printf("  \"ws_upgrades\": %lu,\n", s->ws_upgrades);
+        printf("  \"ws_upgrade_failures\": %lu,\n", s->ws_upgrade_failures);
         printf("  \"ws_frames\": %lu,\n", s->status_2xx);
     }
 

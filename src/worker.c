@@ -386,7 +386,8 @@ void worker_loop(worker_t *w)
         if (w->reset_request) {
             latency_hist_t *saved_tpl = w->stats.tpl_latency;
             int saved_n = w->stats.num_tpl_latency;
-            uint64_t saved_ws = w->stats.ws_upgrades;
+            uint64_t saved_ws      = w->stats.ws_upgrades;
+            uint64_t saved_ws_fail = w->stats.ws_upgrade_failures;
             memset(&w->stats, 0, sizeof(w->stats));
             if (saved_tpl) {
                 memset(saved_tpl, 0, (size_t)saved_n * sizeof(latency_hist_t));
@@ -394,6 +395,7 @@ void worker_loop(worker_t *w)
                 w->stats.num_tpl_latency = saved_n;
             }
             w->stats.ws_upgrades = saved_ws;
+            w->stats.ws_upgrade_failures = saved_ws_fail;
             w->reset_request = 0;
         }
 
@@ -522,13 +524,14 @@ void worker_loop(worker_t *w)
                         fire_requests(w, c, conn_idx, w->pipeline_depth);
                         break;
                     } else if (completed > 0) {
-                        /* Upgrade rejected — record actual status class */
-                        const int sc = c->parser.completed_statuses[0];
-                        if      (sc >= 200 && sc < 300) w->stats.status_2xx++;
-                        else if (sc >= 300 && sc < 400) w->stats.status_3xx++;
-                        else if (sc >= 400 && sc < 500) w->stats.status_4xx++;
-                        else if (sc >= 500 && sc < 600) w->stats.status_5xx++;
-                        else                            w->stats.status_other++;
+                        /* Upgrade refused. This is a failed handshake, not a
+                           response to a benchmark request, so it must not land
+                           in status_*: in WebSocket mode those counters ARE the
+                           frame tally (stats_print reports status_2xx as "WS
+                           frames"), and a refusal carrying a 2xx also pushed
+                           status_2xx above `responses`, underflowing the
+                           unsigned subtraction in main's expected-status check. */
+                        w->stats.ws_upgrade_failures++;
                         return_buffer(w, bid);
                         reconnect(w, conn_idx);
                         break;

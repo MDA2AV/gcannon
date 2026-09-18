@@ -684,7 +684,11 @@ int main(int argc, char **argv)
     else if (expected_status >= 400 && expected_status < 500)  expected_count = total.status_4xx;
     else if (expected_status >= 500 && expected_status < 600)  expected_count = total.status_5xx;
 
-    uint64_t unexpected = total.responses - expected_count;
+    /* Saturating: expected_count is a separate counter, so any accounting bug
+       that pushes it above `responses` would otherwise wrap this to ~2^64 and
+       print a nonsense warning instead of a small, believable one. */
+    uint64_t unexpected = total.responses > expected_count
+                        ? total.responses - expected_count : 0;
     int exit_code = 0;
     if (unexpected > 0 && total.responses > 0) {
         if (!tui_mode && !json_mode)
