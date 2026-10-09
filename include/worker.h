@@ -52,6 +52,7 @@ typedef struct gc_conn {
     char            *scratch_buf;    /* per-conn buffer for placeholder substitution */
     int              scratch_len;    /* allocated size of scratch_buf */
     uint64_t         rng_state;      /* xorshift64 state for RAND placeholders */
+    int              settled;        /* first setup attempt finished (ready or failed) */
 } gc_conn_t;
 
 typedef struct worker {
@@ -84,6 +85,8 @@ typedef struct worker {
     volatile int             *running;
     volatile int              reset_request;     /* main sets after warmup; worker
                                                     zeroes its own stats and clears */
+    _Atomic int               conns_settled;     /* conns whose first setup attempt
+                                                    finished; main waits on it */
     int                       id;
 } worker_t;
 

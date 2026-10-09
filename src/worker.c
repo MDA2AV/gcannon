@@ -162,6 +162,17 @@ static inline uint64_t timespec_diff_us(const struct timespec *start, const stru
     return (uint64_t)(sec * 1000000L + nsec / 1000L);
 }
 
+/* A connection settles when its first setup attempt finishes — it became ready
+   for requests, or it failed and is now retrying. main holds the measurement
+   clock until every connection has settled, so setup (WS upgrades) never runs
+   inside the measured window. Later reconnects don't count again. */
+static inline void conn_settle(worker_t *w, gc_conn_t *c)
+{
+    if (c->settled) return;
+    c->settled = 1;
+    atomic_fetch_add_explicit(&w->conns_settled, 1, memory_order_relaxed);
+}
+
 static int create_connect_socket(int linger_rst)
 {
     const int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
@@ -181,6 +192,7 @@ static void start_connect(worker_t *w, const int conn_idx)
     const int fd = create_connect_socket(w->requests_per_conn > 0);
     if (fd < 0) {
         w->stats.connect_errors++;
+        conn_settle(w, c);   /* never retried, so don't hold the warmup on it */
         return;
     }
 
@@ -234,6 +246,7 @@ static void close_conn(worker_t *w, gc_conn_t *c, const int conn_idx)
 
 static void reconnect(worker_t *w, const int conn_idx)
 {
+    conn_settle(w, &w->conns[conn_idx]);   /* a failed first attempt counts */
     close_conn(w, &w->conns[conn_idx], conn_idx);
     w->stats.reconnects++;
     if (*w->running)
@@ -441,6 +454,7 @@ void worker_loop(worker_t *w)
                     fire_ws_upgrade(w, c, conn_idx);
                 } else {
                     c->state = CONN_ACTIVE;
+                    conn_settle(w, c);
                     fire_requests(w, c, conn_idx, w->pipeline_depth);
                 }
                 break;
@@ -517,6 +531,7 @@ void worker_loop(worker_t *w)
                     }
                     if (completed > 0 && c->parser.completed_statuses[0] == 101) {
                         c->state = CONN_ACTIVE;
+                        conn_settle(w, c);
                         w->stats.ws_upgrades++;
                         ws_parser_reset(&c->ws_parser);
                         return_buffer(w, bid);
