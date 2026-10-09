@@ -15,6 +15,7 @@ so the handshake reply never shares a write with frame data.
 
   --refuse-every N   refuse every Nth upgrade (0 = never refuse)
   --refuse-status S  status line to refuse with (default "200 OK")
+  --upgrade-delay S  wait S seconds before answering each upgrade
 
 Binds an ephemeral port and prints "PORT <n>" on stdout.
 """
@@ -23,6 +24,7 @@ import argparse
 import socket
 import sys
 import threading
+import time
 
 ACCEPT = (
     b"HTTP/1.1 101 Switching Protocols\r\n"
@@ -65,6 +67,8 @@ def serve_conn(conn, args, frame_size, echo, refuse):
                 carry = len(buf) - (idx + 4)
                 buf = b""
                 upgraded = True
+                if args.upgrade_delay:
+                    time.sleep(args.upgrade_delay)
                 if args.refuse_every and next_seq() % args.refuse_every == 0:
                     conn.sendall(refuse)
                     return          # refused: drop it, gcannon reconnects
@@ -89,6 +93,7 @@ def main():
     ap.add_argument("--refuse-every", type=int, default=0)
     ap.add_argument("--refuse-status", default="200 OK")
     ap.add_argument("--payload", type=int, default=5)
+    ap.add_argument("--upgrade-delay", type=float, default=0.0)
     args = ap.parse_args()
 
     frame_size = 2 + 4 + args.payload            # client frames are masked

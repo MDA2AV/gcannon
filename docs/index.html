@@ -900,7 +900,7 @@ Content-Length: 72
         <tr>
           <td>-d &lt;duration&gt;</td>
           <td>10s</td>
-          <td>Benchmark duration. Accepts seconds (<code>5s</code>) or minutes (<code>1m</code>). A 100ms warmup is excluded from results.</td>
+          <td>Benchmark duration. Accepts seconds (<code>5s</code>) or minutes (<code>1m</code>). A warmup is excluded from results: at least 100ms, and until every connection has finished setting up (capped at 10s).</td>
         </tr>
         <tr>
           <td>-p &lt;N&gt;</td>

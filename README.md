@@ -320,7 +320,8 @@ Each worker thread runs an independent io_uring event loop with zero cross-threa
 
 ```
 main thread
-  spawn N workers (100ms warmup, reset stats, run for duration)
+  spawn N workers (warmup: >= 100ms and until every connection is set up;
+                   reset stats, run for duration)
   join, aggregate stats, print
 
 worker thread
