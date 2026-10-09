@@ -9,7 +9,7 @@ High-performance load generator built on Linux io_uring. Supports HTTP/1.1 and W
 ## Install
 
 ```bash
-# Requires liburing-dev
+# Requires liburing-dev and libssl-dev (OpenSSL 3)
 git clone https://github.com/MDA2AV/gcannon.git && cd gcannon
 make
 sudo cp gcannon /usr/local/bin/
@@ -336,6 +336,6 @@ make          # build
 make clean    # clean
 ```
 
-Requires Linux 6.1+ (for io_uring features) and `liburing-dev`.
+Requires Linux 6.1+ (for io_uring features), `liburing-dev` and `libssl-dev` (OpenSSL 3).
 
 HTTP parsing uses [picohttpparser](https://github.com/h2o/picohttpparser) (vendored in `external/`).
