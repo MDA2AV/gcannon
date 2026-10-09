@@ -1,6 +1,6 @@
 CC      = gcc
 CFLAGS  = -O2 -Wall -Wextra -march=native -Iinclude -DUSE_PICO -Iexternal/picohttpparser
-LDFLAGS = -luring -lpthread -lcrypto
+LDFLAGS = -luring -lpthread -lssl -lcrypto
 
 BUILDDIR = build
 

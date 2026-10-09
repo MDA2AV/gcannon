@@ -2,7 +2,7 @@
 
 [![Discord](https://discordapp.com/api/guilds/1177529388229734410/widget.png?style=shield)](https://discord.com/invite/H84B5ZqDXR)
 
-High-performance load generator built on Linux io_uring. Supports HTTP/1.1 and WebSocket.
+High-performance load generator built on Linux io_uring. Supports HTTP/1.1, WebSocket and HTTPS (TLS 1.3 over kernel TLS).
 
 ## [Http Arena](https://www.http-arena.com/) official Http/1.1 load generator
 
@@ -27,6 +27,9 @@ gcannon http://localhost:8080/ -c 512 -t 8 -d 10s -p 16
 # WebSocket echo
 gcannon http://localhost:8080/ws --ws -c 512 -t 8 -d 10s
 
+# HTTPS (TLS 1.3)
+gcannon https://localhost:8443/ -c 512 -t 8 -d 10s
+
 # Raw request files (multiple templates)
 gcannon http://localhost:8080 --raw get.raw,post.raw -c 256 -t 4 -d 5s
 ```
@@ -35,7 +38,7 @@ gcannon http://localhost:8080 --raw get.raw,post.raw -c 256 -t 4 -d 5s
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `<url>` | required | Target URL (`http://` only) |
+| `<url>` | required | Target URL (`http://` or `https://`) |
 | `-c` | 100 | Total connections |
 | `-t` | 1 | Worker threads |
 | `-d` | 10s | Duration (`5s`, `1m`) |
@@ -141,6 +144,22 @@ gcannon http://localhost:8080/ws --ws -c 4096 -t 64 -d 5s -p 16
 # Custom message
 gcannon http://localhost:8080/ws --ws-msg '{"type":"ping"}' -c 256 -t 8 -d 5s
 ```
+
+### HTTPS
+
+`https://` targets run over TLS 1.3. OpenSSL does the handshake, then the record keys go to kernel TLS (kTLS), which encrypts and decrypts on the socket itself. The io_uring hot path is the same as for `http://`, and every mode works over TLS: pipelining, `--raw`, placeholders, `-r` and `--ws`.
+
+```bash
+gcannon https://localhost:8443/ -c 512 -t 8 -d 10s -p 16
+gcannon https://localhost:8443/ws --ws -c 256 -t 8 -d 5s
+```
+
+- TLS 1.3 only, with the suites kernel TLS supports: AES-128-GCM (offered first), AES-256-GCM and ChaCha20-Poly1305.
+- The server certificate is **not verified**. SNI is the URL's host name, and isn't sent for an IP address.
+- Session tickets are ignored, so with `-r` every connection does a full handshake.
+- Needs kernel TLS; gcannon checks for it at startup.
+- Handshake failures count as connect errors, and the first one's reason is printed to stderr.
+- Bandwidth counts decrypted bytes.
 
 ## Output
 
@@ -317,6 +336,7 @@ Each worker thread runs an independent io_uring event loop with zero cross-threa
 - **Batch CQE processing** (up to 2048 completions per loop iteration)
 - **Pre-built request buffers** (no per-request formatting)
 - **Generation counters** in io_uring user-data to detect stale CQEs after reconnection
+- **Kernel TLS** for `https://`: OpenSSL handles only the handshake, then the kernel encrypts and decrypts, so sends and receives stay plain io_uring ops on plaintext (receives use multishot recvmsg to see TLS record types)
 
 ```
 main thread

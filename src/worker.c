@@ -8,6 +8,11 @@
 #include <sys/socket.h>
 #include <netinet/tcp.h>
 #include <fcntl.h>
+#include <poll.h>
+
+#include <openssl/crypto.h>
+#include <openssl/err.h>
+#include <openssl/ssl.h>
 /* io_uring implementation inspired by zerg - https://github.com/MDA2AV/zerg */
 
 static inline struct io_uring_sqe *sqe_get(struct io_uring *ring)
@@ -242,7 +247,17 @@ static void close_conn(worker_t *w, gc_conn_t *c, const int conn_idx)
         struct io_uring_sqe *sqe = sqe_get(&w->ring);
         io_uring_prep_cancel64(sqe, PACK_UD(UD_RECV, c->gen, conn_idx), 0);
         io_uring_sqe_set_data64(sqe, PACK_UD(UD_CANCEL, c->gen, conn_idx));
+        if (c->state == CONN_TLS_HANDSHAKE) {
+            /* An armed handshake poll holds the socket open, like the recv */
+            sqe = sqe_get(&w->ring);
+            io_uring_prep_cancel64(sqe, PACK_UD(UD_POLL, c->gen, conn_idx), 0);
+            io_uring_sqe_set_data64(sqe, PACK_UD(UD_CANCEL, c->gen, conn_idx));
+        }
         close(c->fd);
+    }
+    if (c->ssl) {
+        SSL_free(c->ssl);
+        c->ssl = NULL;
     }
     c->fd = -1;
     c->state = CONN_CLOSED;
@@ -257,6 +272,157 @@ static void reconnect(worker_t *w, const int conn_idx)
     w->stats.reconnects++;
     if (*w->running)
         start_connect(w, conn_idx);
+}
+
+/* The connection is up (and for https, keyed): start receiving, then send the
+   WebSocket upgrade or the first pipeline. */
+static void conn_ready(worker_t *w, gc_conn_t *c, const int conn_idx)
+{
+    arm_recv_multishot(w, conn_idx);
+    if (w->ws_mode) {
+        c->state = CONN_WS_UPGRADING;
+        fire_ws_upgrade(w, c, conn_idx);
+    } else {
+        c->state = CONN_ACTIVE;
+        conn_settle(w, c);
+        fire_requests(w, c, conn_idx, w->pipeline_depth);
+    }
+}
+
+/* ── TLS handshake ─────────────────────────────────────────────────── */
+
+/* OpenSSL runs the handshake directly on the socket, and all that comes out of
+ * it are the TLS 1.3 traffic secrets. Those become kernel TLS keys and the SSL
+ * object is freed, so from then on the connection is the same plain fd as for
+ * http:// — the kernel just encrypts what goes through it. */
+
+/* Key log callback: the only public way OpenSSL 3.0 hands out the secrets */
+static void tls_keylog(const SSL *ssl, const char *line)
+{
+    gc_conn_t *c = SSL_get_app_data(ssl);
+    if (c) ktls_keylog_line(&c->tls_secrets, line);
+}
+
+static SSL_CTX *tls_ctx_new(void)
+{
+    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx) return NULL;
+    /* Kernel TLS carries TLS 1.3 records in these three suites, so offer
+       nothing it can't take. AES-128-GCM first, the order browsers use. */
+    if (!SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION) ||
+        !SSL_CTX_set_ciphersuites(ctx, "TLS_AES_128_GCM_SHA256:"
+                                       "TLS_AES_256_GCM_SHA384:"
+                                       "TLS_CHACHA20_POLY1305_SHA256")) {
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+    /* Benchmark targets mostly run with self-signed or test certificates */
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+    /* The receive path drops session tickets, so there is nothing to cache */
+    SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_OFF);
+    SSL_CTX_set_keylog_callback(ctx, tls_keylog);
+#ifdef SSL_OP_ENABLE_KTLS
+    /* Both directions are installed below. OpenSSL's own kTLS, if a system
+       config turns it on, would claim the transmit side first. */
+    SSL_CTX_clear_options(ctx, SSL_OP_ENABLE_KTLS);
+#endif
+    return ctx;
+}
+
+/* The first TLS failure of a run goes to stderr, so a target that won't do
+   TLS 1.3 says why instead of only piling up connect errors. */
+static void tls_report(const char *what, const char *why)
+{
+    static atomic_flag reported = ATOMIC_FLAG_INIT;
+    if (!atomic_flag_test_and_set(&reported))
+        fprintf(stderr, "TLS %s failed: %s\n", what, why);
+}
+
+static void tls_finish(worker_t *w, gc_conn_t *c, const int conn_idx)
+{
+    const ktls_secrets_t *k = &c->tls_secrets;
+    const char *name = SSL_CIPHER_get_name(SSL_get_current_cipher(c->ssl));
+    const ktls_suite_t suite = ktls_suite_from_name(name);
+    char why[128];
+    int rc = -EPROTO;
+
+    if (!suite) {
+        snprintf(why, sizeof(why), "kernel TLS can't carry %s", name ? name : "the suite");
+        tls_report("setup", why);
+    } else if (!k->client_len || k->client_len != k->server_len) {
+        tls_report("setup", "the handshake produced no traffic secrets");
+    } else if ((rc = ktls_install(c->fd, suite, k->client, k->server, k->client_len)) < 0) {
+        snprintf(why, sizeof(why), "installing kernel TLS keys: %s", strerror(-rc));
+        tls_report("setup", why);
+    }
+
+    OPENSSL_cleanse(&c->tls_secrets, sizeof(c->tls_secrets));
+    SSL_free(c->ssl);   /* SSL_set_fd doesn't own the fd, so it stays open */
+    c->ssl = NULL;
+
+    if (rc < 0) {
+        w->stats.connect_errors++;
+        reconnect(w, conn_idx);
+        return;
+    }
+    conn_ready(w, c, conn_idx);
+}
+
+/* Drive the handshake as far as the socket allows, then wait for it with a
+   one-shot poll. */
+static void tls_step(worker_t *w, gc_conn_t *c, const int conn_idx)
+{
+    ERR_clear_error();   /* SSL_get_error reads this thread's error queue */
+    const int r = SSL_do_handshake(c->ssl);
+    if (r == 1) {
+        tls_finish(w, c, conn_idx);
+        return;
+    }
+    const int err = SSL_get_error(c->ssl, r);
+    if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+        struct io_uring_sqe *sqe = sqe_get(&w->ring);
+        io_uring_prep_poll_add(sqe, c->fd, err == SSL_ERROR_WANT_READ ? POLLIN : POLLOUT);
+        io_uring_sqe_set_data64(sqe, PACK_UD(UD_POLL, c->gen, conn_idx));
+        return;
+    }
+
+    char why[256];
+    const unsigned long e = ERR_peek_last_error();
+    const char *reason = e ? ERR_reason_error_string(e) : NULL;
+    if (reason)
+        snprintf(why, sizeof(why), "%s", reason);
+    else if (e)
+        ERR_error_string_n(e, why, sizeof(why));
+    else if (err == SSL_ERROR_SYSCALL && errno)
+        snprintf(why, sizeof(why), "%s", strerror(errno));
+    else
+        snprintf(why, sizeof(why), "server closed the connection");
+    tls_report("handshake", why);
+    ERR_clear_error();
+
+    w->stats.connect_errors++;
+    reconnect(w, conn_idx);
+}
+
+static void tls_start(worker_t *w, gc_conn_t *c, const int conn_idx)
+{
+    c->state = CONN_TLS_HANDSHAKE;
+    memset(&c->tls_secrets, 0, sizeof(c->tls_secrets));
+    /* OpenSSL reads one whole record at a time (no read-ahead), so when the
+       handshake ends nothing past the server's Finished has left the socket:
+       kernel TLS starts at the first application record, sequence 0. */
+    c->ssl = SSL_new(w->ssl_ctx);
+    if (!c->ssl || !SSL_set_fd(c->ssl, c->fd)) {
+        tls_report("setup", "out of memory");
+        w->stats.connect_errors++;
+        reconnect(w, conn_idx);
+        return;
+    }
+    SSL_set_app_data(c->ssl, c);
+    if (w->tls_sni)
+        SSL_set_tlsext_host_name(c->ssl, w->tls_sni);
+    SSL_set_connect_state(c->ssl);
+    tls_step(w, c, conn_idx);
 }
 
 
@@ -281,6 +447,8 @@ void worker_init(worker_t *w,
                  const int recv_buf_size,
                  const int cqe_latency,
                  const int per_tpl_latency,
+                 const int tls,
+                 const char *tls_sni,
                  volatile int *running)
 {
     memset(w, 0, sizeof(*w));
@@ -304,6 +472,8 @@ void worker_init(worker_t *w,
     w->recv_buf_size     = recv_buf_size;
     w->cqe_latency       = cqe_latency;
     w->per_tpl_latency   = per_tpl_latency;
+    w->ktls              = tls;
+    w->tls_sni           = tls_sni;
     w->running           = running;
 
     if (per_tpl_latency && num_templates > 1) {
@@ -379,6 +549,14 @@ void worker_init(worker_t *w,
     if (!w->conns) {
         fprintf(stderr, "[w%d] calloc: out of memory\n", id);
         exit(1);
+    }
+
+    if (tls) {
+        w->ssl_ctx = tls_ctx_new();
+        if (!w->ssl_ctx) {
+            fprintf(stderr, "[w%d] TLS setup failed\n", id);
+            exit(1);
+        }
     }
 
     /* Start all connections */
@@ -458,15 +636,23 @@ void worker_loop(worker_t *w)
                     reconnect(w, conn_idx);
                     break;
                 }
-                arm_recv_multishot(w, conn_idx);
-                if (w->ws_mode) {
-                    c->state = CONN_WS_UPGRADING;
-                    fire_ws_upgrade(w, c, conn_idx);
-                } else {
-                    c->state = CONN_ACTIVE;
-                    conn_settle(w, c);
-                    fire_requests(w, c, conn_idx, w->pipeline_depth);
+                if (w->ktls)
+                    tls_start(w, c, conn_idx);
+                else
+                    conn_ready(w, c, conn_idx);
+                break;
+            }
+
+            case UD_POLL: {
+                /* The handshake can move again, or the socket failed (which
+                   SSL_do_handshake will report) */
+                if (c->state != CONN_TLS_HANDSHAKE) break;
+                if (res < 0) {
+                    w->stats.connect_errors++;
+                    reconnect(w, conn_idx);
+                    break;
                 }
+                tls_step(w, c, conn_idx);
                 break;
             }
 
@@ -700,8 +886,10 @@ void worker_destroy(worker_t *w)
     for (int i = 0; i < w->num_conns; i++) {
         if (w->conns[i].fd >= 0)
             close(w->conns[i].fd);
+        SSL_free(w->conns[i].ssl);
         free(w->conns[i].scratch_buf);
     }
+    SSL_CTX_free(w->ssl_ctx);
 
     io_uring_free_buf_ring(&w->ring, w->buf_ring,
                            BUF_RING_ENTRIES, BUFFER_RING_BGID);

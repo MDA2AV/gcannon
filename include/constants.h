@@ -2,11 +2,12 @@
 
 #include <stdint.h>
 
-#define GCANNON_VERSION "0.6.2"
+#define GCANNON_VERSION "0.7.0"
 
 /* ── User-data packing (64-bit: [kind:16][gen:16][conn_idx:32]) ───── */
 
-typedef enum { UD_CONNECT = 1, UD_RECV = 2, UD_SEND = 3, UD_CANCEL = 4 } ud_kind_t;
+typedef enum { UD_CONNECT = 1, UD_RECV = 2, UD_SEND = 3, UD_CANCEL = 4,
+               UD_POLL = 5 /* TLS handshake readiness */ } ud_kind_t;
 
 #define PACK_UD(kind, gen, idx)  (((uint64_t)(kind) << 48) | ((uint64_t)((gen) & 0xFFFF) << 32) | (uint32_t)(idx))
 #define UD_KIND(ud)              ((ud_kind_t)((ud) >> 48))
