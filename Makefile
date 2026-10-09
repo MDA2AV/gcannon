@@ -41,7 +41,7 @@ KTLS_TEST_SRC = $(TESTDIR)/test_ktls.c src/ktls.c
 KTLS_TEST_BIN = $(BUILDDIR)/test_ktls
 
 $(KTLS_TEST_BIN): $(KTLS_TEST_SRC) include/ktls.h | $(BUILDDIR)
-	$(CC) $(CFLAGS) -o $@ $(KTLS_TEST_SRC) -lcrypto
+	$(CC) $(CFLAGS) -o $@ $(KTLS_TEST_SRC) -lcrypto -luring
 
 test-unit: $(TEST_BIN) $(KTLS_TEST_BIN)
 	@rc=0; \

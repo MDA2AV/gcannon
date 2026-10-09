@@ -3,12 +3,14 @@
 #include <liburing.h>
 #include <netinet/in.h>
 #include <stdatomic.h>
+#include <sys/socket.h>
 #include <time.h>
 
 #include "constants.h"
 #include "stats.h"
 #include "http.h"
 #include "ws.h"
+#include "ktls.h"
 
 typedef enum { CONN_CONNECTING, CONN_WS_UPGRADING, CONN_ACTIVE, CONN_CLOSED } conn_state_t;
 
@@ -79,6 +81,10 @@ typedef struct worker {
     int                       ws_frame_len;      /* single frame length */
     int                       ws_pipeline_len;   /* total buffer length */
     int                       recv_buf_size;     /* per-buffer size in bytes */
+    int                       ktls;              /* 1 = sockets carry kernel TLS:
+                                                    receive with recvmsg so record
+                                                    types are visible */
+    struct msghdr             recv_msg;          /* recvmsg template (kTLS only) */
     int                       cqe_latency;       /* 1 = timestamp at CQE arrival, 0 = after parse */
     int                       per_tpl_latency;   /* 1 = per-template latency histograms */
     worker_stats_t            stats;

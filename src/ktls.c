@@ -9,6 +9,7 @@
 #include <sys/socket.h>
 #include <linux/tls.h>
 
+#include <liburing.h>
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
@@ -222,4 +223,19 @@ out:
     if (cfd >= 0) close(cfd);
     if (lfd >= 0) close(lfd);
     return rc;
+}
+
+int ktls_recvmsg_record(void *buf, int res, struct msghdr *msg,
+                        const uint8_t **payload, uint32_t *len)
+{
+    struct io_uring_recvmsg_out *o = io_uring_recvmsg_validate(buf, res, msg);
+    if (!o) return -1;
+
+    *payload = io_uring_recvmsg_payload(o, msg);
+    *len = io_uring_recvmsg_payload_length(o, res, msg);
+
+    const struct cmsghdr *cm = io_uring_recvmsg_cmsg_firsthdr(o, msg);
+    if (cm && cm->cmsg_level == SOL_TLS && cm->cmsg_type == TLS_GET_RECORD_TYPE)
+        return *(const uint8_t *)CMSG_DATA(cm);
+    return 0;
 }

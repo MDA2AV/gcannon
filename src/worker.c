@@ -32,7 +32,13 @@ static inline void arm_recv_multishot(worker_t *w, const int conn_idx)
 {
     const gc_conn_t *c = &w->conns[conn_idx];
     struct io_uring_sqe *sqe = sqe_get(&w->ring);
-    io_uring_prep_recv_multishot(sqe, c->fd, NULL, 0, 0);
+    if (w->ktls)
+        /* recvmsg, not recv: kTLS reports each record's type in a cmsg and
+           fails a recv with no room for one (EIO) as soon as a session
+           ticket arrives */
+        io_uring_prep_recvmsg_multishot(sqe, c->fd, &w->recv_msg, 0);
+    else
+        io_uring_prep_recv_multishot(sqe, c->fd, NULL, 0, 0);
     sqe->flags    |= IOSQE_BUFFER_SELECT;
     sqe->buf_group = BUFFER_RING_BGID;
     io_uring_sqe_set_data64(sqe, PACK_UD(UD_RECV, c->gen, conn_idx));
@@ -349,6 +355,10 @@ void worker_init(worker_t *w,
         }
     }
 
+    /* recvmsg template for kTLS sockets: no address, room for the
+       record-type cmsg ahead of the payload in each provided buffer */
+    w->recv_msg.msg_controllen = KTLS_RECORD_CMSG_SPACE;
+
     w->buf_mask = (uint32_t)(BUF_RING_ENTRIES - 1);
     const size_t slab_size = (size_t)BUF_RING_ENTRIES * w->recv_buf_size;
     if (posix_memalign((void **)&w->buf_slab, 64, slab_size) != 0) {
@@ -513,15 +523,49 @@ void worker_loop(worker_t *w)
                 if (!has_buffer) break;
 
                 const uint16_t bid = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
-                const uint8_t *buf = w->buf_slab + (size_t)bid * w->recv_buf_size;
+                uint8_t *slot = w->buf_slab + (size_t)bid * w->recv_buf_size;
+                const uint8_t *buf = slot;
+                int len = res;
 
-                w->stats.bytes_read += res;
+                if (w->ktls) {
+                    /* recvmsg completion: header, record-type cmsg, then the
+                       plaintext, which is all the parsers see */
+                    uint32_t plen = 0;
+                    const int type = ktls_recvmsg_record(slot, res, &w->recv_msg,
+                                                         &buf, &plen);
+                    len = (int)plen;
+                    if (type == KTLS_RECORD_HANDSHAKE) {
+                        /* Post-handshake message, in practice a session
+                           ticket. Sessions aren't resumed, so drop it. (A
+                           KeyUpdate makes the next read fail with EKEYEXPIRED,
+                           which reconnects.) */
+                        return_buffer(w, bid);
+                        if (!has_more) arm_recv_multishot(w, conn_idx);
+                        break;
+                    }
+                    if (type < 0 || len == 0 ||
+                        (type != KTLS_RECORD_DATA && type != 0)) {
+                        /* Malformed completion, end of stream, or an alert.
+                           End of stream and close_notify (description 0) are
+                           orderly, like a FIN on a plain socket; every other
+                           alert is fatal in TLS 1.3. */
+                        const int orderly = type >= 0 &&
+                            (len == 0 || (type == KTLS_RECORD_ALERT &&
+                                          len >= 2 && buf[1] == 0));
+                        if (!orderly) w->stats.read_errors++;
+                        return_buffer(w, bid);
+                        reconnect(w, conn_idx);
+                        break;
+                    }
+                }
+
+                w->stats.bytes_read += len;
 
                 int completed = 0;
 
                 if (c->state == CONN_WS_UPGRADING) {
                     /* Parse HTTP upgrade response — look for 101 */
-                    completed = http_parse_responses(&c->parser, buf, res);
+                    completed = http_parse_responses(&c->parser, buf, len);
                     if (completed < 0) {
                         /* Unrecoverable parse failure — drop and reconnect */
                         w->stats.read_errors++;
@@ -563,9 +607,9 @@ void worker_loop(worker_t *w)
                     clock_gettime(CLOCK_MONOTONIC, &now);
 
                 if (w->ws_mode) {
-                    completed = ws_parse_frames(&c->ws_parser, buf, res);
+                    completed = ws_parse_frames(&c->ws_parser, buf, len);
                 } else {
-                    completed = http_parse_responses(&c->parser, buf, res);
+                    completed = http_parse_responses(&c->parser, buf, len);
                     if (completed < 0) {
                         /* Unrecoverable parse failure (oversized headers or
                            malformed response) — drop and reconnect */
