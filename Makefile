@@ -1,10 +1,11 @@
 CC      = gcc
 CFLAGS  = -O2 -Wall -Wextra -march=native -Iinclude -DUSE_PICO -Iexternal/picohttpparser
-LDFLAGS = -luring -lpthread
+LDFLAGS = -luring -lpthread -lcrypto
 
 BUILDDIR = build
 
-SRC      = src/main.c src/worker.c src/http.c src/ws.c src/stats.c src/tui.c src/history.c
+SRC      = src/main.c src/worker.c src/http.c src/ws.c src/stats.c src/tui.c src/history.c \
+           src/ktls.c
 OBJ      = $(patsubst src/%.c,$(BUILDDIR)/%.o,$(SRC))
 DEP      = $(OBJ:.o=.d)
 PICO_OBJ = $(BUILDDIR)/picohttpparser.o
@@ -36,8 +37,17 @@ TEST_BIN  = $(BUILDDIR)/test_http_parser
 $(TEST_BIN): $(TEST_SRC) | $(BUILDDIR)
 	$(CC) $(CFLAGS) -o $@ $(TEST_SRC)
 
-test-unit: $(TEST_BIN)
-	./$(TEST_BIN)
+KTLS_TEST_SRC = $(TESTDIR)/test_ktls.c src/ktls.c
+KTLS_TEST_BIN = $(BUILDDIR)/test_ktls
+
+$(KTLS_TEST_BIN): $(KTLS_TEST_SRC) include/ktls.h | $(BUILDDIR)
+	$(CC) $(CFLAGS) -o $@ $(KTLS_TEST_SRC) -lcrypto
+
+test-unit: $(TEST_BIN) $(KTLS_TEST_BIN)
+	@rc=0; \
+	 ./$(TEST_BIN)      || rc=1; \
+	 ./$(KTLS_TEST_BIN) || rc=1; \
+	 exit $$rc
 
 # Every executable tests/test_*.sh is an integration test; adding one needs no
 # Makefile change.
