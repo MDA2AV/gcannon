@@ -2,6 +2,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/socket.h>
 
 /*
  * Kernel TLS (kTLS) for TLS 1.3 client connections.
@@ -58,3 +59,26 @@ int ktls_install(int fd, ktls_suite_t suite,
  * connection. Returns 0, or -errno (-ENOENT when the tls module isn't
  * loaded). */
 int ktls_probe(void);
+
+/* ── receiving ─────────────────────────────────────────────────────── */
+
+/* TLS record content types (RFC 8446 section 5.1) */
+#define KTLS_RECORD_ALERT      21
+#define KTLS_RECORD_HANDSHAKE  22
+#define KTLS_RECORD_DATA       23
+
+/* Room for the record-type cmsg in a recvmsg: what msg_controllen must be. */
+#define KTLS_RECORD_CMSG_SPACE CMSG_SPACE(sizeof(uint8_t))
+
+/* A kTLS socket hands non-data records (session tickets, alerts) to userspace
+ * with their type in a cmsg, and fails a recv that has no room for one with
+ * EIO. So kTLS sockets are read with multishot recvmsg, and each completion
+ * unpacked here.
+ *
+ * buf is the provided buffer, res the CQE result and msg the msghdr the
+ * recvmsg was armed with (msg_controllen = KTLS_RECORD_CMSG_SPACE). Points
+ * *payload and *len at the plaintext. Returns the record type, 0 if the
+ * completion carried none (end of stream, where *len is 0), or -1 if it is
+ * malformed. */
+int ktls_recvmsg_record(void *buf, int res, struct msghdr *msg,
+                        const uint8_t **payload, uint32_t *len);
