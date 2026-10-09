@@ -8,6 +8,7 @@
 #include <sched.h>
 #include <netdb.h>
 #include <arpa/inet.h>
+#include <errno.h>
 #include <time.h>
 
 #include "constants.h"
@@ -33,6 +34,8 @@ typedef struct thread_ctx {
     int              recv_buf_size;
     int              cqe_latency;
     int              per_tpl_latency;
+    int              tls;
+    const char      *tls_sni;
     const char      *ws_host;
     int              ws_port;
     const char      *ws_path;
@@ -44,13 +47,19 @@ typedef struct thread_ctx {
 /* ── URL parser ────────────────────────────────────────────────────── */
 
 static int parse_url(const char *url, char *host, int host_sz,
-                     int *port, char *path, int path_sz)
+                     int *port, char *path, int path_sz, int *tls)
 {
-    if (strncmp(url, "http://", 7) != 0) {
-        fprintf(stderr, "Error: only http:// URLs supported\n");
+    const char *hp;
+    if (strncmp(url, "http://", 7) == 0) {
+        hp = url + 7;
+        *tls = 0;
+    } else if (strncmp(url, "https://", 8) == 0) {
+        hp = url + 8;
+        *tls = 1;
+    } else {
+        fprintf(stderr, "Error: only http:// and https:// URLs supported\n");
         return -1;
     }
-    const char *hp = url + 7;
     const char *slash = strchr(hp, '/');
     const char *colon = strchr(hp, ':');
 
@@ -72,7 +81,7 @@ static int parse_url(const char *url, char *host, int host_sz,
         if (hlen >= host_sz) hlen = host_sz - 1;
         memcpy(host, hp, hlen);
         host[hlen] = '\0';
-        *port = 80;
+        *port = *tls ? 443 : 80;
     }
     return 0;
 }
@@ -251,6 +260,7 @@ static void *worker_thread(void *arg)
                 ctx->ws_payload, ctx->ws_payload_len,
                 ctx->recv_buf_size,
                 ctx->cqe_latency, ctx->per_tpl_latency,
+                ctx->tls, ctx->tls_sni,
                 &g_running);
     worker_loop(&ctx->worker);
     return NULL;
@@ -393,11 +403,12 @@ int main(int argc, char **argv)
     /* Resolve target host */
     char host[256] = {0}, path[1024] = "/";
     int port = 80;
+    int tls = 0;
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
 
     if (url) {
-        if (parse_url(url, host, sizeof(host), &port, path, sizeof(path)) < 0)
+        if (parse_url(url, host, sizeof(host), &port, path, sizeof(path), &tls) < 0)
             return 1;
         addr.sin_port = htons(port);
         if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
@@ -408,6 +419,24 @@ int main(int argc, char **argv)
             }
             memcpy(&addr.sin_addr, he->h_addr_list[0], he->h_length);
         }
+    }
+
+    /* https:// hands the record layer to kernel TLS. Check the kernel can do
+       it before connecting anything, or every connection would handshake and
+       then fail. */
+    const char *tls_sni = NULL;
+    if (tls) {
+        const int rc = ktls_probe();
+        if (rc < 0) {
+            fprintf(stderr, "Error: https:// needs kernel TLS, which this kernel "
+                            "refused (%s)%s\n", strerror(-rc),
+                    rc == -ENOENT ? " - is the tls module loaded?" : "");
+            return 1;
+        }
+        /* SNI carries host names only, never an address (RFC 6066) */
+        struct in_addr ip;
+        if (inet_pton(AF_INET, host, &ip) != 1)
+            tls_sni = host;
     }
 
     /* Build request templates */
@@ -528,6 +557,8 @@ int main(int argc, char **argv)
         }
         printf("\n");
         printf("  Target:    %s:%d%s\n", host, port, path);
+        if (tls)
+            printf("  TLS:       1.3 via kernel TLS (certificate not verified)\n");
         printf("  Threads:   %d\n", num_threads);
         printf("  Conns:     %d (%.0f/thread)\n", num_connections,
                (double)num_connections / num_threads);
@@ -568,6 +599,8 @@ int main(int argc, char **argv)
         ctxs[i].recv_buf_size    = recv_buf_size;
         ctxs[i].cqe_latency      = cqe_latency;
         ctxs[i].per_tpl_latency  = per_tpl_latency;
+        ctxs[i].tls              = tls;
+        ctxs[i].tls_sni          = tls_sni;
         ctxs[i].ws_host           = host;
         ctxs[i].ws_port           = port;
         ctxs[i].ws_path           = path;

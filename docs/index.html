@@ -885,7 +885,7 @@ Content-Length: 72
         <tr>
           <td>&lt;url&gt;</td>
           <td>required</td>
-          <td>Target URL. Only <code>http://</code> is supported (no TLS). Can be omitted if <code>--raw</code> files contain a <code>Host</code> header.</td>
+          <td>Target URL: <code>http://</code> or <code>https://</code> (TLS 1.3 over kernel TLS; the server certificate is not verified). Can be omitted if <code>--raw</code> files contain a <code>Host</code> header, in which case the connection is plain HTTP.</td>
         </tr>
         <tr>
           <td>-c &lt;N&gt;</td>
