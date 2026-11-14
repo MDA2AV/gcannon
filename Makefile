@@ -32,12 +32,18 @@ clean:
 TESTDIR   = tests
 TEST_SRC  = $(TESTDIR)/test_http_parser.c src/http.c external/picohttpparser/picohttpparser.c
 TEST_BIN  = $(BUILDDIR)/test_http_parser
+RING_TEST_BIN = $(BUILDDIR)/test_buf_ring
+RING_TEST_OBJ = $(filter-out $(BUILDDIR)/main.o $(BUILDDIR)/worker.o,$(OBJ))
 
 $(TEST_BIN): $(TEST_SRC) | $(BUILDDIR)
 	$(CC) $(CFLAGS) -o $@ $(TEST_SRC)
 
-test-unit: $(TEST_BIN)
+$(RING_TEST_BIN): $(TESTDIR)/test_buf_ring.c src/worker.c include/worker.h include/constants.h $(RING_TEST_OBJ) $(PICO_OBJ) | $(BUILDDIR)
+	$(CC) $(CFLAGS) -o $@ $< $(RING_TEST_OBJ) $(PICO_OBJ) $(LDFLAGS)
+
+test-unit: $(TEST_BIN) $(RING_TEST_BIN)
 	./$(TEST_BIN)
+	./$(RING_TEST_BIN)
 
 # Every executable tests/test_*.sh is an integration test; adding one needs no
 # Makefile change.
