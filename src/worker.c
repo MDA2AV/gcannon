@@ -392,6 +392,21 @@ void worker_init(worker_t *w,
 
 /* ── event loop ────────────────────────────────────────────────────── */
 
+/* A failed read on a kTLS socket that the record layer caused, not the peer
+   going away (plain sockets don't count that either): EBADMSG for a record
+   that doesn't decrypt, EKEYEXPIRED for a KeyUpdate, which isn't supported,
+   and the like. ENOBUFS and ECANCELED come from gcannon's own ring. */
+static inline int ktls_read_error(const int res)
+{
+    switch (-res) {
+    case ECONNRESET: case ECONNABORTED: case EPIPE: case ETIMEDOUT:
+    case ENOBUFS: case ECANCELED:
+        return 0;
+    default:
+        return res < 0;
+    }
+}
+
 void worker_loop(worker_t *w)
 {
     struct io_uring_cqe *cqes[BATCH_CQES];
@@ -516,6 +531,10 @@ void worker_loop(worker_t *w)
                         const uint16_t bid = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
                         return_buffer(w, bid);
                     }
+                    /* Count a session the record layer gave up on; left
+                       uncounted, it shows only as reconnects and a low rate */
+                    if (w->ktls && ktls_read_error(res))
+                        w->stats.read_errors++;
                     reconnect(w, conn_idx);
                     break;
                 }
