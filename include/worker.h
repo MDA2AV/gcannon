@@ -12,7 +12,11 @@
 #include "ws.h"
 #include "ktls.h"
 
-typedef enum { CONN_CONNECTING, CONN_WS_UPGRADING, CONN_ACTIVE, CONN_CLOSED } conn_state_t;
+typedef enum { CONN_CONNECTING, CONN_TLS_HANDSHAKE, CONN_WS_UPGRADING, CONN_ACTIVE,
+               CONN_CLOSED } conn_state_t;
+
+struct ssl_st;
+struct ssl_ctx_st;
 
 /* Placeholder substitution types for {RAND:min:max} and {SEQ:start} in raw templates */
 typedef enum { SUB_NONE = 0, SUB_RAND, SUB_SEQ } sub_type_t;
@@ -55,6 +59,8 @@ typedef struct gc_conn {
     int              scratch_len;    /* allocated size of scratch_buf */
     uint64_t         rng_state;      /* xorshift64 state for RAND placeholders */
     int              settled;        /* first setup attempt finished (ready or failed) */
+    struct ssl_st   *ssl;            /* only while the TLS handshake runs */
+    ktls_secrets_t   tls_secrets;    /* traffic secrets captured during it */
 } gc_conn_t;
 
 typedef struct worker {
@@ -81,10 +87,12 @@ typedef struct worker {
     int                       ws_frame_len;      /* single frame length */
     int                       ws_pipeline_len;   /* total buffer length */
     int                       recv_buf_size;     /* per-buffer size in bytes */
-    int                       ktls;              /* 1 = sockets carry kernel TLS:
-                                                    receive with recvmsg so record
-                                                    types are visible */
+    int                       ktls;              /* 1 = https: TLS handshake, then
+                                                    kernel TLS; receive with recvmsg
+                                                    so record types are visible */
     struct msghdr             recv_msg;          /* recvmsg template (kTLS only) */
+    struct ssl_ctx_st        *ssl_ctx;           /* handshake config (kTLS only) */
+    const char               *tls_sni;           /* server name, NULL for an IP */
     int                       cqe_latency;       /* 1 = timestamp at CQE arrival, 0 = after parse */
     int                       per_tpl_latency;   /* 1 = per-template latency histograms */
     worker_stats_t            stats;
@@ -105,6 +113,7 @@ void worker_init(worker_t *w, int id, const struct sockaddr_in *addr,
                  const uint8_t *ws_payload, int ws_payload_len,
                  int recv_buf_size,
                  int cqe_latency, int per_tpl_latency,
+                 int tls, const char *tls_sni,
                  volatile int *running);
 
 /* Main event loop — blocks until *running == 0 */

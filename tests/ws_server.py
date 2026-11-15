@@ -16,12 +16,15 @@ so the handshake reply never shares a write with frame data.
   --refuse-every N   refuse every Nth upgrade (0 = never refuse)
   --refuse-status S  status line to refuse with (default "200 OK")
   --upgrade-delay S  wait S seconds before answering each upgrade
+  --tls-cert F       serve over TLS 1.3 with this certificate chain (PEM)...
+  --tls-key F        ...and this key
 
 Binds an ephemeral port and prints "PORT <n>" on stdout.
 """
 
 import argparse
 import socket
+import ssl
 import sys
 import threading
 import time
@@ -44,13 +47,15 @@ def next_seq():
         return _seq
 
 
-def serve_conn(conn, args, frame_size, echo, refuse):
+def serve_conn(conn, args, frame_size, echo, refuse, tls_ctx):
     conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    conn.settimeout(2.0)
     buf = b""
     upgraded = False
     carry = 0
     try:
+        if tls_ctx:
+            conn = tls_ctx.wrap_socket(conn, server_side=True)
+        conn.settimeout(2.0)
         while True:
             try:
                 data = conn.recv(65536)
@@ -79,7 +84,7 @@ def serve_conn(conn, args, frame_size, echo, refuse):
             frames, carry = divmod(carry, frame_size)
             if frames:
                 conn.sendall(echo * frames)
-    except OSError:
+    except (OSError, ssl.SSLError):
         pass
     finally:
         try:
@@ -94,7 +99,15 @@ def main():
     ap.add_argument("--refuse-status", default="200 OK")
     ap.add_argument("--payload", type=int, default=5)
     ap.add_argument("--upgrade-delay", type=float, default=0.0)
+    ap.add_argument("--tls-cert")
+    ap.add_argument("--tls-key")
     args = ap.parse_args()
+
+    tls_ctx = None
+    if args.tls_cert:
+        tls_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls_ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+        tls_ctx.load_cert_chain(args.tls_cert, args.tls_key)
 
     frame_size = 2 + 4 + args.payload            # client frames are masked
     echo = bytes([0x81, args.payload]) + b"x" * args.payload
@@ -115,7 +128,7 @@ def main():
             except socket.timeout:
                 continue
             threading.Thread(target=serve_conn,
-                             args=(conn, args, frame_size, echo, refuse),
+                             args=(conn, args, frame_size, echo, refuse, tls_ctx),
                              daemon=True).start()
     except KeyboardInterrupt:
         pass
