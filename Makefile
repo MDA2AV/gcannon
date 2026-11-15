@@ -46,7 +46,7 @@ KTLS_TEST_SRC = $(TESTDIR)/test_ktls.c src/ktls.c
 KTLS_TEST_BIN = $(BUILDDIR)/test_ktls
 
 $(KTLS_TEST_BIN): $(KTLS_TEST_SRC) include/ktls.h | $(BUILDDIR)
-	$(CC) $(CFLAGS) -o $@ $(KTLS_TEST_SRC) -lcrypto
+	$(CC) $(CFLAGS) -o $@ $(KTLS_TEST_SRC) -lcrypto -luring
 
 # Run every unit suite even if an earlier one fails, then report the
 # combined result.

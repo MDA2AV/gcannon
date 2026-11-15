@@ -11,8 +11,16 @@
  * both ends with the same code only proves the code agrees with itself, so
  * one test keys just the client and has the peer build and open records in
  * userspace per RFC 8446; that is what catches a key or IV landing in the
- * wrong field of the kernel's crypto_info. These tests need kernel TLS (the
- * tls module) and are skipped without it.
+ * wrong field of the kernel's crypto_info.
+ *
+ * The receive tests read a kTLS socket the way the worker does, with multishot
+ * recvmsg into a provided buffer ring, and check that session tickets, data,
+ * alerts and end of stream come out of ktls_recvmsg_record() as what they
+ * are. They also pin the kernel behaviour that forces recvmsg in the first
+ * place: a plain recv fails with EIO when a non-data record arrives.
+ *
+ * Everything past derivation and key log parsing needs kernel TLS (the tls
+ * module) and is skipped without it.
  *
  * Build:  make test-unit
  */
@@ -26,10 +34,16 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <linux/tls.h>
 
+#include <liburing.h>
 #include <openssl/evp.h>
 
 #include "ktls.h"
+
+#ifndef SOL_TLS
+#define SOL_TLS 282
+#endif
 
 /* ── harness ───────────────────────────────────────────────────────── */
 
@@ -430,11 +444,196 @@ static void test_install_mismatched_keys(void)
     close(s);
 }
 
+/* ── receiving (needs kernel TLS) ──────────────────────────────────── */
+
+/* Send one record of the given type from a kTLS socket (kernel docs,
+ * "Sending TLS control messages"). */
+static ssize_t send_record(int fd, uint8_t type, const void *data, size_t len)
+{
+    char cbuf[CMSG_SPACE(sizeof(type))];
+    struct iovec iov = { .iov_base = (void *)data, .iov_len = len };
+    struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1,
+                          .msg_control = cbuf, .msg_controllen = sizeof(cbuf) };
+    struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
+    cm->cmsg_level = SOL_TLS;
+    cm->cmsg_type  = TLS_SET_RECORD_TYPE;
+    cm->cmsg_len   = CMSG_LEN(sizeof(type));
+    *CMSG_DATA(cm) = type;
+    msg.msg_controllen = cm->cmsg_len;
+    return sendmsg(fd, &msg, MSG_NOSIGNAL);
+}
+
+static int keyed_pair(int *c, int *s)
+{
+    uint8_t a[32], b[32];
+    fill_seq(a, sizeof(a), 0x31);
+    fill_seq(b, sizeof(b), 0x62);
+    if (loopback_pair(c, s) < 0) return -1;
+    if (ktls_install(*c, KTLS_AES_128_GCM_SHA256, a, b, 32) < 0 ||
+        ktls_install(*s, KTLS_AES_128_GCM_SHA256, b, a, 32) < 0) {
+        close(*c);
+        close(*s);
+        return -1;
+    }
+    return 0;
+}
+
+typedef struct {
+    int      type;     /* ktls_recvmsg_record() result */
+    uint32_t len;
+    uint8_t  head[32]; /* first bytes of the payload */
+} piece_t;
+
+/* Read fd the way the worker does — multishot recvmsg into a provided buffer
+ * ring — until end of stream, and unpack every completion. */
+static int collect(int fd, unsigned buf_size, piece_t *out, int max)
+{
+    enum { NBUF = 8 };
+    struct io_uring ring;
+    if (io_uring_queue_init(16, &ring, 0) < 0) return -1;
+    int ret;
+    struct io_uring_buf_ring *br = io_uring_setup_buf_ring(&ring, NBUF, 7, 0, &ret);
+    uint8_t *slab = malloc((size_t)NBUF * buf_size);
+    if (!br || !slab) {
+        free(slab);
+        io_uring_queue_exit(&ring);
+        return -1;
+    }
+    for (int i = 0; i < NBUF; i++)
+        io_uring_buf_ring_add(br, slab + (size_t)i * buf_size, buf_size, i,
+                              io_uring_buf_ring_mask(NBUF), i);
+    io_uring_buf_ring_advance(br, NBUF);
+
+    struct msghdr msg = { .msg_controllen = KTLS_RECORD_CMSG_SPACE };
+    int n = 0, armed = 0, done = 0;
+    while (!done && n < max) {
+        if (!armed) {
+            struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+            io_uring_prep_recvmsg_multishot(sqe, fd, &msg, 0);
+            sqe->flags |= IOSQE_BUFFER_SELECT;
+            sqe->buf_group = 7;
+            io_uring_submit(&ring);
+            armed = 1;
+        }
+        struct io_uring_cqe *cqe;
+        struct __kernel_timespec ts = { .tv_sec = 2 };
+        if (io_uring_wait_cqe_timeout(&ring, &cqe, &ts) < 0) break;
+        if (!(cqe->flags & IORING_CQE_F_MORE)) armed = 0;
+        if (cqe->res < 0) {
+            out[n].type = cqe->res;   /* -errno, distinct from a record type */
+            out[n++].len = 0;
+            done = 1;
+        } else if (cqe->flags & IORING_CQE_F_BUFFER) {
+            const int bid = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
+            uint8_t *b = slab + (size_t)bid * buf_size;
+            const uint8_t *payload = NULL;
+            piece_t *p = &out[n++];
+            p->type = ktls_recvmsg_record(b, cqe->res, &msg, &payload, &p->len);
+            if (p->type >= 0)
+                memcpy(p->head, payload, p->len < sizeof(p->head) ? p->len : sizeof(p->head));
+            if (p->type < 0 || p->len == 0) done = 1;
+            io_uring_buf_ring_add(br, b, buf_size, bid, io_uring_buf_ring_mask(NBUF), 0);
+            io_uring_buf_ring_advance(br, 1);
+        }
+        io_uring_cqe_seen(&ring, cqe);
+    }
+    io_uring_free_buf_ring(&ring, br, NBUF, 7);
+    io_uring_queue_exit(&ring);
+    free(slab);
+    return n;
+}
+
+static void test_plain_recv_fails_on_control_record(void)
+{
+    begin("recv: a plain recv fails with EIO once a non-data record arrives");
+    int c, s;
+    if (keyed_pair(&c, &s) < 0) {
+        CHECK(0, "keyed loopback connection: %s", strerror(errno));
+        return;
+    }
+    static const uint8_t ticket[] = { 0x04, 0x00, 0x00, 0x00 };
+    send_record(s, KTLS_RECORD_HANDSHAKE, ticket, sizeof(ticket));
+    char buf[256];
+    const ssize_t r = recv(c, buf, sizeof(buf), 0);
+    const int err = r < 0 ? errno : 0;
+    CHECK(r < 0 && err == EIO,
+          "recv returned %zd (%s); this is why kTLS sockets are read with recvmsg",
+          r, err ? strerror(err) : "no error");
+    close(c);
+    close(s);
+}
+
+static void test_recvmsg_record_types(void)
+{
+    begin("recvmsg: ticket, data, alert and end of stream are told apart");
+    int c, s;
+    if (keyed_pair(&c, &s) < 0) {
+        CHECK(0, "keyed loopback connection: %s", strerror(errno));
+        return;
+    }
+    static const uint8_t ticket[] = { 0x04, 0x00, 0x00, 0x00 };
+    static const char    data[]   = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    static const uint8_t notify[] = { 0x01, 0x00 };   /* warning, close_notify */
+    send_record(s, KTLS_RECORD_HANDSHAKE, ticket, sizeof(ticket));
+    send(s, data, sizeof(data) - 1, MSG_NOSIGNAL);
+    send_record(s, KTLS_RECORD_ALERT, notify, sizeof(notify));
+    close(s);
+
+    piece_t p[8];
+    const int n = collect(c, 4096, p, 8);
+    CHECK(n == 4, "got %d completions, want 4 (ticket, data, alert, end of stream)", n);
+    if (n >= 1)
+        CHECK(p[0].type == KTLS_RECORD_HANDSHAKE && p[0].len == sizeof(ticket) &&
+              memcmp(p[0].head, ticket, sizeof(ticket)) == 0,
+              "first: type %d len %u, want the 4-byte ticket (22)", p[0].type, p[0].len);
+    if (n >= 2)
+        CHECK(p[1].type == KTLS_RECORD_DATA && p[1].len == sizeof(data) - 1 &&
+              memcmp(p[1].head, data, sizeof(p[1].head)) == 0,
+              "second: type %d len %u, want the response as data (23)", p[1].type, p[1].len);
+    if (n >= 3)
+        CHECK(p[2].type == KTLS_RECORD_ALERT && p[2].len == 2 &&
+              p[2].head[0] == 1 && p[2].head[1] == 0,
+              "third: type %d len %u, want close_notify (21)", p[2].type, p[2].len);
+    if (n >= 4)
+        CHECK(p[3].type == 0 && p[3].len == 0,
+              "fourth: type %d len %u, want end of stream", p[3].type, p[3].len);
+    close(c);
+}
+
+static void test_recvmsg_record_split_across_buffers(void)
+{
+    begin("recvmsg: a record bigger than a buffer arrives in pieces, each typed");
+    int c, s;
+    if (keyed_pair(&c, &s) < 0) {
+        CHECK(0, "keyed loopback connection: %s", strerror(errno));
+        return;
+    }
+    static uint8_t big[10000];
+    for (size_t i = 0; i < sizeof(big); i++)
+        big[i] = (uint8_t)('a' + i % 26);
+    send(s, big, sizeof(big), MSG_NOSIGNAL);   /* one record: under 16 KB */
+    close(s);
+
+    piece_t p[16];
+    const int n = collect(c, 4096, p, 16);
+    uint32_t total = 0;
+    int typed = 1;
+    for (int i = 0; i < n; i++) {
+        if (p[i].len == 0) continue;   /* end of stream */
+        total += p[i].len;
+        if (p[i].type != KTLS_RECORD_DATA) typed = 0;
+    }
+    CHECK(total == sizeof(big), "received %u bytes, want %zu", total, sizeof(big));
+    CHECK(n >= 3, "%d completions: the record wasn't split, test proves nothing", n);
+    CHECK(typed, "a continuation piece lost its record type");
+    close(c);
+}
+
 /* ── main ──────────────────────────────────────────────────────────── */
 
 int main(void)
 {
-    printf("\ngcannon kTLS key tests\n\n");
+    printf("\ngcannon kTLS tests\n\n");
 
     test_suite_names();
     test_derive_rfc8448();
@@ -447,6 +646,9 @@ int main(void)
         test_install_roundtrip();
         test_install_records_match_rfc8446();
         test_install_mismatched_keys();
+        test_plain_recv_fails_on_control_record();
+        test_recvmsg_record_types();
+        test_recvmsg_record_split_across_buffers();
     } else {
         printf("  install tests\n    SKIP  kernel TLS unavailable here (%s)\n",
                strerror(-probe));
