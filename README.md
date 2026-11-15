@@ -158,7 +158,7 @@ gcannon https://localhost:8443/ws --ws -c 256 -t 8 -d 5s
 - The server certificate is **not verified**. SNI is the URL's host name, and isn't sent for an IP address.
 - Session tickets are ignored, so with `-r` every connection does a full handshake.
 - Needs kernel TLS; gcannon checks for it at startup.
-- Handshake failures count as connect errors, and the first one's reason is printed to stderr.
+- Handshake failures count as connect errors. Failures after the handshake count as read errors: a record that doesn't decrypt, a fatal alert, or a server KeyUpdate (rekeying isn't supported). The first TLS failure's reason is printed to stderr.
 - Bandwidth counts decrypted bytes.
 
 ## Output

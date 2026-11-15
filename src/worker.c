@@ -719,8 +719,12 @@ void worker_loop(worker_t *w)
                     }
                     /* Count a session the record layer gave up on; left
                        uncounted, it shows only as reconnects and a low rate */
-                    if (w->ktls && ktls_read_error(res))
+                    if (w->ktls && ktls_read_error(res)) {
                         w->stats.read_errors++;
+                        tls_report("read", res == -EKEYEXPIRED
+                                   ? "the server sent a KeyUpdate; rekeying isn't supported"
+                                   : strerror(-res));
+                    }
                     reconnect(w, conn_idx);
                     break;
                 }
@@ -757,7 +761,17 @@ void worker_loop(worker_t *w)
                         const int orderly = type >= 0 &&
                             (len == 0 || (type == KTLS_RECORD_ALERT &&
                                           len >= 2 && buf[1] == 0));
-                        if (!orderly) w->stats.read_errors++;
+                        if (!orderly) {
+                            char why[64];
+                            if (type == KTLS_RECORD_ALERT && len >= 2)
+                                snprintf(why, sizeof(why), "the server sent alert %d", buf[1]);
+                            else if (type < 0)
+                                snprintf(why, sizeof(why), "malformed recvmsg completion");
+                            else
+                                snprintf(why, sizeof(why), "unexpected record type %d", type);
+                            tls_report("read", why);
+                            w->stats.read_errors++;
+                        }
                         return_buffer(w, bid);
                         reconnect(w, conn_idx);
                         break;
