@@ -24,7 +24,7 @@ static inline void return_buffer(worker_t *w, uint16_t bid)
 {
     uint8_t *addr = w->buf_slab + (size_t)bid * w->recv_buf_size;
     io_uring_buf_ring_add(w->buf_ring, addr, w->recv_buf_size,
-                          bid, w->buf_mask, w->buf_index++);
+                          bid, w->buf_mask, 0);
     io_uring_buf_ring_advance(w->buf_ring, 1);
 }
 
