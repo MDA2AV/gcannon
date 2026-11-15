@@ -578,18 +578,64 @@ int main(int argc, char **argv)
         pthread_create(&threads[i], NULL, worker_thread, &ctxs[i]);
     }
 
-    /* Warmup — let connections establish */
-    nanosleep(&(struct timespec){ .tv_sec = 0, .tv_nsec = 100000000 }, NULL); /* 100ms */
+    /* Warmup — at least WARMUP_MIN_MS, then until every connection has
+     * settled (became ready, or failed once and is retrying). A fixed sleep
+     * let slow setup — a WebSocket upgrade the server answers late — run into
+     * the measured window, where those connections sat idle and dragged the
+     * rate down. Capped so a server that never answers can't stall the run. */
+    nanosleep(&(struct timespec){ .tv_sec = 0, .tv_nsec = WARMUP_MIN_MS * 1000000L }, NULL);
+    {
+        struct timespec warm_start, now;
+        clock_gettime(CLOCK_MONOTONIC, &warm_start);
+        for (;;) {
+            int settled = 0;
+            for (int i = 0; i < num_threads; i++)
+                settled += atomic_load_explicit(&ctxs[i].worker.conns_settled,
+                                                memory_order_relaxed);
+            if (settled >= num_connections || !g_running) break;
+
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            const long waited_ms = (now.tv_sec - warm_start.tv_sec) * 1000L
+                                 + (now.tv_nsec - warm_start.tv_nsec) / 1000000L;
+            if (waited_ms >= WARMUP_MAX_MS - WARMUP_MIN_MS) {
+                fprintf(stderr, "Warning: %d of %d connections still not set up after "
+                                "%.0fs of warmup; measuring anyway\n",
+                        num_connections - settled, num_connections,
+                        WARMUP_MAX_MS / 1000.0);
+                break;
+            }
+            nanosleep(&(struct timespec){ .tv_sec = 0, .tv_nsec = 1000000 }, NULL); /* 1ms */
+        }
+    }
 
     /* Reset counters after warmup. Signal each worker to zero its own stats
      * from its own thread; memset-ing them here would race with the workers
      * still incrementing those same counters (a data race / undefined behavior). */
     for (int i = 0; i < num_threads; i++)
         ctxs[i].worker.reset_request = 1;
-    /* Wait until every worker has acknowledged before we start the clock. */
+    /* Wait until every worker has acknowledged before we start the clock.
+     * A worker that saw Ctrl-C has left its loop without acknowledging, so
+     * stop waiting once g_running drops; otherwise this waits forever. */
     for (int i = 0; i < num_threads; i++)
-        while (ctxs[i].worker.reset_request)
+        while (ctxs[i].worker.reset_request && g_running)
             nanosleep(&(struct timespec){ .tv_sec = 0, .tv_nsec = 100000 }, NULL); /* 100us */
+
+    if (!g_running) {
+        /* Ctrl-C before the clock started. Nothing was measured, so there is
+         * no result to print (elapsed would be ~0 and the rate absurd) and
+         * none to add to the run history. */
+        for (int i = 0; i < num_threads; i++) {
+            pthread_join(threads[i], NULL);
+            worker_destroy(&ctxs[i].worker);
+        }
+        fprintf(stderr, "Interrupted during warmup; nothing was measured\n");
+        for (int i = 0; i < num_templates; i++)
+            free(templates[i].pipeline_buf);
+        free(templates);
+        free(ctxs);
+        free(threads);
+        return 130;   /* 128 + SIGINT, as a shell reports an interrupted command */
+    }
 
     struct timespec start_time;
     clock_gettime(CLOCK_MONOTONIC, &start_time);

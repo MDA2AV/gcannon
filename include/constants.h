@@ -2,7 +2,7 @@
 
 #include <stdint.h>
 
-#define GCANNON_VERSION "0.6.1"
+#define GCANNON_VERSION "0.6.2"
 
 /* ── User-data packing (64-bit: [kind:16][gen:16][conn_idx:32]) ───── */
 
@@ -23,3 +23,6 @@ typedef enum { UD_CONNECT = 1, UD_RECV = 2, UD_SEND = 3, UD_CANCEL = 4 } ud_kind
 #define MAX_CONNS_PER_WORKER  16384
 #define BUFFER_RING_BGID      1
 #define MAX_TEMPLATES         64
+#define WARMUP_MIN_MS         100    /* warmup lasts at least this long... */
+#define WARMUP_MAX_MS         10000  /* ...and waits this long at most for
+                                        connections still being set up */
