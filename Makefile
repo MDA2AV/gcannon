@@ -33,9 +33,14 @@ clean:
 TESTDIR   = tests
 TEST_SRC  = $(TESTDIR)/test_http_parser.c src/http.c external/picohttpparser/picohttpparser.c
 TEST_BIN  = $(BUILDDIR)/test_http_parser
+RING_TEST_BIN = $(BUILDDIR)/test_buf_ring
+RING_TEST_OBJ = $(filter-out $(BUILDDIR)/main.o $(BUILDDIR)/worker.o,$(OBJ))
 
 $(TEST_BIN): $(TEST_SRC) | $(BUILDDIR)
 	$(CC) $(CFLAGS) -o $@ $(TEST_SRC)
+
+$(RING_TEST_BIN): $(TESTDIR)/test_buf_ring.c src/worker.c include/worker.h include/constants.h $(RING_TEST_OBJ) $(PICO_OBJ) | $(BUILDDIR)
+	$(CC) $(CFLAGS) -o $@ $< $(RING_TEST_OBJ) $(PICO_OBJ) $(LDFLAGS)
 
 KTLS_TEST_SRC = $(TESTDIR)/test_ktls.c src/ktls.c
 KTLS_TEST_BIN = $(BUILDDIR)/test_ktls
@@ -43,9 +48,12 @@ KTLS_TEST_BIN = $(BUILDDIR)/test_ktls
 $(KTLS_TEST_BIN): $(KTLS_TEST_SRC) include/ktls.h | $(BUILDDIR)
 	$(CC) $(CFLAGS) -o $@ $(KTLS_TEST_SRC) -lcrypto
 
-test-unit: $(TEST_BIN) $(KTLS_TEST_BIN)
+# Run every unit suite even if an earlier one fails, then report the
+# combined result.
+test-unit: $(TEST_BIN) $(RING_TEST_BIN) $(KTLS_TEST_BIN)
 	@rc=0; \
 	 ./$(TEST_BIN)      || rc=1; \
+	 ./$(RING_TEST_BIN) || rc=1; \
 	 ./$(KTLS_TEST_BIN) || rc=1; \
 	 exit $$rc
 
