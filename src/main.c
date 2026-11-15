@@ -646,10 +646,29 @@ int main(int argc, char **argv)
      * still incrementing those same counters (a data race / undefined behavior). */
     for (int i = 0; i < num_threads; i++)
         ctxs[i].worker.reset_request = 1;
-    /* Wait until every worker has acknowledged before we start the clock. */
+    /* Wait until every worker has acknowledged before we start the clock.
+     * A worker that saw Ctrl-C has left its loop without acknowledging, so
+     * stop waiting once g_running drops; otherwise this waits forever. */
     for (int i = 0; i < num_threads; i++)
-        while (ctxs[i].worker.reset_request)
+        while (ctxs[i].worker.reset_request && g_running)
             nanosleep(&(struct timespec){ .tv_sec = 0, .tv_nsec = 100000 }, NULL); /* 100us */
+
+    if (!g_running) {
+        /* Ctrl-C before the clock started. Nothing was measured, so there is
+         * no result to print (elapsed would be ~0 and the rate absurd) and
+         * none to add to the run history. */
+        for (int i = 0; i < num_threads; i++) {
+            pthread_join(threads[i], NULL);
+            worker_destroy(&ctxs[i].worker);
+        }
+        fprintf(stderr, "Interrupted during warmup; nothing was measured\n");
+        for (int i = 0; i < num_templates; i++)
+            free(templates[i].pipeline_buf);
+        free(templates);
+        free(ctxs);
+        free(threads);
+        return 130;   /* 128 + SIGINT, as a shell reports an interrupted command */
+    }
 
     struct timespec start_time;
     clock_gettime(CLOCK_MONOTONIC, &start_time);
