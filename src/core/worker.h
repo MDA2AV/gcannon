@@ -1,0 +1,137 @@
+#pragma once
+
+#include <liburing.h>
+#include <netinet/in.h>
+#include <stdatomic.h>
+#include <sys/socket.h>
+#include <time.h>
+
+#include "core/constants.h"
+#include "core/stats.h"
+#include "proto/http.h"
+#include "proto/ws.h"
+#include "proto/ktls.h"
+#include "proto/template.h"
+
+typedef enum { CONN_CONNECTING, CONN_TLS_HANDSHAKE, CONN_WS_UPGRADING, CONN_ACTIVE,
+               CONN_CLOSED } conn_state_t;
+
+struct ssl_st;
+struct ssl_ctx_st;
+
+typedef struct gc_conn {
+    int              fd;
+    uint16_t         gen;            /* generation counter for stale CQE detection */
+    conn_state_t     state;
+    int              tpl_idx;        /* which request template this conn uses */
+    int              pipeline_inflight;
+    http_parser_t    parser;
+    ws_parser_t      ws_parser;
+    struct timespec  send_times[PIPELINE_DEPTH_MAX];
+    int              send_time_head;
+    int              send_time_tail;
+    int              send_inflight;
+    int              send_total;     /* total bytes we intended to send */
+    int              send_done;      /* bytes confirmed sent so far */
+    const char      *send_buf;       /* buffer currently in flight (for partial-send resubmit) */
+    int              requests_sent;  /* total requests sent on this connection */
+    int              responses_recv; /* total responses received on this connection */
+    char            *scratch_buf;    /* per-conn buffer for placeholder substitution */
+    int              scratch_len;    /* allocated size of scratch_buf */
+    uint64_t         rng_state;      /* xorshift64 state for RAND placeholders */
+    int              settled;        /* first setup attempt finished (ready or failed) */
+    struct ssl_st   *ssl;            /* only while the TLS handshake runs */
+    ktls_secrets_t   tls_secrets;    /* traffic secrets captured during it */
+    /* --rate: when this connection's next request is due (CLOCK_MONOTONIC ns).
+       It only ever moves forward one interval per request, and survives
+       reconnects, so time lost to a stall is owed rather than forgotten. */
+    uint64_t         due_ns;
+    int              pace_pending;   /* due while the previous send was still in flight */
+} gc_conn_t;
+
+/* --rate: one queued send. Stale entries (the connection closed, or was
+   rescheduled) are recognised by gen/due and dropped when they surface. */
+typedef struct pace_entry {
+    uint64_t due_ns;
+    int      conn_idx;
+    uint16_t gen;
+} pace_entry_t;
+
+typedef struct worker {
+    struct io_uring           ring;
+    struct io_uring_buf_ring *buf_ring;
+    uint8_t                  *buf_slab;
+    uint32_t                  buf_index;
+    uint32_t                  buf_mask;
+    gc_conn_t                *conns;
+    int                       num_conns;
+
+    const struct sockaddr_in *server_addrs;      /* --addr-span consecutive targets */
+    int                       num_addrs;         /* connection i uses
+                                                    server_addrs[i % num_addrs] */
+    request_tpl_t            *templates;
+    int                       num_templates;
+    int                       pipeline_depth;
+
+    int                       requests_per_conn; /* 0 = keep-alive forever */
+    int                       expected_status;   /* expected HTTP status code (0 = any) */
+    int                       conn_offset;       /* global connection index offset for template assignment */
+    int                       ws_mode;           /* 1 = WebSocket echo mode */
+    char                     *ws_upgrade_buf;    /* pre-built upgrade request */
+    int                       ws_upgrade_len;
+    uint8_t                  *ws_frame_buf;      /* pipeline_depth copies of the WS frame */
+    int                       ws_frame_len;      /* single frame length */
+    int                       ws_pipeline_len;   /* total buffer length */
+    int                       recv_buf_size;     /* per-buffer size in bytes */
+    int                       ktls;              /* 1 = https: TLS handshake, then
+                                                    kernel TLS; receive with recvmsg
+                                                    so record types are visible */
+    struct msghdr             recv_msg;          /* recvmsg template (kTLS only) */
+    struct ssl_ctx_st        *ssl_ctx;           /* handshake config (kTLS only) */
+    const char               *tls_sni;           /* server name, NULL for an IP */
+    int                       cqe_latency;       /* 1 = timestamp at CQE arrival, 0 = after parse */
+    int                       per_tpl_latency;   /* 1 = per-template latency histograms */
+    worker_stats_t            stats;
+    volatile int             *running;
+    volatile int              reset_request;     /* main sets after warmup; worker
+                                                    zeroes its own stats and clears */
+    _Atomic int               conns_settled;     /* conns whose first setup attempt
+                                                    finished; main waits on it */
+    int                       id;
+
+    /* --rate: every connection sends one request per interval_ns, its first
+       offset by its share of the interval so the fleet does not fire in
+       waves. 0 = closed loop (the default): send again on every response. */
+    uint64_t                  interval_ns;
+    uint64_t                  epoch_ns;          /* one clock for every worker: connection g
+                                                    sends at epoch + its offset + k*interval */
+    int                       total_conns;       /* across all workers, for the offsets */
+    pace_entry_t             *pace_heap;         /* min-heap on due_ns */
+    int                       pace_len;
+    int                       pace_cap;
+
+    /* --connect-limit: initial connects in flight at once (0 = all at once) */
+    int                       connect_limit;
+    int                       connect_next;      /* next connection not yet started */
+    int                       connect_inflight;
+} worker_t;
+
+/* Initialize worker (must be called from worker thread for SINGLE_ISSUER) */
+void worker_init(worker_t *w, int id,
+                 const struct sockaddr_in *addrs, int num_addrs,
+                 request_tpl_t *templates, int num_templates, int pipeline_depth,
+                 int num_conns, int conn_offset, int requests_per_conn,
+                 int expected_status, int ws_mode,
+                 const char *ws_host, int ws_port, const char *ws_path,
+                 const uint8_t *ws_payload, int ws_payload_len,
+                 int recv_buf_size,
+                 int cqe_latency, int per_tpl_latency,
+                 int tls, const char *tls_sni,
+                 uint64_t interval_ns, uint64_t epoch_ns, int total_conns,
+                 int connect_limit, volatile int *running);
+
+/* Main event loop — blocks until *running == 0 */
+void worker_loop(worker_t *w);
+
+/* Cleanup */
+void worker_destroy(worker_t *w);

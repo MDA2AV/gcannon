@@ -11,12 +11,14 @@
 #include <errno.h>
 #include <time.h>
 
-#include "constants.h"
-#include "worker.h"
-#include "http.h"
-#include "stats.h"
-#include "tui.h"
-#include "history.h"
+#include "cli.h"
+#include "core/constants.h"
+#include "core/stats.h"
+#include "core/worker.h"
+#include "proto/template.h"
+#include "output/history.h"
+#include "output/report.h"
+#include "output/tui.h"
 
 /* ── globals ───────────────────────────────────────────────────────── */
 
@@ -48,209 +50,6 @@ typedef struct thread_ctx {
     int              total_conns;
     int              connect_limit;
 } thread_ctx_t;
-
-/* ── URL parser ────────────────────────────────────────────────────── */
-
-static int parse_url(const char *url, char *host, int host_sz,
-                     int *port, char *path, int path_sz, int *tls)
-{
-    const char *hp;
-    if (strncmp(url, "http://", 7) == 0) {
-        hp = url + 7;
-        *tls = 0;
-    } else if (strncmp(url, "https://", 8) == 0) {
-        hp = url + 8;
-        *tls = 1;
-    } else {
-        fprintf(stderr, "Error: only http:// and https:// URLs supported\n");
-        return -1;
-    }
-    const char *slash = strchr(hp, '/');
-    const char *colon = strchr(hp, ':');
-
-    if (slash) {
-        snprintf(path, path_sz, "%s", slash);
-    } else {
-        snprintf(path, path_sz, "/");
-        slash = hp + strlen(hp);
-    }
-
-    if (colon && colon < slash) {
-        int hlen = (int)(colon - hp);
-        if (hlen >= host_sz) hlen = host_sz - 1;
-        memcpy(host, hp, hlen);
-        host[hlen] = '\0';
-        *port = atoi(colon + 1);
-    } else {
-        int hlen = (int)(slash - hp);
-        if (hlen >= host_sz) hlen = host_sz - 1;
-        memcpy(host, hp, hlen);
-        host[hlen] = '\0';
-        *port = *tls ? 443 : 80;
-    }
-    return 0;
-}
-
-static int parse_duration(const char *s)
-{
-    const int val = atoi(s);
-    const int len = strlen(s);
-    if (len > 0 && (s[len-1] == 's' || s[len-1] == 'S'))
-        return val;
-    if (len > 0 && (s[len-1] == 'm' || s[len-1] == 'M'))
-        return val * 60;
-    return val;
-}
-
-/* ── placeholder scanning for {RAND:min:max} and {SEQ:start} ──────── */
-
-static int count_digits(uint64_t n)
-{
-    if (n == 0) return 1;
-    int d = 0;
-    while (n > 0) { d++; n /= 10; }
-    return d;
-}
-
-/*
- * Scan raw template bytes for a single {RAND:min:max} or {SEQ:start}
- * placeholder. If found, replace it in-place with zero-padded digits
- * and populate ph. Returns 0 on success, -1 on parse error.
- * The buffer may be resized if the placeholder text and the padded
- * width differ — caller must use the returned buf/len.
- */
-static int scan_placeholder(char **buf, int *len, placeholder_t *ph)
-{
-    memset(ph, 0, sizeof(*ph));
-    ph->type = SUB_NONE;
-
-    /* find {RAND: or {SEQ: */
-    char *p = NULL;
-    for (int i = 0; i < *len - 5; i++) {
-        if ((*buf)[i] == '{' &&
-            (memcmp(*buf + i, "{RAND:", 6) == 0 ||
-             memcmp(*buf + i, "{SEQ:",  5) == 0)) {
-            p = *buf + i;
-            break;
-        }
-    }
-    if (!p) return 0; /* no placeholder */
-
-    /* find closing } */
-    char *end = memchr(p, '}', *len - (int)(p - *buf));
-    if (!end) {
-        fprintf(stderr, "Error: unclosed placeholder in raw template\n");
-        return -1;
-    }
-
-    int ph_start = (int)(p - *buf);
-    int ph_len   = (int)(end - p) + 1; /* includes { and } */
-
-    /* parse type and params */
-    char tmp[128];
-    int tlen = ph_len < (int)sizeof(tmp) ? ph_len : (int)sizeof(tmp) - 1;
-    memcpy(tmp, p, tlen);
-    tmp[tlen] = '\0';
-
-    if (strncmp(tmp, "{RAND:", 6) == 0) {
-        ph->type = SUB_RAND;
-        uint64_t mn = 0, mx = 0;
-        if (sscanf(tmp, "{RAND:%lu:%lu}", &mn, &mx) != 2 || mx < mn) {
-            fprintf(stderr, "Error: bad {RAND:min:max} syntax: %s\n", tmp);
-            return -1;
-        }
-        ph->min = mn;
-        ph->max = mx;
-        ph->width = count_digits(mx);
-    } else if (strncmp(tmp, "{SEQ:", 5) == 0) {
-        ph->type = SUB_SEQ;
-        uint64_t start = 0;
-        if (sscanf(tmp, "{SEQ:%lu}", &start) != 1) {
-            fprintf(stderr, "Error: bad {SEQ:start} syntax: %s\n", tmp);
-            return -1;
-        }
-        ph->min = start;
-        ph->max = 0;
-        atomic_store(&ph->seq, start);
-        /* Width matches digits(start) so the first emitted value has no
-         * leading zeros. JSON number fields reject leading zeros per
-         * RFC 8259, so anything else silently corrupts POST bodies.
-         * Users who need the counter to grow past 10^digits(start)
-         * must pick a start with enough digit headroom — e.g.
-         * {SEQ:10000001} covers ~89M increments with 8-digit width. */
-        ph->width = count_digits(start);
-    } else {
-        return 0;
-    }
-
-    ph->offset = ph_start;
-
-    /* replace placeholder text with zero-padded digits in the buffer.
-     * If ph_len != ph->width, we need to shift the rest of the buffer. */
-    int delta = ph->width - ph_len;
-    int new_len = *len + delta;
-    if (delta != 0) {
-        char *new_buf = malloc(new_len);
-        if (!new_buf) return -1;
-        memcpy(new_buf, *buf, ph_start);
-        memset(new_buf + ph_start, '0', ph->width);
-        memcpy(new_buf + ph_start + ph->width,
-               *buf + ph_start + ph_len,
-               *len - ph_start - ph_len);
-        free(*buf);
-        *buf = new_buf;
-        *len = new_len;
-    } else {
-        memset(*buf + ph_start, '0', ph->width);
-    }
-
-    return 0;
-}
-
-/* ── raw request file loading ──────────────────────────────────────── */
-
-static char *load_file(const char *path, int *out_len)
-{
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        fprintf(stderr, "Error: cannot open raw request file '%s'\n", path);
-        return NULL;
-    }
-    fseek(f, 0, SEEK_END);
-    const long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    char *buf = malloc(sz);
-    if (!buf) {
-        fprintf(stderr, "Error: out of memory reading '%s'\n", path);
-        fclose(f);
-        return NULL;
-    }
-    if ((long)fread(buf, 1, sz, f) != sz) {
-        fprintf(stderr, "Error: failed to read '%s'\n", path);
-        free(buf);
-        fclose(f);
-        return NULL;
-    }
-    fclose(f);
-    *out_len = (int)sz;
-    return buf;
-}
-
-static int build_pipeline_from_raw(const char *raw, int raw_len,
-                                   int pipeline_depth, request_tpl_t *tpl)
-{
-    tpl->request_len  = raw_len;
-    tpl->pipeline_len = raw_len * pipeline_depth;
-    tpl->pipeline_buf = malloc(tpl->pipeline_len);
-    if (!tpl->pipeline_buf) {
-        fprintf(stderr, "Error: out of memory building pipeline\n");
-        return -1;
-    }
-    memcpy(tpl->pipeline_buf, raw, raw_len);
-    for (int i = 1; i < pipeline_depth; i++)
-        memcpy(tpl->pipeline_buf + i * raw_len, raw, raw_len);
-    return 0;
-}
 
 /* ── worker thread entry ───────────────────────────────────────────── */
 
@@ -284,171 +83,18 @@ static void sigint_handler(int sig)
 
 int main(int argc, char **argv)
 {
-    int num_connections = 100;
-    int num_threads = 1;
-    int duration_sec = 10;
-    int pipeline_depth = 1;
-    int requests_per_conn = 0; /* 0 = keep-alive forever */
-    int expected_status = 200; /* expected HTTP status code */
-    int ws_mode = 0;
-    int tui_mode = 0;
-    int json_mode = 0;
-    int cqe_latency = 0;
-    int per_tpl_latency = 0;
-    int recv_buf_size = RECV_BUF_SIZE_DEFAULT;
-    int hist_buckets = 0; /* 0 = default (10) */
-    double rate = 0;          /* --rate: total req/s; 0 = closed loop */
-    int addr_span = 1;        /* --addr-span: consecutive target addresses */
-    int connect_limit = 0;    /* --connect-limit: first connects in flight per thread */
-    int warmup_max_sec = WARMUP_MAX_MS / 1000;
-    const char *ws_message = "hello";
-    const char *url = NULL;
-    const char *raw_files = NULL;
-
-    /* Parse CLI args */
-    for (int i = 1; i < argc; i++) {
-        if (argv[i][0] != '-') {
-            url = argv[i];
-        } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
-            num_connections = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
-            num_threads = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
-            duration_sec = parse_duration(argv[++i]);
-        } else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
-            pipeline_depth = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "-r") == 0 && i + 1 < argc) {
-            requests_per_conn = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
-            expected_status = atoi(argv[++i]);
-        } else if ((strcmp(argv[i], "--raw") == 0 || strcmp(argv[i], "-R") == 0) && i + 1 < argc) {
-            raw_files = argv[++i];
-        } else if (strcmp(argv[i], "--ws") == 0) {
-            ws_mode = 1;
-        } else if (strcmp(argv[i], "--ws-msg") == 0 && i + 1 < argc) {
-            ws_message = argv[++i];
-            ws_mode = 1;
-        } else if (strcmp(argv[i], "--tui") == 0) {
-            tui_mode = 1;
-        } else if (strcmp(argv[i], "--json") == 0) {
-            json_mode = 1;
-        } else if ((strcmp(argv[i], "--buckets") == 0 || strcmp(argv[i], "-b") == 0) && i + 1 < argc) {
-            hist_buckets = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "--cqe-latency") == 0) {
-            cqe_latency = 1;
-        } else if (strcmp(argv[i], "--recv-buf") == 0 && i + 1 < argc) {
-            recv_buf_size = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "--per-tpl-latency") == 0) {
-            per_tpl_latency = 1;
-        } else if (strcmp(argv[i], "--rate") == 0 && i + 1 < argc) {
-            rate = atof(argv[++i]);
-            if (rate <= 0) {
-                fprintf(stderr, "Error: --rate must be a positive number of requests/s\n");
-                return 1;
-            }
-        } else if (strcmp(argv[i], "--addr-span") == 0 && i + 1 < argc) {
-            addr_span = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "--connect-limit") == 0 && i + 1 < argc) {
-            connect_limit = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "--warmup-max") == 0 && i + 1 < argc) {
-            warmup_max_sec = parse_duration(argv[++i]);
-        } else if (strcmp(argv[i], "--version") == 0) {
-            printf("gcannon %s\n", GCANNON_VERSION);
-            return 0;
-        } else if (strcmp(argv[i], "--clear-history") == 0) {
-            history_clear();
-            printf("Run history cleared.\n");
-            return 0;
-        } else {
-            fprintf(stderr, "Usage: gcannon <url> -c <conns> -t <threads> "
-                            "-d <duration> [-p <pipeline>] [-r <req/conn>] "
-                            "[-s <status>] [-R|--raw file1,file2,...] "
-                            "[--ws [--ws-msg <message>]] [--tui] [--json] [-b <buckets>] "
-                            "[--recv-buf <bytes>] [--cqe-latency] [--rate <req/s>] "
-                            "[--addr-span <n>] [--connect-limit <n>] "
-                            "[--warmup-max <duration>] [--version]\n");
-            return 1;
-        }
-    }
-
-    if (!url && !raw_files) {
-        fprintf(stderr, "Usage: gcannon <url> -c <conns> -t <threads> "
-                        "-d <duration> [-p <pipeline>] [-r <req/conn>] "
-                        "[-R|--raw file1,file2,...] [--tui] [--json]\n");
-        return 1;
-    }
-
-    /* Validate counts before anything derives from them. num_threads in
-       particular is a divisor below, so -t 0 used to die with SIGFPE. */
-    if (num_threads < 1) {
-        fprintf(stderr, "Error: -t must be at least 1 (got %d)\n", num_threads);
-        return 1;
-    }
-    if (num_connections < 1) {
-        fprintf(stderr, "Error: -c must be at least 1 (got %d)\n", num_connections);
-        return 1;
-    }
-    if (pipeline_depth < 1) {
-        fprintf(stderr, "Error: -p must be at least 1 (got %d)\n", pipeline_depth);
-        return 1;
-    }
-    if (duration_sec < 1) {
-        fprintf(stderr, "Error: -d must be at least 1 second (got %d)\n", duration_sec);
-        return 1;
-    }
-    if (requests_per_conn < 0) {
-        fprintf(stderr, "Error: -r must not be negative (got %d)\n", requests_per_conn);
-        return 1;
-    }
-    if (num_connections < num_threads) {
-        /* Threads past the remainder would get zero connections and spin in
-           the event loop doing nothing, quietly producing a slower run than
-           the flags suggest. */
-        fprintf(stderr, "Error: -c (%d) must be at least -t (%d); every thread "
-                        "needs at least one connection\n",
-                num_connections, num_threads);
-        return 1;
-    }
-
-    /* --rate paces requests one at a time per connection: a pipeline would
-       send several on one schedule slot, and a per-connection quota would end
-       a connection's schedule early. */
-    if (rate > 0 && pipeline_depth != 1) {
-        fprintf(stderr, "Error: --rate needs -p 1 (got -p %d)\n", pipeline_depth);
-        return 1;
-    }
-    if (rate > 0 && requests_per_conn > 0) {
-        fprintf(stderr, "Error: --rate cannot be combined with -r\n");
-        return 1;
-    }
-    if (addr_span < 1 || addr_span > 65536) {
-        fprintf(stderr, "Error: --addr-span must be 1..65536 (got %d)\n", addr_span);
-        return 1;
-    }
-    if (connect_limit < 0) {
-        fprintf(stderr, "Error: --connect-limit must not be negative (got %d)\n",
-                connect_limit);
-        return 1;
-    }
-    if (warmup_max_sec < 1) {
-        fprintf(stderr, "Error: --warmup-max must be at least 1 second\n");
-        return 1;
-    }
-
-    if (pipeline_depth > PIPELINE_DEPTH_MAX)
-        pipeline_depth = PIPELINE_DEPTH_MAX;
-
-    if (recv_buf_size < 512) {
-        fprintf(stderr, "Error: --recv-buf must be at least 512\n");
-        return 1;
-    }
-    if (recv_buf_size > 4 * 1024 * 1024) {
-        /* Each worker pre-allocates BUF_RING_ENTRIES buffers of this size, so an
-           unbounded value (e.g. --recv-buf 1000000000) asks for hundreds of GB
-           per worker. Reject obviously-wrong sizes up front. */
-        fprintf(stderr, "Error: --recv-buf must be at most %d (each worker "
-                        "pre-allocates %d buffers of this size)\n",
-                        4 * 1024 * 1024, BUF_RING_ENTRIES);
+    options_t o;
+    switch (cli_parse(argc, argv, &o)) {
+    case CLI_RUN:
+        break;
+    case CLI_VERSION:
+        printf("gcannon %s\n", GCANNON_VERSION);
+        return 0;
+    case CLI_CLEAR_HISTORY:
+        history_clear();
+        printf("Run history cleared.\n");
+        return 0;
+    default:
         return 1;
     }
 
@@ -459,8 +105,8 @@ int main(int argc, char **argv)
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
 
-    if (url) {
-        if (parse_url(url, host, sizeof(host), &port, path, sizeof(path), &tls) < 0)
+    if (o.url) {
+        if (cli_parse_url(o.url, host, sizeof(host), &port, path, sizeof(path), &tls) < 0)
             return 1;
         addr.sin_port = htons(port);
         if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
@@ -491,120 +137,27 @@ int main(int argc, char **argv)
             tls_sni = host;
     }
 
-    /* Build request templates */
+    /* Build request templates (proto/template.c). Without a URL the target
+       comes from the first --raw file's Host header. */
     request_tpl_t *templates = NULL;
     int num_templates = 0;
-
-    if (raw_files) {
-        /* Count commas to get number of files */
-        int count = 1;
-        for (const char *p = raw_files; *p; p++)
-            if (*p == ',') count++;
-
-        /* worker_stats_t indexes tpl_responses[]/tpl_responses_2xx[] by
-           template, and both are fixed at MAX_TEMPLATES. Going past that
-           writes over the adjacent tpl_latency pointer. */
-        if (count > MAX_TEMPLATES) {
-            fprintf(stderr, "Error: at most %d --raw templates supported "
-                            "(got %d)\n", MAX_TEMPLATES, count);
-            return 1;
-        }
-
-        templates = calloc(count, sizeof(request_tpl_t));
-        if (!templates) { fprintf(stderr, "Error: out of memory\n"); return 1; }
-
-        /* Parse comma-separated file list */
-        char *files_dup = strdup(raw_files);
-        if (!files_dup) { fprintf(stderr, "Error: out of memory\n"); return 1; }
-        char *saveptr;
-        char *tok = strtok_r(files_dup, ",", &saveptr);
-        while (tok) {
-            int raw_len;
-            char *raw = load_file(tok, &raw_len);
-            if (!raw) { free(files_dup); return 1; }
-
-            /* If no URL was given, extract host:port from the first raw file's Host header */
-            if (!url && num_templates == 0) {
-                char *host_hdr = strstr(raw, "Host: ");
-                if (!host_hdr) host_hdr = strstr(raw, "host: ");
-                if (host_hdr) {
-                    host_hdr += 6;
-                    char *eol = strstr(host_hdr, "\r\n");
-                    int hlen = eol ? (int)(eol - host_hdr) : (int)strlen(host_hdr);
-                    if (hlen >= (int)sizeof(host)) hlen = sizeof(host) - 1;
-                    memcpy(host, host_hdr, hlen);
-                    host[hlen] = '\0';
-                    /* Parse host:port */
-                    char *colon = strchr(host, ':');
-                    if (colon) {
-                        *colon = '\0';
-                        port = atoi(colon + 1);
-                    }
-                    addr.sin_port = htons(port);
-                    if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
-                        struct hostent *he = gethostbyname(host);
-                        if (!he) {
-                            fprintf(stderr, "Error: cannot resolve host '%s'\n", host);
-                            free(files_dup); return 1;
-                        }
-                        memcpy(&addr.sin_addr, he->h_addr_list[0], he->h_length);
-                    }
-                }
-            }
-
-            /* Scan for {RAND:min:max} or {SEQ:start} placeholder.
-             * Modifies raw in-place (may realloc) and populates .ph */
-            placeholder_t ph;
-            if (scan_placeholder(&raw, &raw_len, &ph) != 0) {
-                free(raw); free(files_dup); return 1;
-            }
-
-            build_pipeline_from_raw(raw, raw_len, pipeline_depth, &templates[num_templates]);
-            templates[num_templates].ph = ph;
-            num_templates++;
-            free(raw);
-            tok = strtok_r(NULL, ",", &saveptr);
-        }
-        free(files_dup);
-
-        /* strtok_r skips empty fields, so --raw "" and --raw ",,," both get
-           here with nothing loaded. num_templates is a divisor in
-           start_connect's template assignment, so zero is a SIGFPE. */
-        if (num_templates == 0) {
-            fprintf(stderr, "Error: --raw listed no template files\n");
-            free(templates);
-            return 1;
-        }
-    } else {
-        /* Build GET request from URL */
-        templates = calloc(1, sizeof(request_tpl_t));
-        if (!templates) { fprintf(stderr, "Error: out of memory\n"); return 1; }
-        num_templates = 1;
-
-        char *single_buf;
-        int request_len = http_build_pipeline(host, port, path, 1, &single_buf);
-        free(single_buf);
-
-        char *pipeline_buf;
-        http_build_pipeline(host, port, path, pipeline_depth, &pipeline_buf);
-
-        templates[0].pipeline_buf = pipeline_buf;
-        templates[0].request_len  = request_len;
-        templates[0].pipeline_len = request_len * pipeline_depth;
-    }
+    if (templates_build(o.raw_files, o.url != NULL, o.pipeline_depth,
+                        host, sizeof(host), &port, path, &addr,
+                        &templates, &num_templates) < 0)
+        return 1;
 
     /* --addr-span: consecutive IPv4 addresses from the target's. One source
        address holds at most ~64K connections to one destination address and
        port; every 127.x.y.z is local, so a server listening on 0.0.0.0 takes
        a larger fleet spread over 127.0.0.1, .2, ... */
     const uint32_t base_ip = ntohl(addr.sin_addr.s_addr);
-    if ((uint64_t)base_ip + (uint64_t)(addr_span - 1) > 0xFFFFFFFFULL) {
-        fprintf(stderr, "Error: --addr-span %d runs past 255.255.255.255\n", addr_span);
+    if ((uint64_t)base_ip + (uint64_t)(o.addr_span - 1) > 0xFFFFFFFFULL) {
+        fprintf(stderr, "Error: --addr-span %d runs past 255.255.255.255\n", o.addr_span);
         return 1;
     }
-    struct sockaddr_in *addrs = calloc(addr_span, sizeof(*addrs));
+    struct sockaddr_in *addrs = calloc(o.addr_span, sizeof(*addrs));
     if (!addrs) { fprintf(stderr, "Error: out of memory\n"); return 1; }
-    for (int i = 0; i < addr_span; i++) {
+    for (int i = 0; i < o.addr_span; i++) {
         addrs[i] = addr;
         addrs[i].sin_addr.s_addr = htonl(base_ip + (uint32_t)i);
     }
@@ -612,59 +165,23 @@ int main(int argc, char **argv)
     /* --rate: each connection sends once per interval, so together they send
        at the rate asked for */
     uint64_t interval_ns = 0;
-    if (rate > 0) {
-        interval_ns = (uint64_t)((double)num_connections * 1e9 / rate);
+    if (o.rate > 0) {
+        interval_ns = (uint64_t)((double)o.num_connections * 1e9 / o.rate);
         if (interval_ns == 0) interval_ns = 1;
     }
 
-    int conns_per_thread = num_connections / num_threads;
-    int extra = num_connections % num_threads;
+    int conns_per_thread = o.num_connections / o.num_threads;
+    int extra = o.num_connections % o.num_threads;
 
-    if (!json_mode) {
-        printf("gcannon v%s", GCANNON_VERSION);
-        if (ws_mode || tui_mode || cqe_latency || per_tpl_latency) {
-            printf(" [");
-            int first = 1;
-            if (ws_mode)        { printf("WS");             first = 0; }
-            if (tui_mode)       { printf("%sTUI",   first ? "" : ", "); first = 0; }
-            if (cqe_latency)    { printf("%sCQE",   first ? "" : ", "); first = 0; }
-            if (per_tpl_latency){ printf("%sTPL",   first ? "" : ", "); first = 0; }
-            printf("]");
-        }
-        printf("\n");
-        printf("  Target:    %s:%d%s\n", host, port, path);
-        if (tls)
-            printf("  TLS:       1.3 via kernel TLS (certificate not verified)\n");
-        printf("  Threads:   %d\n", num_threads);
-        printf("  Conns:     %d (%.0f/thread)\n", num_connections,
-               (double)num_connections / num_threads);
-        printf("  Pipeline:  %d\n", pipeline_depth);
-        if (requests_per_conn > 0)
-            printf("  Req/conn:  %d\n", requests_per_conn);
-        else
-            printf("  Req/conn:  unlimited (keep-alive)\n");
-        if (num_templates > 1)
-            printf("  Templates: %d\n", num_templates);
-        printf("  Expected:  %d\n", expected_status);
-        printf("  Duration:  %ds\n", duration_sec);
-        if (addr_span > 1) {
-            char first[INET_ADDRSTRLEN], last[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &addrs[0].sin_addr, first, sizeof(first));
-            inet_ntop(AF_INET, &addrs[addr_span - 1].sin_addr, last, sizeof(last));
-            printf("  Addresses: %s - %s (%d)\n", first, last, addr_span);
-        }
-        if (rate > 0)
-            printf("  Rate:      %.0f req/s, one request per connection every %.3fs\n",
-                   rate, interval_ns / 1e9);
-        printf("\n");
-    }
+    if (!o.json_mode)
+        report_banner(&o, host, port, path, tls, num_templates, addrs, interval_ns);
 
     signal(SIGINT, sigint_handler);
     signal(SIGPIPE, SIG_IGN);
 
     /* Spawn worker threads */
-    thread_ctx_t *ctxs = calloc(num_threads, sizeof(thread_ctx_t));
-    pthread_t *threads = calloc(num_threads, sizeof(pthread_t));
+    thread_ctx_t *ctxs = calloc(o.num_threads, sizeof(thread_ctx_t));
+    pthread_t *threads = calloc(o.num_threads, sizeof(pthread_t));
     if (!ctxs || !threads) {
         fprintf(stderr, "Error: out of memory\n");
         return 1;
@@ -677,32 +194,32 @@ int main(int argc, char **argv)
                             + (uint64_t)epoch_ts.tv_nsec;
 
     int conn_offset = 0;
-    for (int i = 0; i < num_threads; i++) {
+    for (int i = 0; i < o.num_threads; i++) {
         ctxs[i].worker.id        = i;
         ctxs[i].worker.conn_offset = conn_offset;
         ctxs[i].templates        = templates;
         ctxs[i].num_templates    = num_templates;
-        ctxs[i].pipeline_depth   = pipeline_depth;
+        ctxs[i].pipeline_depth   = o.pipeline_depth;
         ctxs[i].num_conns        = conns_per_thread + (i < extra ? 1 : 0);
-        ctxs[i].requests_per_conn = requests_per_conn;
-        ctxs[i].expected_status   = expected_status;
-        ctxs[i].ws_mode           = ws_mode;
-        ctxs[i].recv_buf_size    = recv_buf_size;
-        ctxs[i].cqe_latency      = cqe_latency;
-        ctxs[i].per_tpl_latency  = per_tpl_latency;
+        ctxs[i].requests_per_conn = o.requests_per_conn;
+        ctxs[i].expected_status   = o.expected_status;
+        ctxs[i].ws_mode           = o.ws_mode;
+        ctxs[i].recv_buf_size    = o.recv_buf_size;
+        ctxs[i].cqe_latency      = o.cqe_latency;
+        ctxs[i].per_tpl_latency  = o.per_tpl_latency;
         ctxs[i].tls              = tls;
         ctxs[i].tls_sni          = tls_sni;
         ctxs[i].ws_host           = host;
         ctxs[i].ws_port           = port;
         ctxs[i].ws_path           = path;
-        ctxs[i].ws_payload        = (const uint8_t *)ws_message;
-        ctxs[i].ws_payload_len    = strlen(ws_message);
+        ctxs[i].ws_payload        = (const uint8_t *)o.ws_message;
+        ctxs[i].ws_payload_len    = strlen(o.ws_message);
         ctxs[i].addrs             = addrs;
-        ctxs[i].num_addrs         = addr_span;
+        ctxs[i].num_addrs         = o.addr_span;
         ctxs[i].interval_ns       = interval_ns;
         ctxs[i].epoch_ns          = epoch_ns;
-        ctxs[i].total_conns       = num_connections;
-        ctxs[i].connect_limit     = connect_limit;
+        ctxs[i].total_conns       = o.num_connections;
+        ctxs[i].connect_limit     = o.connect_limit;
         conn_offset += ctxs[i].num_conns;
         pthread_create(&threads[i], NULL, worker_thread, &ctxs[i]);
     }
@@ -718,19 +235,19 @@ int main(int argc, char **argv)
         clock_gettime(CLOCK_MONOTONIC, &warm_start);
         for (;;) {
             int settled = 0;
-            for (int i = 0; i < num_threads; i++)
+            for (int i = 0; i < o.num_threads; i++)
                 settled += atomic_load_explicit(&ctxs[i].worker.conns_settled,
                                                 memory_order_relaxed);
-            if (settled >= num_connections || !g_running) break;
+            if (settled >= o.num_connections || !g_running) break;
 
             clock_gettime(CLOCK_MONOTONIC, &now);
             const long waited_ms = (now.tv_sec - warm_start.tv_sec) * 1000L
                                  + (now.tv_nsec - warm_start.tv_nsec) / 1000000L;
-            if (waited_ms >= (long)warmup_max_sec * 1000L - WARMUP_MIN_MS) {
+            if (waited_ms >= (long)o.warmup_max_sec * 1000L - WARMUP_MIN_MS) {
                 fprintf(stderr, "Warning: %d of %d connections still not set up after "
                                 "%ds of warmup; measuring anyway\n",
-                        num_connections - settled, num_connections,
-                        warmup_max_sec);
+                        o.num_connections - settled, o.num_connections,
+                        o.warmup_max_sec);
                 break;
             }
             nanosleep(&(struct timespec){ .tv_sec = 0, .tv_nsec = 1000000 }, NULL); /* 1ms */
@@ -740,12 +257,12 @@ int main(int argc, char **argv)
     /* Reset counters after warmup. Signal each worker to zero its own stats
      * from its own thread; memset-ing them here would race with the workers
      * still incrementing those same counters (a data race / undefined behavior). */
-    for (int i = 0; i < num_threads; i++)
+    for (int i = 0; i < o.num_threads; i++)
         ctxs[i].worker.reset_request = 1;
     /* Wait until every worker has acknowledged before we start the clock.
      * A worker that saw Ctrl-C has left its loop without acknowledging, so
      * stop waiting once g_running drops; otherwise this waits forever. */
-    for (int i = 0; i < num_threads; i++)
+    for (int i = 0; i < o.num_threads; i++)
         while (ctxs[i].worker.reset_request && g_running)
             nanosleep(&(struct timespec){ .tv_sec = 0, .tv_nsec = 100000 }, NULL); /* 100us */
 
@@ -753,14 +270,12 @@ int main(int argc, char **argv)
         /* Ctrl-C before the clock started. Nothing was measured, so there is
          * no result to print (elapsed would be ~0 and the rate absurd) and
          * none to add to the run history. */
-        for (int i = 0; i < num_threads; i++) {
+        for (int i = 0; i < o.num_threads; i++) {
             pthread_join(threads[i], NULL);
             worker_destroy(&ctxs[i].worker);
         }
         fprintf(stderr, "Interrupted during warmup; nothing was measured\n");
-        for (int i = 0; i < num_templates; i++)
-            free(templates[i].pipeline_buf);
-        free(templates);
+        templates_free(templates, num_templates);
         free(ctxs);
         free(threads);
         return 130;   /* 128 + SIGINT, as a shell reports an interrupted command */
@@ -768,8 +283,8 @@ int main(int argc, char **argv)
 
     /* --rate: a line a wrapper can wait on to sample anything else (a
        server's CPU, say) over exactly the measured window */
-    if (rate > 0)
-        fprintf(stderr, "gcannon: warmup done, measuring for %ds\n", duration_sec);
+    if (o.rate > 0)
+        fprintf(stderr, "gcannon: warmup done, measuring for %ds\n", o.duration_sec);
 
     struct timespec start_time;
     clock_gettime(CLOCK_MONOTONIC, &start_time);
@@ -778,23 +293,23 @@ int main(int argc, char **argv)
     uint64_t prev_responses = 0;
     int ticks = 0;
     uint64_t *rps_history = NULL;
-    if (tui_mode) {
-        rps_history = calloc(duration_sec > 0 ? duration_sec : 1, sizeof(uint64_t));
-        tui_progress_init(duration_sec);
+    if (o.tui_mode) {
+        rps_history = calloc(o.duration_sec > 0 ? o.duration_sec : 1, sizeof(uint64_t));
+        tui_progress_init(o.duration_sec);
     }
 
-    while (g_running && ticks < duration_sec) {
+    while (g_running && ticks < o.duration_sec) {
         nanosleep(&(struct timespec){ .tv_sec = 1, .tv_nsec = 0 }, NULL);
         ticks++;
 
-        if (tui_mode) {
+        if (o.tui_mode) {
             uint64_t snap_resp = 0, snap_bytes = 0;
-            for (int i = 0; i < num_threads; i++) {
+            for (int i = 0; i < o.num_threads; i++) {
                 snap_resp  += ctxs[i].worker.stats.responses;
                 snap_bytes += ctxs[i].worker.stats.bytes_read;
             }
             rps_history[ticks - 1] = snap_resp - prev_responses;
-            tui_progress_update(ticks, duration_sec,
+            tui_progress_update(ticks, o.duration_sec,
                                 snap_resp, snap_bytes, prev_responses,
                                 rps_history, ticks);
             prev_responses = snap_resp;
@@ -802,12 +317,12 @@ int main(int argc, char **argv)
     }
     /* --rate: the window is over but every connection is still open; what a
        wrapper samples now excludes the teardown (a million closes) below */
-    if (rate > 0)
+    if (o.rate > 0)
         fprintf(stderr, "gcannon: measurement done\n");
     g_running = 0;
 
     /* Join threads */
-    for (int i = 0; i < num_threads; i++)
+    for (int i = 0; i < o.num_threads; i++)
         pthread_join(threads[i], NULL);
 
     struct timespec end_time;
@@ -817,11 +332,11 @@ int main(int argc, char **argv)
 
     /* Aggregate stats */
     worker_stats_t total = {0};
-    if (per_tpl_latency && num_templates > 1) {
+    if (o.per_tpl_latency && num_templates > 1) {
         total.tpl_latency = calloc(num_templates, sizeof(latency_hist_t));
         total.num_tpl_latency = num_templates;
     }
-    for (int i = 0; i < num_threads; i++) {
+    for (int i = 0; i < o.num_threads; i++) {
         stats_merge(&total, &ctxs[i].worker.stats);
         worker_destroy(&ctxs[i].worker);
     }
@@ -840,35 +355,35 @@ int main(int argc, char **argv)
 
     history_build_record(&current_record, &total, elapsed,
                          host, port, path,
-                         num_connections, num_threads,
-                         pipeline_depth, duration_sec);
+                         o.num_connections, o.num_threads,
+                         o.pipeline_depth, o.duration_sec);
     if (history) history_save(history, &current_record);
 
-    if (json_mode) {
+    if (o.json_mode) {
         char target[512];
         if (port == 80)
             snprintf(target, sizeof(target), "%s%s", host, path);
         else
             snprintf(target, sizeof(target), "%s:%d%s", host, port, path);
-        stats_print_json(&total, elapsed, num_templates, ws_mode,
-                         target, num_connections, num_threads,
-                         pipeline_depth, duration_sec, rate);
-    } else if (tui_mode) {
-        tui_print_results(&total, elapsed, num_templates, expected_status,
-                          hist_buckets, prev_runs, num_prev, &current_record,
-                          ws_mode);
-        if (rate > 0) stats_print_rate(&total, elapsed, rate, num_connections);
+        report_json(&total, elapsed, num_templates, o.ws_mode,
+                    target, o.num_connections, o.num_threads,
+                    o.pipeline_depth, o.duration_sec, o.rate);
+    } else if (o.tui_mode) {
+        tui_print_results(&total, elapsed, num_templates, o.expected_status,
+                          o.hist_buckets, prev_runs, num_prev, &current_record,
+                          o.ws_mode);
+        if (o.rate > 0) report_rate(&total, elapsed, o.rate, o.num_connections);
     } else {
-        stats_print(&total, elapsed, num_templates, ws_mode);
-        if (rate > 0) stats_print_rate(&total, elapsed, rate, num_connections);
+        report_text(&total, elapsed, num_templates, o.ws_mode);
+        if (o.rate > 0) report_rate(&total, elapsed, o.rate, o.num_connections);
     }
 
     /* Check for unexpected status codes (exit code) */
     uint64_t expected_count = 0;
-    if (expected_status >= 200 && expected_status < 300)      expected_count = total.status_2xx;
-    else if (expected_status >= 300 && expected_status < 400)  expected_count = total.status_3xx;
-    else if (expected_status >= 400 && expected_status < 500)  expected_count = total.status_4xx;
-    else if (expected_status >= 500 && expected_status < 600)  expected_count = total.status_5xx;
+    if (o.expected_status >= 200 && o.expected_status < 300)      expected_count = total.status_2xx;
+    else if (o.expected_status >= 300 && o.expected_status < 400)  expected_count = total.status_3xx;
+    else if (o.expected_status >= 400 && o.expected_status < 500)  expected_count = total.status_4xx;
+    else if (o.expected_status >= 500 && o.expected_status < 600)  expected_count = total.status_5xx;
 
     /* Saturating: expected_count is a separate counter, so any accounting bug
        that pushes it above `responses` would otherwise wrap this to ~2^64 and
@@ -877,19 +392,17 @@ int main(int argc, char **argv)
                         ? total.responses - expected_count : 0;
     int exit_code = 0;
     if (unexpected > 0 && total.responses > 0) {
-        if (!tui_mode && !json_mode)
+        if (!o.tui_mode && !o.json_mode)
             printf("\n  WARNING: %lu/%lu responses (%.1f%%) had unexpected status (expected %dxx)\n",
                    unexpected, total.responses,
-                   100.0 * unexpected / total.responses, expected_status / 100);
+                   100.0 * unexpected / total.responses, o.expected_status / 100);
         exit_code = 1;
     }
 
     free(total.tpl_latency);
     free(history);
     free(prev_runs);
-    for (int i = 0; i < num_templates; i++)
-        free(templates[i].pipeline_buf);
-    free(templates);
+    templates_free(templates, num_templates);
     free(ctxs);
     free(threads);
     free(rps_history);
