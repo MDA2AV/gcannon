@@ -44,6 +44,7 @@ typedef struct thread_ctx {
     const struct sockaddr_in *addrs;
     int              num_addrs;
     uint64_t         interval_ns;
+    uint64_t         epoch_ns;
     int              total_conns;
     int              connect_limit;
 } thread_ctx_t;
@@ -265,8 +266,8 @@ static void *worker_thread(void *arg)
                 ctx->recv_buf_size,
                 ctx->cqe_latency, ctx->per_tpl_latency,
                 ctx->tls, ctx->tls_sni,
-                ctx->interval_ns, ctx->total_conns, ctx->connect_limit,
-                &g_running);
+                ctx->interval_ns, ctx->epoch_ns, ctx->total_conns,
+                ctx->connect_limit, &g_running);
     worker_loop(&ctx->worker);
     return NULL;
 }
@@ -669,6 +670,12 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    /* --rate: the shared clock every connection's schedule is laid on */
+    struct timespec epoch_ts;
+    clock_gettime(CLOCK_MONOTONIC, &epoch_ts);
+    const uint64_t epoch_ns = (uint64_t)epoch_ts.tv_sec * 1000000000ULL
+                            + (uint64_t)epoch_ts.tv_nsec;
+
     int conn_offset = 0;
     for (int i = 0; i < num_threads; i++) {
         ctxs[i].worker.id        = i;
@@ -693,6 +700,7 @@ int main(int argc, char **argv)
         ctxs[i].addrs             = addrs;
         ctxs[i].num_addrs         = addr_span;
         ctxs[i].interval_ns       = interval_ns;
+        ctxs[i].epoch_ns          = epoch_ns;
         ctxs[i].total_conns       = num_connections;
         ctxs[i].connect_limit     = connect_limit;
         conn_offset += ctxs[i].num_conns;

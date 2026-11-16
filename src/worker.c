@@ -290,8 +290,16 @@ static long pace_wait_ns(const worker_t *w)
 
 /* A connection is ready for requests (first time, or again after a
  * reconnect): closed loop fills its pipeline, --rate starts or resumes its
- * schedule. The first due time is offset by this connection's share of the
- * interval, so a fleet that comes up together still sends evenly spread. */
+ * schedule.
+ *
+ * Every connection sends on one shared grid: connection g at
+ * epoch + (g/N)*interval + k*interval. Anchoring each schedule at the moment
+ * its connection came up instead would bunch the offsets of a fleet that
+ * opens over a ramp (in index order, as --connect-limit does), and the
+ * offered rate would pulse at the interval's period by about ramp/interval.
+ * A connection starts at its first slot after it is up: slots that passed
+ * while it was still connecting were setup, not owed. A reconnect keeps its
+ * schedule and catches up on what it missed. */
 static void conn_start_requests(worker_t *w, gc_conn_t *c, const int conn_idx)
 {
     if (!w->interval_ns) {
@@ -301,7 +309,11 @@ static void conn_start_requests(worker_t *w, gc_conn_t *c, const int conn_idx)
     c->pace_pending = 0;
     if (!c->due_ns) {
         const int g = w->conn_offset + conn_idx;
-        c->due_ns = now_ns() + (uint64_t)((double)w->interval_ns * g / w->total_conns);
+        const uint64_t now = now_ns();
+        uint64_t due = w->epoch_ns + (uint64_t)((double)w->interval_ns * g / w->total_conns);
+        if (due < now)
+            due += (now - due + w->interval_ns - 1) / w->interval_ns * w->interval_ns;
+        c->due_ns = due;
     }
     pace_schedule(w, c, conn_idx);
 }
@@ -615,6 +627,7 @@ void worker_init(worker_t *w,
                  const int tls,
                  const char *tls_sni,
                  const uint64_t interval_ns,
+                 const uint64_t epoch_ns,
                  const int total_conns,
                  const int connect_limit,
                  volatile int *running)
@@ -631,6 +644,7 @@ void worker_init(worker_t *w,
     w->server_addrs      = addrs;
     w->num_addrs         = num_addrs > 0 ? num_addrs : 1;
     w->interval_ns       = interval_ns;
+    w->epoch_ns          = epoch_ns;
     w->total_conns       = total_conns > 0 ? total_conns : num_conns;
     w->connect_limit     = connect_limit;
     w->templates         = templates;

@@ -161,17 +161,20 @@ gcannon http://127.0.0.1:8080/ -c 1000000 -t 64 -d 20s \
 
 Every other mode sends the next request as soon as the last response arrives, so it answers "how fast can this server go". `--rate` holds the rate fixed instead and answers "what does this load cost, and how long does a request wait":
 
-- **Each connection has its own schedule.** The interval is connections / rate, and each connection's first send is offset by its share of the interval, so a fleet that connects together still sends evenly spread instead of in waves.
+- **Each connection has its own schedule, on one shared clock.** The interval is connections / rate, and connection *g* sends at its share *g/N* of the interval plus every interval after, so the fleet sends evenly spread instead of in waves however long it takes to connect. A connection starts at its first slot after it is up.
 - **Latency counts from the scheduled time** (coordinated-omission correction). A server that stalls makes every request scheduled during the stall wait, and each one is charged its wait: a 400 ms stall in a 3 s run at 2,000 req/s puts p90 above 100 ms, where timing from the send would only charge the requests already on the wire.
 - **A late schedule is caught up, not reset.** A connection that fell behind - its response was slow, or it was reconnecting - sends its owed requests back to back, each still timed from its own slot.
 - **Sends go out on time.** The event loop sleeps exactly until the next send is due, with the thread's timer slack set to 1 ns, so a request leaves within tens of microseconds of its slot. `Schedule:` reports the largest gap seen.
 
-Output adds three lines (and a `rate` block plus `connections_active` in `--json`):
+Output adds three lines (and a `rate` block plus `connections_active` in `--json`). From 20,000 connections at 5,000 req/s over four addresses, against an actix server:
 
 ```
-  Rate:       target 250000 req/s, achieved 249996 (100.00%)
-  Schedule:   4999931 paced sends, 0 more than 1ms late, max lag 182us
-  Active:     1000000 of 1000000 connections open at the end
+  50008 requests in 10.00s, 50008 responses
+  Throughput: 5.00K req/s
+  ...
+  Rate:       target 5000 req/s, achieved 5000 (100.00%)
+  Schedule:   50008 paced sends, 0 more than 1ms late, max lag 765us
+  Active:     20000 of 20000 connections open at the end
 ```
 
 On stderr, `--rate` prints `gcannon: warmup done, measuring for <N>s` when the window opens and `gcannon: measurement done` when it closes, before any connection is torn down, so a wrapper can sample something else (a server's cgroup CPU, say) over exactly the measured window.

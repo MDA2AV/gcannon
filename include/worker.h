@@ -122,6 +122,8 @@ typedef struct worker {
        offset by its share of the interval so the fleet does not fire in
        waves. 0 = closed loop (the default): send again on every response. */
     uint64_t                  interval_ns;
+    uint64_t                  epoch_ns;          /* one clock for every worker: connection g
+                                                    sends at epoch + its offset + k*interval */
     int                       total_conns;       /* across all workers, for the offsets */
     pace_entry_t             *pace_heap;         /* min-heap on due_ns */
     int                       pace_len;
@@ -144,8 +146,8 @@ void worker_init(worker_t *w, int id,
                  int recv_buf_size,
                  int cqe_latency, int per_tpl_latency,
                  int tls, const char *tls_sni,
-                 uint64_t interval_ns, int total_conns, int connect_limit,
-                 volatile int *running);
+                 uint64_t interval_ns, uint64_t epoch_ns, int total_conns,
+                 int connect_limit, volatile int *running);
 
 /* Main event loop — blocks until *running == 0 */
 void worker_loop(worker_t *w);
