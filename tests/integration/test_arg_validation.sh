@@ -12,7 +12,8 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$(dirname "$HERE")"
+ROOT="$(cd "$HERE/../.." && pwd)"
+SERVERS="$ROOT/tests/servers"
 GCANNON="$ROOT/gcannon"
 
 # Never connected to — validation must reject before host resolution.
@@ -64,7 +65,7 @@ expect_accepted() {
     local desc="$1"; shift
     local out rc port
 
-    python3 "$HERE/chunked_server.py" --mode whole \
+    python3 "$SERVERS/chunked_server.py" --mode whole \
             >"$TMP/srv.out" 2>"$TMP/srv.err" &
     echo $! >>"$PIDFILE"
     for _ in $(seq 1 100); do

@@ -2,7 +2,7 @@
 
 #include <stdint.h>
 #include <time.h>
-#include "stats.h"
+#include "core/stats.h"
 
 #define HISTORY_MAGIC     0x47434E48   /* "GCNH" */
 #define HISTORY_VERSION   1

@@ -13,7 +13,8 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$(dirname "$HERE")"
+ROOT="$(cd "$HERE/../.." && pwd)"
+SERVERS="$ROOT/tests/servers"
 GCANNON="$ROOT/gcannon"
 
 CONNS=4
@@ -52,7 +53,7 @@ start_server() {
     local mode="$1"
     local out="$TMP/$mode.out"
 
-    python3 "$HERE/chunked_server.py" --mode "$mode" >"$out" 2>"$TMP/$mode.err" &
+    python3 "$SERVERS/chunked_server.py" --mode "$mode" >"$out" 2>"$TMP/$mode.err" &
     echo $! >>"$PIDFILE"
 
     for _ in $(seq 1 100); do

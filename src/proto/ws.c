@@ -1,4 +1,4 @@
-#include "ws.h"
+#include "proto/ws.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>

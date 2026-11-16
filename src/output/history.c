@@ -4,7 +4,7 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <limits.h>
-#include "history.h"
+#include "output/history.h"
 
 static const char *history_path(void)
 {

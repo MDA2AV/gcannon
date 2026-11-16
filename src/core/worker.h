@@ -6,11 +6,11 @@
 #include <sys/socket.h>
 #include <time.h>
 
-#include "constants.h"
-#include "stats.h"
-#include "http.h"
-#include "ws.h"
-#include "ktls.h"
+#include "core/constants.h"
+#include "core/stats.h"
+#include "proto/http.h"
+#include "proto/ws.h"
+#include "proto/ktls.h"
 
 typedef enum { CONN_CONNECTING, CONN_TLS_HANDSHAKE, CONN_WS_UPGRADING, CONN_ACTIVE,
                CONN_CLOSED } conn_state_t;

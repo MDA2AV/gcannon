@@ -11,12 +11,12 @@
 #include <errno.h>
 #include <time.h>
 
-#include "constants.h"
-#include "worker.h"
-#include "http.h"
-#include "stats.h"
-#include "tui.h"
-#include "history.h"
+#include "core/constants.h"
+#include "core/worker.h"
+#include "proto/http.h"
+#include "core/stats.h"
+#include "output/tui.h"
+#include "output/history.h"
 
 /* ── globals ───────────────────────────────────────────────────────── */
 

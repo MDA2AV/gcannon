@@ -13,10 +13,11 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$(dirname "$HERE")"
+ROOT="$(cd "$HERE/../.." && pwd)"
+SERVERS="$ROOT/tests/servers"
 GCANNON="$ROOT/gcannon"
 
-MAX_TEMPLATES=64   # keep in sync with include/constants.h
+MAX_TEMPLATES=64   # keep in sync with src/core/constants.h
 
 if [[ ! -x "$GCANNON" ]]; then
     echo "error: $GCANNON not built — run 'make' first" >&2
@@ -50,7 +51,7 @@ make_templates() {
 }
 
 start_server() {
-    python3 "$HERE/chunked_server.py" --mode whole \
+    python3 "$SERVERS/chunked_server.py" --mode whole \
             >"$TMP/srv.out" 2>"$TMP/srv.err" &
     echo $! >>"$PIDFILE"
     local _

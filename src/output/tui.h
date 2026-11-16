@@ -1,7 +1,7 @@
 #pragma once
 
-#include "stats.h"
-#include "history.h"
+#include "core/stats.h"
+#include "output/history.h"
 
 /* Print initial empty progress bar (call once before the main loop) */
 void tui_progress_init(int duration_sec);

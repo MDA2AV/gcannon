@@ -21,7 +21,8 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$(dirname "$HERE")"
+ROOT="$(cd "$HERE/../.." && pwd)"
+SERVERS="$ROOT/tests/servers"
 GCANNON="$ROOT/gcannon"
 
 if [[ ! -x "$GCANNON" ]]; then
@@ -50,7 +51,7 @@ failures=0
 # Starts ws_server.py; echoes nothing, sets $PORT.
 start_ws() {
     local tag="$1"; shift
-    python3 "$HERE/ws_server.py" "$@" >"$TMP/$tag.out" 2>"$TMP/$tag.err" &
+    python3 "$SERVERS/ws_server.py" "$@" >"$TMP/$tag.out" 2>"$TMP/$tag.err" &
     echo $! >>"$PIDFILE"
     local _
     for _ in $(seq 1 100); do

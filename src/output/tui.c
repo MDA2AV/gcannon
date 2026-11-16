@@ -1,4 +1,4 @@
-#include "tui.h"
+#include "output/tui.h"
 
 #include <stdio.h>
 #include <string.h>

@@ -17,7 +17,8 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$(dirname "$HERE")"
+ROOT="$(cd "$HERE/../.." && pwd)"
+SERVERS="$ROOT/tests/servers"
 GCANNON="${GCANNON:-$ROOT/gcannon}"
 
 if [[ ! -x "$GCANNON" ]]; then
@@ -78,7 +79,7 @@ failures=0
 # Starts a test server script; sets $PORT.
 start_server() {
     local tag="$1" script="$2"; shift 2
-    python3 "$HERE/$script" "$@" >"$TMP/$tag.out" 2>"$TMP/$tag.err" &
+    python3 "$SERVERS/$script" "$@" >"$TMP/$tag.out" 2>"$TMP/$tag.err" &
     echo $! >>"$PIDFILE"
     local _
     for _ in $(seq 1 100); do

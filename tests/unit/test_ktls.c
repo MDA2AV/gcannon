@@ -39,7 +39,7 @@
 #include <liburing.h>
 #include <openssl/evp.h>
 
-#include "ktls.h"
+#include "proto/ktls.h"
 
 #ifndef SOL_TLS
 #define SOL_TLS 282

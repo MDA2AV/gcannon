@@ -14,7 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "http.h"
+#include "proto/http.h"
 
 /* ── harness ───────────────────────────────────────────────────────── */
 
@@ -267,7 +267,7 @@ static void test_chunked_split_sweep_pair(void)
  * The exact shape the integration test produces: a server that writes the body
  * and the terminating CRLF in two separate flushes, so the CRLF lands in its
  * own recv. This is what nginx/Go/many frameworks do under some buffering
- * configurations, and what tests/chunked_server.py reproduces deliberately.
+ * configurations, and what tests/servers/chunked_server.py reproduces deliberately.
  */
 static void test_chunked_terminator_flushed_separately(void)
 {

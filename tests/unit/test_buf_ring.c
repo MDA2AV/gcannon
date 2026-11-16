@@ -1,5 +1,5 @@
 /* Exercise the private production helper without requiring an io_uring fd. */
-#include "../src/worker.c"
+#include "../../src/core/worker.c"
 
 static int failures;
 

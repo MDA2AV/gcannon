@@ -1,7 +1,7 @@
 #pragma once
 
 #include <stdint.h>
-#include "constants.h"
+#include "core/constants.h"
 
 /*
  * Two-tier latency histogram (~234KB per worker):
