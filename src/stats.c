@@ -81,6 +81,11 @@ void stats_merge(worker_stats_t *dst, const worker_stats_t *src)
     dst->latency_count  += src->latency_count;
     dst->latency_sum_us += src->latency_sum_us;
     dst->overflow       += src->overflow;
+    dst->paced_sends    += src->paced_sends;
+    dst->paced_late     += src->paced_late;
+    dst->conns_active   += src->conns_active;
+    if (src->paced_lag_max_us > dst->paced_lag_max_us)
+        dst->paced_lag_max_us = src->paced_lag_max_us;
 
     for (int i = 0; i < MAX_TEMPLATES; i++) {
         dst->tpl_responses[i] += src->tpl_responses[i];
@@ -249,7 +254,7 @@ void stats_print(const worker_stats_t *s, double elapsed_sec, int num_templates,
 void stats_print_json(const worker_stats_t *s, double elapsed_sec,
                       int num_templates, int ws_mode,
                       const char *target, int num_connections, int num_threads,
-                      int pipeline_depth, int duration_sec)
+                      int pipeline_depth, int duration_sec, double target_rate)
 {
     const uint64_t avg_us = s->latency_count
                             ? s->latency_sum_us / s->latency_count : 0;
@@ -321,5 +326,32 @@ void stats_print_json(const worker_stats_t *s, double elapsed_sec,
         printf("\n  ]");
     }
 
+    /* --rate only, so every other run's JSON stays exactly as it was */
+    if (target_rate > 0) {
+        printf(",\n  \"rate\": {\n");
+        printf("    \"target\": %.0f,\n", target_rate);
+        printf("    \"achieved\": %.2f,\n", rps);
+        printf("    \"ratio\": %.4f,\n", rps / target_rate);
+        printf("    \"paced_sends\": %lu,\n", s->paced_sends);
+        printf("    \"late\": %lu,\n", s->paced_late);
+        printf("    \"max_lag_us\": %lu\n", s->paced_lag_max_us);
+        printf("  },\n");
+        printf("  \"connections_active\": %lu", s->conns_active);
+    }
+
     printf("\n}\n");
+}
+
+void stats_print_rate(const worker_stats_t *s, double elapsed_sec,
+                      double target_rate, int num_connections)
+{
+    const double rps = elapsed_sec > 0 ? s->responses / elapsed_sec : 0;
+    char lag[32];
+    format_latency(lag, sizeof(lag), s->paced_lag_max_us);
+    printf("  Rate:       target %.0f req/s, achieved %.0f (%.2f%%)\n",
+           target_rate, rps, target_rate > 0 ? 100.0 * rps / target_rate : 0.0);
+    printf("  Schedule:   %lu paced sends, %lu more than 1ms late, max lag %s\n",
+           s->paced_sends, s->paced_late, lag);
+    printf("  Active:     %lu of %d connections open at the end\n",
+           s->conns_active, num_connections);
 }

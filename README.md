@@ -54,6 +54,11 @@ gcannon http://localhost:8080 --raw get.raw,post.raw -c 256 -t 4 -d 5s
 | `--recv-buf` | 4096 | Receive buffer size in bytes (min 512). Each worker allocates 4096 buffers of this size. Larger values suit big responses; smaller values save memory. |
 | `--cqe-latency` | | Measure latency at CQE arrival instead of after response parsing |
 | `--per-tpl-latency` | | Per-template latency histograms (with `--raw` and multiple templates) |
+| `--rate` | closed loop | Fixed total request rate (req/s), paced per connection; latency counts from each request's scheduled time. Needs `-p 1` and no `-r`. See [Fixed-rate mode](#fixed-rate-mode---rate) |
+| `--addr-span` | 1 | Spread connections over N consecutive IPv4 addresses from the target's (`127.0.0.1`, `.2`, ...): one source address holds at most ~64K connections to one destination |
+| `--connect-limit` | all at once | First connection attempts in flight per thread; each completion starts the next |
+| `--warmup-max` | 10s | Longest the warmup waits for connections to settle before measuring anyway |
+| `--version` | | Print the version and exit |
 | `--clear-history` | | Clear saved run history and exit |
 
 ## Dynamic Placeholders
@@ -144,6 +149,37 @@ gcannon http://localhost:8080/ws --ws -c 4096 -t 64 -d 5s -p 16
 # Custom message
 gcannon http://localhost:8080/ws --ws-msg '{"type":"ping"}' -c 256 -t 8 -d 5s
 ```
+
+### Fixed-rate mode (`--rate`)
+
+```bash
+# 250K req/s spread over 1M keep-alive connections: one request per
+# connection every 4s, the fleet spread over 127.0.0.1-127.0.0.32
+gcannon http://127.0.0.1:8080/ -c 1000000 -t 64 -d 20s \
+    --rate 250000 --addr-span 32 --connect-limit 512 --warmup-max 3m
+```
+
+Every other mode sends the next request as soon as the last response arrives, so it answers "how fast can this server go". `--rate` holds the rate fixed instead and answers "what does this load cost, and how long does a request wait":
+
+- **Each connection has its own schedule, on one shared clock.** The interval is connections / rate, and connection *g* sends at its share *g/N* of the interval plus every interval after, so the fleet sends evenly spread instead of in waves however long it takes to connect. A connection starts at its first slot after it is up.
+- **Latency counts from the scheduled time** (coordinated-omission correction). A server that stalls makes every request scheduled during the stall wait, and each one is charged its wait: a 400 ms stall in a 3 s run at 2,000 req/s puts p90 above 100 ms, where timing from the send would only charge the requests already on the wire.
+- **A late schedule is caught up, not reset.** A connection that fell behind - its response was slow, or it was reconnecting - sends its owed requests back to back, each still timed from its own slot.
+- **Sends go out on time.** The event loop sleeps exactly until the next send is due, with the thread's timer slack set to 1 ns, so a request leaves within tens of microseconds of its slot. `Schedule:` reports the largest gap seen.
+
+Output adds three lines (and a `rate` block plus `connections_active` in `--json`). From 20,000 connections at 5,000 req/s over four addresses, against an actix server:
+
+```
+  50008 requests in 10.00s, 50008 responses
+  Throughput: 5.00K req/s
+  ...
+  Rate:       target 5000 req/s, achieved 5000 (100.00%)
+  Schedule:   50008 paced sends, 0 more than 1ms late, max lag 765us
+  Active:     20000 of 20000 connections open at the end
+```
+
+On stderr, `--rate` prints `gcannon: warmup done, measuring for <N>s` when the window opens and `gcannon: measurement done` when it closes, before any connection is torn down, so a wrapper can sample something else (a server's cgroup CPU, say) over exactly the measured window.
+
+A large fleet needs `--addr-span` (one source address holds ~64K connections to one destination, so a server listening on `0.0.0.0` takes a million spread over 32 loopback addresses), `--connect-limit` (a million SYNs at once overflow any listen backlog, and every retry costs seconds), and a `--warmup-max` long enough to open them all.
 
 ### HTTPS
 

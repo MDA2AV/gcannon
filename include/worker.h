@@ -61,7 +61,20 @@ typedef struct gc_conn {
     int              settled;        /* first setup attempt finished (ready or failed) */
     struct ssl_st   *ssl;            /* only while the TLS handshake runs */
     ktls_secrets_t   tls_secrets;    /* traffic secrets captured during it */
+    /* --rate: when this connection's next request is due (CLOCK_MONOTONIC ns).
+       It only ever moves forward one interval per request, and survives
+       reconnects, so time lost to a stall is owed rather than forgotten. */
+    uint64_t         due_ns;
+    int              pace_pending;   /* due while the previous send was still in flight */
 } gc_conn_t;
+
+/* --rate: one queued send. Stale entries (the connection closed, or was
+   rescheduled) are recognised by gen/due and dropped when they surface. */
+typedef struct pace_entry {
+    uint64_t due_ns;
+    int      conn_idx;
+    uint16_t gen;
+} pace_entry_t;
 
 typedef struct worker {
     struct io_uring           ring;
@@ -72,7 +85,9 @@ typedef struct worker {
     gc_conn_t                *conns;
     int                       num_conns;
 
-    struct sockaddr_in        server_addr;
+    const struct sockaddr_in *server_addrs;      /* --addr-span consecutive targets */
+    int                       num_addrs;         /* connection i uses
+                                                    server_addrs[i % num_addrs] */
     request_tpl_t            *templates;
     int                       num_templates;
     int                       pipeline_depth;
@@ -102,10 +117,27 @@ typedef struct worker {
     _Atomic int               conns_settled;     /* conns whose first setup attempt
                                                     finished; main waits on it */
     int                       id;
+
+    /* --rate: every connection sends one request per interval_ns, its first
+       offset by its share of the interval so the fleet does not fire in
+       waves. 0 = closed loop (the default): send again on every response. */
+    uint64_t                  interval_ns;
+    uint64_t                  epoch_ns;          /* one clock for every worker: connection g
+                                                    sends at epoch + its offset + k*interval */
+    int                       total_conns;       /* across all workers, for the offsets */
+    pace_entry_t             *pace_heap;         /* min-heap on due_ns */
+    int                       pace_len;
+    int                       pace_cap;
+
+    /* --connect-limit: initial connects in flight at once (0 = all at once) */
+    int                       connect_limit;
+    int                       connect_next;      /* next connection not yet started */
+    int                       connect_inflight;
 } worker_t;
 
 /* Initialize worker (must be called from worker thread for SINGLE_ISSUER) */
-void worker_init(worker_t *w, int id, const struct sockaddr_in *addr,
+void worker_init(worker_t *w, int id,
+                 const struct sockaddr_in *addrs, int num_addrs,
                  request_tpl_t *templates, int num_templates, int pipeline_depth,
                  int num_conns, int conn_offset, int requests_per_conn,
                  int expected_status, int ws_mode,
@@ -114,7 +146,8 @@ void worker_init(worker_t *w, int id, const struct sockaddr_in *addr,
                  int recv_buf_size,
                  int cqe_latency, int per_tpl_latency,
                  int tls, const char *tls_sni,
-                 volatile int *running);
+                 uint64_t interval_ns, uint64_t epoch_ns, int total_conns,
+                 int connect_limit, volatile int *running);
 
 /* Main event loop — blocks until *running == 0 */
 void worker_loop(worker_t *w);

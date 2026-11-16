@@ -9,6 +9,7 @@
 #include <netinet/tcp.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/prctl.h>
 
 #include <openssl/crypto.h>
 #include <openssl/err.h>
@@ -82,10 +83,23 @@ static inline void write_padded(char *buf, int width, uint64_t val)
     }
 }
 
-static inline void fire_requests(worker_t *w, gc_conn_t *c, int conn_idx, int count)
+static inline uint64_t now_ns(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000ULL + (uint64_t)t.tv_nsec;
+}
+
+/* Send up to `count` requests. at_ns, when non-zero, is the time the requests
+ * were scheduled for (--rate): latency is then measured from the schedule, not
+ * from the send, so a server that holds a connection up delays everything
+ * queued behind it in the figures too (coordinated-omission correction).
+ * Returns 1 if anything was sent. */
+static inline int fire_requests_at(worker_t *w, gc_conn_t *c, int conn_idx, int count,
+                                   const uint64_t at_ns)
 {
     if (count <= 0 || c->send_inflight || c->state != CONN_ACTIVE)
-        return;
+        return 0;
 
     if (count > w->pipeline_depth)
         count = w->pipeline_depth;
@@ -93,7 +107,7 @@ static inline void fire_requests(worker_t *w, gc_conn_t *c, int conn_idx, int co
     /* Cap to remaining requests on this connection */
     if (w->requests_per_conn > 0) {
         const int remaining = w->requests_per_conn - c->requests_sent;
-        if (remaining <= 0) return;
+        if (remaining <= 0) return 0;
         if (count > remaining) count = remaining;
     }
 
@@ -115,7 +129,7 @@ static inline void fire_requests(worker_t *w, gc_conn_t *c, int conn_idx, int co
             /* Ensure scratch buffer is large enough */
             if (c->scratch_len < send_len) {
                 char *nb = malloc(send_len);
-                if (!nb) return;   /* OOM — skip this batch; retry on next event
+                if (!nb) return 0; /* OOM — skip this batch; retry on next event
                                       (keeps the old buffer; never deref NULL) */
                 free(c->scratch_buf);
                 c->scratch_buf = nb;
@@ -150,7 +164,12 @@ static inline void fire_requests(worker_t *w, gc_conn_t *c, int conn_idx, int co
        the same dispatch timestamp.  Latency = time from batch dispatch
        to individual response arrival. */
     struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (at_ns) {
+        now.tv_sec  = (time_t)(at_ns / 1000000000ULL);
+        now.tv_nsec = (long)(at_ns % 1000000000ULL);
+    } else {
+        clock_gettime(CLOCK_MONOTONIC, &now);
+    }
     for (int k = 0; k < count; k++) {
         c->send_times[c->send_time_tail % PIPELINE_DEPTH_MAX] = now;
         c->send_time_tail++;
@@ -163,6 +182,140 @@ static inline void fire_requests(worker_t *w, gc_conn_t *c, int conn_idx, int co
     c->pipeline_inflight += count;
     c->requests_sent += count;
     w->stats.requests += count;
+    return 1;
+}
+
+static inline void fire_requests(worker_t *w, gc_conn_t *c, int conn_idx, int count)
+{
+    fire_requests_at(w, c, conn_idx, count, 0);
+}
+
+/* ── --rate pacing ─────────────────────────────────────────────────── */
+
+/* A connection's next send waits in a per-worker min-heap until it is due.
+ * Each connection has at most one live entry; entries left behind by a close
+ * or a reschedule are detected when they reach the top and skipped. */
+
+static void pace_push(worker_t *w, const uint64_t due_ns, const int conn_idx, const uint16_t gen)
+{
+    if (w->pace_len == w->pace_cap) {
+        const int cap = w->pace_cap ? w->pace_cap * 2 : 1024;
+        pace_entry_t *h = realloc(w->pace_heap, (size_t)cap * sizeof(*h));
+        if (!h) {
+            fprintf(stderr, "[w%d] pace heap: out of memory\n", w->id);
+            exit(1);
+        }
+        w->pace_heap = h;
+        w->pace_cap = cap;
+    }
+    int i = w->pace_len++;
+    while (i > 0) {
+        const int parent = (i - 1) / 2;
+        if (w->pace_heap[parent].due_ns <= due_ns) break;
+        w->pace_heap[i] = w->pace_heap[parent];
+        i = parent;
+    }
+    w->pace_heap[i] = (pace_entry_t){ .due_ns = due_ns, .conn_idx = conn_idx, .gen = gen };
+}
+
+static pace_entry_t pace_pop(worker_t *w)
+{
+    const pace_entry_t top  = w->pace_heap[0];
+    const pace_entry_t last = w->pace_heap[--w->pace_len];
+    int i = 0;
+    for (;;) {
+        int child = 2 * i + 1;
+        if (child >= w->pace_len) break;
+        if (child + 1 < w->pace_len &&
+            w->pace_heap[child + 1].due_ns < w->pace_heap[child].due_ns)
+            child++;
+        if (last.due_ns <= w->pace_heap[child].due_ns) break;
+        w->pace_heap[i] = w->pace_heap[child];
+        i = child;
+    }
+    if (w->pace_len > 0) w->pace_heap[i] = last;
+    return top;
+}
+
+/* Send the request that is due on this connection, or note that it is owed
+ * if the previous send has not completed yet (UD_SEND fires it then). */
+static void pace_fire(worker_t *w, gc_conn_t *c, const int conn_idx)
+{
+    if (c->send_inflight) {
+        c->pace_pending = 1;
+        return;
+    }
+    const uint64_t now = now_ns();
+    if (!fire_requests_at(w, c, conn_idx, 1, c->due_ns))
+        return;
+    const uint64_t lag_us = now > c->due_ns ? (now - c->due_ns) / 1000 : 0;
+    w->stats.paced_sends++;
+    if (lag_us > 1000) w->stats.paced_late++;
+    if (lag_us > w->stats.paced_lag_max_us) w->stats.paced_lag_max_us = lag_us;
+}
+
+/* The connection is free for its next request: send it now if it is due
+ * (or overdue), otherwise queue it for its time. */
+static void pace_schedule(worker_t *w, gc_conn_t *c, const int conn_idx)
+{
+    if (c->due_ns <= now_ns())
+        pace_fire(w, c, conn_idx);
+    else
+        pace_push(w, c->due_ns, conn_idx, c->gen);
+}
+
+/* Fire everything whose time has come. */
+static void pace_tick(worker_t *w)
+{
+    if (!w->pace_len) return;
+    const uint64_t now = now_ns();
+    while (w->pace_len && w->pace_heap[0].due_ns <= now) {
+        const pace_entry_t e = pace_pop(w);
+        gc_conn_t *c = &w->conns[e.conn_idx];
+        if (c->gen != e.gen || c->state != CONN_ACTIVE || c->due_ns != e.due_ns)
+            continue;   /* closed or rescheduled since it was queued */
+        pace_fire(w, c, e.conn_idx);
+    }
+}
+
+/* How long the loop may sleep: until the next send is due, at most 1 ms. */
+static long pace_wait_ns(const worker_t *w)
+{
+    if (!w->pace_len) return 1000000L;
+    const uint64_t now = now_ns();
+    const uint64_t due = w->pace_heap[0].due_ns;
+    if (due <= now) return 0;
+    return due - now < 1000000ULL ? (long)(due - now) : 1000000L;
+}
+
+/* A connection is ready for requests (first time, or again after a
+ * reconnect): closed loop fills its pipeline, --rate starts or resumes its
+ * schedule.
+ *
+ * Every connection sends on one shared grid: connection g at
+ * epoch + (g/N)*interval + k*interval. Anchoring each schedule at the moment
+ * its connection came up instead would bunch the offsets of a fleet that
+ * opens over a ramp (in index order, as --connect-limit does), and the
+ * offered rate would pulse at the interval's period by about ramp/interval.
+ * A connection starts at its first slot after it is up: slots that passed
+ * while it was still connecting were setup, not owed. A reconnect keeps its
+ * schedule and catches up on what it missed. */
+static void conn_start_requests(worker_t *w, gc_conn_t *c, const int conn_idx)
+{
+    if (!w->interval_ns) {
+        fire_requests(w, c, conn_idx, w->pipeline_depth);
+        return;
+    }
+    c->pace_pending = 0;
+    if (!c->due_ns) {
+        const int g = w->conn_offset + conn_idx;
+        const uint64_t now = now_ns();
+        uint64_t due = w->epoch_ns + (uint64_t)((double)w->interval_ns * g / w->total_conns);
+        if (due < now)
+            due += (now - due + w->interval_ns - 1) / w->interval_ns * w->interval_ns;
+        c->due_ns = due;
+    }
+    pace_schedule(w, c, conn_idx);
 }
 
 static inline uint64_t timespec_diff_us(const struct timespec *start, const struct timespec *end)
@@ -197,14 +350,15 @@ static int create_connect_socket(int linger_rst)
     return fd;
 }
 
-static void start_connect(worker_t *w, const int conn_idx)
+/* Returns 1 when a connect was submitted (a UD_CONNECT completion will follow) */
+static int start_connect(worker_t *w, const int conn_idx)
 {
     gc_conn_t *c = &w->conns[conn_idx];
     const int fd = create_connect_socket(w->requests_per_conn > 0);
     if (fd < 0) {
         w->stats.connect_errors++;
         conn_settle(w, c);   /* never retried, so don't hold the warmup on it */
-        return;
+        return 0;
     }
 
     c->fd = fd;
@@ -235,10 +389,32 @@ static void start_connect(worker_t *w, const int conn_idx)
     http_parser_reset(&c->parser);
     ws_parser_reset(&c->ws_parser);
 
+    /* --addr-span: one source address can hold only ~64K connections to one
+       destination, so a large fleet is spread over consecutive addresses */
+    const struct sockaddr_in *dst =
+        &w->server_addrs[(w->conn_offset + conn_idx) % w->num_addrs];
     struct io_uring_sqe *sqe = sqe_get(&w->ring);
-    io_uring_prep_connect(sqe, fd, (struct sockaddr *)&w->server_addr,
-                          sizeof(w->server_addr));
+    io_uring_prep_connect(sqe, fd, (const struct sockaddr *)dst, sizeof(*dst));
     io_uring_sqe_set_data64(sqe, PACK_UD(UD_CONNECT, c->gen, conn_idx));
+    return 1;
+}
+
+/* --connect-limit: start connections not yet started while fewer than the
+   limit have a first attempt in flight. Each first-attempt completion frees
+   a slot (UD_CONNECT); later reconnects are not counted. */
+static void connect_fill(worker_t *w)
+{
+    while (w->connect_next < w->num_conns &&
+           w->connect_inflight < w->connect_limit && *w->running) {
+        if (start_connect(w, w->connect_next++))
+            w->connect_inflight++;
+    }
+}
+
+static void connect_fill_after(worker_t *w)
+{
+    if (w->connect_inflight > 0) w->connect_inflight--;
+    connect_fill(w);
 }
 
 static void close_conn(worker_t *w, gc_conn_t *c, const int conn_idx)
@@ -285,7 +461,7 @@ static void conn_ready(worker_t *w, gc_conn_t *c, const int conn_idx)
     } else {
         c->state = CONN_ACTIVE;
         conn_settle(w, c);
-        fire_requests(w, c, conn_idx, w->pipeline_depth);
+        conn_start_requests(w, c, conn_idx);
     }
 }
 
@@ -430,7 +606,8 @@ static void tls_start(worker_t *w, gc_conn_t *c, const int conn_idx)
 
 void worker_init(worker_t *w,
                  const int id,
-                 const struct sockaddr_in *addr,
+                 const struct sockaddr_in *addrs,
+                 const int num_addrs,
                  request_tpl_t *templates,
                  const int num_templates,
                  const int pipeline_depth,
@@ -449,6 +626,10 @@ void worker_init(worker_t *w,
                  const int per_tpl_latency,
                  const int tls,
                  const char *tls_sni,
+                 const uint64_t interval_ns,
+                 const uint64_t epoch_ns,
+                 const int total_conns,
+                 const int connect_limit,
                  volatile int *running)
 {
     memset(w, 0, sizeof(*w));
@@ -460,7 +641,12 @@ void worker_init(worker_t *w,
     }
 
     w->id                = id;
-    w->server_addr       = *addr;
+    w->server_addrs      = addrs;
+    w->num_addrs         = num_addrs > 0 ? num_addrs : 1;
+    w->interval_ns       = interval_ns;
+    w->epoch_ns          = epoch_ns;
+    w->total_conns       = total_conns > 0 ? total_conns : num_conns;
+    w->connect_limit     = connect_limit;
     w->templates         = templates;
     w->num_templates     = num_templates;
     w->pipeline_depth    = pipeline_depth;
@@ -559,12 +745,35 @@ void worker_init(worker_t *w,
         }
     }
 
-    /* Start all connections */
+    if (interval_ns) {
+        /* Sends are timed by the loop's wait, so the wait has to end when it
+           was asked to: the default 50 us timer slack would land in every
+           paced request's latency. */
+        prctl(PR_SET_TIMERSLACK, 1UL, 0, 0, 0);
+        w->pace_cap  = num_conns + 64;
+        w->pace_heap = malloc((size_t)w->pace_cap * sizeof(*w->pace_heap));
+        if (!w->pace_heap) {
+            fprintf(stderr, "[w%d] pace heap: out of memory\n", id);
+            exit(1);
+        }
+    }
+
     for (int i = 0; i < num_conns; i++) {
         w->conns[i].fd = -1;
         w->conns[i].state = CONN_CLOSED;
         w->conns[i].gen = 0;
-        start_connect(w, i);
+    }
+
+    /* Start the connections: all at once, or with --connect-limit only that
+       many first attempts in flight, each completion starting the next (see
+       UD_CONNECT). A million SYNs at once overflow any listen backlog, and
+       the retries that follow cost seconds each. */
+    if (connect_limit > 0) {
+        connect_fill(w);
+    } else {
+        for (int i = 0; i < num_conns; i++)
+            start_connect(w, i);
+        w->connect_next = num_conns;
     }
 }
 
@@ -594,7 +803,18 @@ void worker_loop(worker_t *w)
         /* Exit check must be unconditional: under sustained load, peek always
          * returns > 0, so a check gated on `got == 0` never fires and the
          * worker spins past shutdown. */
-        if (!*w->running) break;
+        if (!*w->running) {
+            /* How many connections were still open at the end: --rate
+               reports it, since a connection that dropped and never came
+               back sends nothing and would otherwise show only as rate. */
+            if (w->interval_ns) {
+                uint64_t active = 0;
+                for (int i = 0; i < w->num_conns; i++)
+                    if (w->conns[i].state == CONN_ACTIVE) active++;
+                w->stats.conns_active = active;
+            }
+            break;
+        }
 
         /* Warmup reset: zero our own stats from this thread. Doing it from the
          * main thread (as before) raced with these same counters being
@@ -615,10 +835,25 @@ void worker_loop(worker_t *w)
             w->reset_request = 0;
         }
 
+        /* --rate: send what has come due */
+        if (w->interval_ns) {
+            pace_tick(w);
+            io_uring_submit(&w->ring);
+        }
+
         unsigned got = io_uring_peek_batch_cqe(&w->ring, cqes, BATCH_CQES);
         if (got == 0) {
             struct io_uring_cqe *wait_cqe;
-            io_uring_submit_and_wait_timeout(&w->ring, &wait_cqe, 1, &ts, NULL);
+            if (w->interval_ns) {
+                /* Sleep only until the next send is due, so it goes out on
+                   time rather than up to a millisecond late. */
+                const long wait = pace_wait_ns(w);
+                if (wait == 0) continue;
+                struct __kernel_timespec pts = { .tv_sec = 0, .tv_nsec = wait };
+                io_uring_submit_and_wait_timeout(&w->ring, &wait_cqe, 1, &pts, NULL);
+            } else {
+                io_uring_submit_and_wait_timeout(&w->ring, &wait_cqe, 1, &ts, NULL);
+            }
             got = io_uring_peek_batch_cqe(&w->ring, cqes, BATCH_CQES);
             if (got == 0) continue;
         }
@@ -646,6 +881,9 @@ void worker_loop(worker_t *w)
             switch (kind) {
 
             case UD_CONNECT: {
+                /* --connect-limit: a first attempt finished either way */
+                if (w->connect_limit > 0 && cqe_gen == 1)
+                    connect_fill_after(w);
                 if (res < 0) {
                     w->stats.connect_errors++;
                     reconnect(w, conn_idx);
@@ -695,6 +933,17 @@ void worker_loop(worker_t *w)
                     io_uring_sqe_set_data64(sqe, PACK_UD(UD_SEND, c->gen, conn_idx));
                 } else {
                     c->send_inflight = 0;
+
+                    if (w->interval_ns) {
+                        /* --rate: a request came due while this send was
+                           still in flight; send it now. Never refill the way
+                           the closed loop does - that would break the pacing. */
+                        if (c->pace_pending && c->state == CONN_ACTIVE) {
+                            c->pace_pending = 0;
+                            pace_fire(w, c, conn_idx);
+                        }
+                        break;
+                    }
 
                     /* Refill pipeline gap — RECV may have arrived before SEND
                        in the same batch, consuming responses while send_inflight
@@ -799,7 +1048,7 @@ void worker_loop(worker_t *w)
                         ws_parser_reset(&c->ws_parser);
                         return_buffer(w, bid);
                         if (!has_more) arm_recv_multishot(w, conn_idx);
-                        fire_requests(w, c, conn_idx, w->pipeline_depth);
+                        conn_start_requests(w, c, conn_idx);
                         break;
                     } else if (completed > 0) {
                         /* Upgrade refused. This is a failed handshake, not a
@@ -896,8 +1145,16 @@ void worker_loop(worker_t *w)
                     if (!has_more)
                         arm_recv_multishot(w, conn_idx);
 
-                    if (completed > 0)
-                        fire_requests(w, c, conn_idx, completed);
+                    if (completed > 0) {
+                        if (w->interval_ns) {
+                            /* --rate: the next request is due one interval
+                               after the last one was, however late it ran */
+                            c->due_ns += w->interval_ns;
+                            pace_schedule(w, c, conn_idx);
+                        } else {
+                            fire_requests(w, c, conn_idx, completed);
+                        }
+                    }
                 }
                 break;
             }
@@ -930,4 +1187,5 @@ void worker_destroy(worker_t *w)
     free(w->buf_slab);
     free(w->conns);
     free(w->stats.tpl_latency);
+    free(w->pace_heap);
 }
