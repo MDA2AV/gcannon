@@ -51,6 +51,13 @@ typedef struct worker_stats {
     uint64_t tpl_responses_2xx[MAX_TEMPLATES];
     latency_hist_t *tpl_latency;   /* per-template histograms (NULL if disabled) */
     int             num_tpl_latency;
+    /* --rate only. A paced request is sent at its scheduled time or as soon
+       after it as the connection is free; its latency counts from the
+       schedule, so a send that ran late carries the delay in its latency. */
+    uint64_t paced_sends;          /* requests sent on a schedule */
+    uint64_t paced_late;           /* ...more than 1 ms after it */
+    uint64_t paced_lag_max_us;     /* the largest schedule-to-send gap */
+    uint64_t conns_active;         /* connections open when the worker stopped */
 } worker_stats_t;
 
 void stats_record_latency(worker_stats_t *s, uint64_t latency_us);
@@ -64,4 +71,7 @@ void stats_print(const worker_stats_t *s, double elapsed_sec, int num_templates,
 void stats_print_json(const worker_stats_t *s, double elapsed_sec,
                       int num_templates, int ws_mode,
                       const char *target, int num_connections, int num_threads,
-                      int pipeline_depth, int duration_sec);
+                      int pipeline_depth, int duration_sec, double target_rate);
+/* --rate only: target vs achieved rate, schedule lag, connections still open */
+void stats_print_rate(const worker_stats_t *s, double elapsed_sec,
+                      double target_rate, int num_connections);

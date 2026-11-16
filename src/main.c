@@ -41,7 +41,11 @@ typedef struct thread_ctx {
     const char      *ws_path;
     const uint8_t   *ws_payload;
     int              ws_payload_len;
-    struct sockaddr_in addr;
+    const struct sockaddr_in *addrs;
+    int              num_addrs;
+    uint64_t         interval_ns;
+    int              total_conns;
+    int              connect_limit;
 } thread_ctx_t;
 
 /* ── URL parser ────────────────────────────────────────────────────── */
@@ -252,7 +256,7 @@ static int build_pipeline_from_raw(const char *raw, int raw_len,
 static void *worker_thread(void *arg)
 {
     thread_ctx_t *ctx = arg;
-    worker_init(&ctx->worker, ctx->worker.id, &ctx->addr,
+    worker_init(&ctx->worker, ctx->worker.id, ctx->addrs, ctx->num_addrs,
                 ctx->templates, ctx->num_templates, ctx->pipeline_depth,
                 ctx->num_conns, ctx->worker.conn_offset,
                 ctx->requests_per_conn, ctx->expected_status,
@@ -261,6 +265,7 @@ static void *worker_thread(void *arg)
                 ctx->recv_buf_size,
                 ctx->cqe_latency, ctx->per_tpl_latency,
                 ctx->tls, ctx->tls_sni,
+                ctx->interval_ns, ctx->total_conns, ctx->connect_limit,
                 &g_running);
     worker_loop(&ctx->worker);
     return NULL;
@@ -291,6 +296,10 @@ int main(int argc, char **argv)
     int per_tpl_latency = 0;
     int recv_buf_size = RECV_BUF_SIZE_DEFAULT;
     int hist_buckets = 0; /* 0 = default (10) */
+    double rate = 0;          /* --rate: total req/s; 0 = closed loop */
+    int addr_span = 1;        /* --addr-span: consecutive target addresses */
+    int connect_limit = 0;    /* --connect-limit: first connects in flight per thread */
+    int warmup_max_sec = WARMUP_MAX_MS / 1000;
     const char *ws_message = "hello";
     const char *url = NULL;
     const char *raw_files = NULL;
@@ -330,6 +339,21 @@ int main(int argc, char **argv)
             recv_buf_size = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--per-tpl-latency") == 0) {
             per_tpl_latency = 1;
+        } else if (strcmp(argv[i], "--rate") == 0 && i + 1 < argc) {
+            rate = atof(argv[++i]);
+            if (rate <= 0) {
+                fprintf(stderr, "Error: --rate must be a positive number of requests/s\n");
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--addr-span") == 0 && i + 1 < argc) {
+            addr_span = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--connect-limit") == 0 && i + 1 < argc) {
+            connect_limit = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--warmup-max") == 0 && i + 1 < argc) {
+            warmup_max_sec = parse_duration(argv[++i]);
+        } else if (strcmp(argv[i], "--version") == 0) {
+            printf("gcannon %s\n", GCANNON_VERSION);
+            return 0;
         } else if (strcmp(argv[i], "--clear-history") == 0) {
             history_clear();
             printf("Run history cleared.\n");
@@ -339,7 +363,9 @@ int main(int argc, char **argv)
                             "-d <duration> [-p <pipeline>] [-r <req/conn>] "
                             "[-s <status>] [-R|--raw file1,file2,...] "
                             "[--ws [--ws-msg <message>]] [--tui] [--json] [-b <buckets>] "
-                            "[--recv-buf <bytes>] [--cqe-latency]\n");
+                            "[--recv-buf <bytes>] [--cqe-latency] [--rate <req/s>] "
+                            "[--addr-span <n>] [--connect-limit <n>] "
+                            "[--warmup-max <duration>] [--version]\n");
             return 1;
         }
     }
@@ -380,6 +406,31 @@ int main(int argc, char **argv)
         fprintf(stderr, "Error: -c (%d) must be at least -t (%d); every thread "
                         "needs at least one connection\n",
                 num_connections, num_threads);
+        return 1;
+    }
+
+    /* --rate paces requests one at a time per connection: a pipeline would
+       send several on one schedule slot, and a per-connection quota would end
+       a connection's schedule early. */
+    if (rate > 0 && pipeline_depth != 1) {
+        fprintf(stderr, "Error: --rate needs -p 1 (got -p %d)\n", pipeline_depth);
+        return 1;
+    }
+    if (rate > 0 && requests_per_conn > 0) {
+        fprintf(stderr, "Error: --rate cannot be combined with -r\n");
+        return 1;
+    }
+    if (addr_span < 1 || addr_span > 65536) {
+        fprintf(stderr, "Error: --addr-span must be 1..65536 (got %d)\n", addr_span);
+        return 1;
+    }
+    if (connect_limit < 0) {
+        fprintf(stderr, "Error: --connect-limit must not be negative (got %d)\n",
+                connect_limit);
+        return 1;
+    }
+    if (warmup_max_sec < 1) {
+        fprintf(stderr, "Error: --warmup-max must be at least 1 second\n");
         return 1;
     }
 
@@ -541,6 +592,30 @@ int main(int argc, char **argv)
         templates[0].pipeline_len = request_len * pipeline_depth;
     }
 
+    /* --addr-span: consecutive IPv4 addresses from the target's. One source
+       address holds at most ~64K connections to one destination address and
+       port; every 127.x.y.z is local, so a server listening on 0.0.0.0 takes
+       a larger fleet spread over 127.0.0.1, .2, ... */
+    const uint32_t base_ip = ntohl(addr.sin_addr.s_addr);
+    if ((uint64_t)base_ip + (uint64_t)(addr_span - 1) > 0xFFFFFFFFULL) {
+        fprintf(stderr, "Error: --addr-span %d runs past 255.255.255.255\n", addr_span);
+        return 1;
+    }
+    struct sockaddr_in *addrs = calloc(addr_span, sizeof(*addrs));
+    if (!addrs) { fprintf(stderr, "Error: out of memory\n"); return 1; }
+    for (int i = 0; i < addr_span; i++) {
+        addrs[i] = addr;
+        addrs[i].sin_addr.s_addr = htonl(base_ip + (uint32_t)i);
+    }
+
+    /* --rate: each connection sends once per interval, so together they send
+       at the rate asked for */
+    uint64_t interval_ns = 0;
+    if (rate > 0) {
+        interval_ns = (uint64_t)((double)num_connections * 1e9 / rate);
+        if (interval_ns == 0) interval_ns = 1;
+    }
+
     int conns_per_thread = num_connections / num_threads;
     int extra = num_connections % num_threads;
 
@@ -571,6 +646,15 @@ int main(int argc, char **argv)
             printf("  Templates: %d\n", num_templates);
         printf("  Expected:  %d\n", expected_status);
         printf("  Duration:  %ds\n", duration_sec);
+        if (addr_span > 1) {
+            char first[INET_ADDRSTRLEN], last[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &addrs[0].sin_addr, first, sizeof(first));
+            inet_ntop(AF_INET, &addrs[addr_span - 1].sin_addr, last, sizeof(last));
+            printf("  Addresses: %s - %s (%d)\n", first, last, addr_span);
+        }
+        if (rate > 0)
+            printf("  Rate:      %.0f req/s, one request per connection every %.3fs\n",
+                   rate, interval_ns / 1e9);
         printf("\n");
     }
 
@@ -606,7 +690,11 @@ int main(int argc, char **argv)
         ctxs[i].ws_path           = path;
         ctxs[i].ws_payload        = (const uint8_t *)ws_message;
         ctxs[i].ws_payload_len    = strlen(ws_message);
-        ctxs[i].addr              = addr;
+        ctxs[i].addrs             = addrs;
+        ctxs[i].num_addrs         = addr_span;
+        ctxs[i].interval_ns       = interval_ns;
+        ctxs[i].total_conns       = num_connections;
+        ctxs[i].connect_limit     = connect_limit;
         conn_offset += ctxs[i].num_conns;
         pthread_create(&threads[i], NULL, worker_thread, &ctxs[i]);
     }
@@ -630,11 +718,11 @@ int main(int argc, char **argv)
             clock_gettime(CLOCK_MONOTONIC, &now);
             const long waited_ms = (now.tv_sec - warm_start.tv_sec) * 1000L
                                  + (now.tv_nsec - warm_start.tv_nsec) / 1000000L;
-            if (waited_ms >= WARMUP_MAX_MS - WARMUP_MIN_MS) {
+            if (waited_ms >= (long)warmup_max_sec * 1000L - WARMUP_MIN_MS) {
                 fprintf(stderr, "Warning: %d of %d connections still not set up after "
-                                "%.0fs of warmup; measuring anyway\n",
+                                "%ds of warmup; measuring anyway\n",
                         num_connections - settled, num_connections,
-                        WARMUP_MAX_MS / 1000.0);
+                        warmup_max_sec);
                 break;
             }
             nanosleep(&(struct timespec){ .tv_sec = 0, .tv_nsec = 1000000 }, NULL); /* 1ms */
@@ -670,6 +758,11 @@ int main(int argc, char **argv)
         return 130;   /* 128 + SIGINT, as a shell reports an interrupted command */
     }
 
+    /* --rate: a line a wrapper can wait on to sample anything else (a
+       server's CPU, say) over exactly the measured window */
+    if (rate > 0)
+        fprintf(stderr, "gcannon: warmup done, measuring for %ds\n", duration_sec);
+
     struct timespec start_time;
     clock_gettime(CLOCK_MONOTONIC, &start_time);
 
@@ -699,6 +792,10 @@ int main(int argc, char **argv)
             prev_responses = snap_resp;
         }
     }
+    /* --rate: the window is over but every connection is still open; what a
+       wrapper samples now excludes the teardown (a million closes) below */
+    if (rate > 0)
+        fprintf(stderr, "gcannon: measurement done\n");
     g_running = 0;
 
     /* Join threads */
@@ -747,13 +844,15 @@ int main(int argc, char **argv)
             snprintf(target, sizeof(target), "%s:%d%s", host, port, path);
         stats_print_json(&total, elapsed, num_templates, ws_mode,
                          target, num_connections, num_threads,
-                         pipeline_depth, duration_sec);
+                         pipeline_depth, duration_sec, rate);
     } else if (tui_mode) {
         tui_print_results(&total, elapsed, num_templates, expected_status,
                           hist_buckets, prev_runs, num_prev, &current_record,
                           ws_mode);
+        if (rate > 0) stats_print_rate(&total, elapsed, rate, num_connections);
     } else {
         stats_print(&total, elapsed, num_templates, ws_mode);
+        if (rate > 0) stats_print_rate(&total, elapsed, rate, num_connections);
     }
 
     /* Check for unexpected status codes (exit code) */
@@ -786,5 +885,6 @@ int main(int argc, char **argv)
     free(ctxs);
     free(threads);
     free(rps_history);
+    free(addrs);
     return exit_code;
 }
