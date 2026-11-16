@@ -66,12 +66,3 @@ void hist_merge(latency_hist_t *dst, const latency_hist_t *src);
 uint64_t hist_percentile(const latency_hist_t *h, double pct);
 void stats_merge(worker_stats_t *dst, const worker_stats_t *src);
 uint64_t stats_percentile(const worker_stats_t *s, double pct);
-void stats_print(const worker_stats_t *s, double elapsed_sec, int num_templates,
-                 int ws_mode);
-void stats_print_json(const worker_stats_t *s, double elapsed_sec,
-                      int num_templates, int ws_mode,
-                      const char *target, int num_connections, int num_threads,
-                      int pipeline_depth, int duration_sec, double target_rate);
-/* --rate only: target vs achieved rate, schedule lag, connections still open */
-void stats_print_rate(const worker_stats_t *s, double elapsed_sec,
-                      double target_rate, int num_connections);

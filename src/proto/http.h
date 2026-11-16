@@ -2,12 +2,6 @@
 
 #include <stdint.h>
 
-/* Build a pipelined GET request buffer.
- * Returns total length of pipeline_depth copies concatenated.
- * Caller must free *out_buf. */
-int http_build_pipeline(const char *host, int port, const char *path,
-                        int pipeline_depth, char **out_buf);
-
 /* HTTP response parser state (per-connection) */
 typedef struct http_parser {
     int  state;           /* 0 = headers, 1 = content-length body, 2 = chunked body */

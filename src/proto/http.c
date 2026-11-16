@@ -7,40 +7,6 @@
 
 #include "picohttpparser.h"
 
-int http_build_pipeline(const char *host, int port, const char *path,
-                        int pipeline_depth, char **out_buf)
-{
-    /* Measure the single request length first */
-    int single_len;
-    if (port == 80 || port == 443)
-        single_len = snprintf(NULL, 0,
-            "GET %s HTTP/1.1\r\nHost: %s\r\n\r\n",
-            path, host);
-    else
-        single_len = snprintf(NULL, 0,
-            "GET %s HTTP/1.1\r\nHost: %s:%d\r\n\r\n",
-            path, host, port);
-
-    int total_len = single_len * pipeline_depth;
-    char *buf = malloc(total_len + 1); /* +1 for snprintf null terminator */
-
-    /* Format into the first slot, then replicate */
-    if (port == 80 || port == 443)
-        snprintf(buf, single_len + 1,
-            "GET %s HTTP/1.1\r\nHost: %s\r\n\r\n",
-            path, host);
-    else
-        snprintf(buf, single_len + 1,
-            "GET %s HTTP/1.1\r\nHost: %s:%d\r\n\r\n",
-            path, host, port);
-
-    for (int i = 1; i < pipeline_depth; i++)
-        memcpy(buf + i * single_len, buf, single_len);
-
-    *out_buf = buf;
-    return total_len;
-}
-
 void http_parser_reset(http_parser_t *p)
 {
     p->state = 0;

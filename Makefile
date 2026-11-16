@@ -4,14 +4,16 @@ LDFLAGS = -luring -lpthread -lssl -lcrypto
 
 BUILDDIR = build
 
-# src/main.c runs the benchmark; the folders hold what it is built from:
+# src/main.c runs the benchmark and src/cli.c reads its options; the folders
+# hold what it is built from:
 #   core/    the per-thread io_uring engine
-#   proto/   what goes over the wire: HTTP/1.1, WebSocket, TLS
+#   proto/   what goes over the wire: requests, HTTP/1.1, WebSocket, TLS
 #   output/  what a run prints and remembers
-SRC      = src/main.c \
-           src/core/worker.c src/core/stats.c \
-           src/proto/http.c src/proto/ws.c src/proto/ktls.c \
-           src/output/tui.c src/output/history.c
+SRC      = src/main.c src/cli.c \
+           src/core/worker.c src/core/pace.c src/core/stats.c \
+           src/proto/template.c src/proto/http.c src/proto/ws.c \
+           src/proto/tls.c src/proto/ktls.c \
+           src/output/report.c src/output/tui.c src/output/history.c
 OBJ      = $(patsubst src/%.c,$(BUILDDIR)/%.o,$(SRC))
 DEP      = $(OBJ:.o=.d)
 PICO_OBJ = $(BUILDDIR)/picohttpparser.o

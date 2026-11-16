@@ -9,22 +9,12 @@
 #include <netinet/tcp.h>
 #include <fcntl.h>
 #include <poll.h>
-#include <sys/prctl.h>
 
-#include <openssl/crypto.h>
-#include <openssl/err.h>
-#include <openssl/ssl.h>
+#include "core/pace.h"
+#include "core/send.h"
+#include "proto/tls.h"
+
 /* io_uring implementation inspired by zerg - https://github.com/MDA2AV/zerg */
-
-static inline struct io_uring_sqe *sqe_get(struct io_uring *ring)
-{
-    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
-    if (__builtin_expect(!sqe, 0)) {
-        io_uring_submit(ring);
-        sqe = io_uring_get_sqe(ring);
-    }
-    return sqe;
-}
 
 static inline void return_buffer(worker_t *w, uint16_t bid)
 {
@@ -62,260 +52,16 @@ static inline void fire_ws_upgrade(worker_t *w, gc_conn_t *c, const int conn_idx
     c->send_buf   = w->ws_upgrade_buf;
 }
 
-/* Fast xorshift64 PRNG — one per connection, no shared state */
-static inline uint64_t xorshift64(uint64_t *state)
-{
-    uint64_t x = *state;
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    *state = x;
-    return x;
-}
-
-/* Write a zero-padded decimal number into buf at the given width.
- * E.g. write_padded(buf, 6, 42357) writes "042357". */
-static inline void write_padded(char *buf, int width, uint64_t val)
-{
-    for (int i = width - 1; i >= 0; i--) {
-        buf[i] = '0' + (char)(val % 10);
-        val /= 10;
-    }
-}
-
-static inline uint64_t now_ns(void)
-{
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (uint64_t)t.tv_sec * 1000000000ULL + (uint64_t)t.tv_nsec;
-}
-
-/* Send up to `count` requests. at_ns, when non-zero, is the time the requests
- * were scheduled for (--rate): latency is then measured from the schedule, not
- * from the send, so a server that holds a connection up delays everything
- * queued behind it in the figures too (coordinated-omission correction).
- * Returns 1 if anything was sent. */
-static inline int fire_requests_at(worker_t *w, gc_conn_t *c, int conn_idx, int count,
-                                   const uint64_t at_ns)
-{
-    if (count <= 0 || c->send_inflight || c->state != CONN_ACTIVE)
-        return 0;
-
-    if (count > w->pipeline_depth)
-        count = w->pipeline_depth;
-
-    /* Cap to remaining requests on this connection */
-    if (w->requests_per_conn > 0) {
-        const int remaining = w->requests_per_conn - c->requests_sent;
-        if (remaining <= 0) return 0;
-        if (count > remaining) count = remaining;
-    }
-
-    const char *buf;
-    int send_len;
-
-    if (w->ws_mode) {
-        send_len = count * w->ws_frame_len;
-        buf = (const char *)w->ws_frame_buf;
-    } else {
-        const request_tpl_t *tpl = &w->templates[c->tpl_idx];
-
-        if (tpl->ph.type != SUB_NONE) {
-            /* Template has a placeholder — copy to scratch buffer and
-             * substitute the value before sending. Each pipelined copy
-             * in the batch gets its own substituted value. */
-            send_len = count * tpl->request_len;
-
-            /* Ensure scratch buffer is large enough */
-            if (c->scratch_len < send_len) {
-                char *nb = malloc(send_len);
-                if (!nb) return 0; /* OOM — skip this batch; retry on next event
-                                      (keeps the old buffer; never deref NULL) */
-                free(c->scratch_buf);
-                c->scratch_buf = nb;
-                c->scratch_len = send_len;
-            }
-
-            for (int k = 0; k < count; k++) {
-                char *dst = c->scratch_buf + k * tpl->request_len;
-                memcpy(dst, tpl->pipeline_buf, tpl->request_len);
-
-                uint64_t val;
-                if (tpl->ph.type == SUB_RAND) {
-                    uint64_t range = tpl->ph.max - tpl->ph.min + 1;
-                    val = tpl->ph.min + (xorshift64(&c->rng_state) % range);
-                } else { /* SUB_SEQ */
-                    val = atomic_fetch_add(&((request_tpl_t *)tpl)->ph.seq, 1);
-                }
-                write_padded(dst + tpl->ph.offset, tpl->ph.width, val);
-            }
-            buf = c->scratch_buf;
-        } else {
-            buf = tpl->pipeline_buf;
-            send_len = count * tpl->request_len;
-        }
-    }
-
-    struct io_uring_sqe *sqe = sqe_get(&w->ring);
-    io_uring_prep_send(sqe, c->fd, buf, send_len, MSG_NOSIGNAL);
-    io_uring_sqe_set_data64(sqe, PACK_UD(UD_SEND, c->gen, conn_idx));
-
-    /* All requests in this batch go out in one send, so they share
-       the same dispatch timestamp.  Latency = time from batch dispatch
-       to individual response arrival. */
-    struct timespec now;
-    if (at_ns) {
-        now.tv_sec  = (time_t)(at_ns / 1000000000ULL);
-        now.tv_nsec = (long)(at_ns % 1000000000ULL);
-    } else {
-        clock_gettime(CLOCK_MONOTONIC, &now);
-    }
-    for (int k = 0; k < count; k++) {
-        c->send_times[c->send_time_tail % PIPELINE_DEPTH_MAX] = now;
-        c->send_time_tail++;
-    }
-
-    c->send_inflight = 1;
-    c->send_total = send_len;
-    c->send_done  = 0;
-    c->send_buf   = buf;
-    c->pipeline_inflight += count;
-    c->requests_sent += count;
-    w->stats.requests += count;
-    return 1;
-}
-
-static inline void fire_requests(worker_t *w, gc_conn_t *c, int conn_idx, int count)
-{
-    fire_requests_at(w, c, conn_idx, count, 0);
-}
-
-/* ── --rate pacing ─────────────────────────────────────────────────── */
-
-/* A connection's next send waits in a per-worker min-heap until it is due.
- * Each connection has at most one live entry; entries left behind by a close
- * or a reschedule are detected when they reach the top and skipped. */
-
-static void pace_push(worker_t *w, const uint64_t due_ns, const int conn_idx, const uint16_t gen)
-{
-    if (w->pace_len == w->pace_cap) {
-        const int cap = w->pace_cap ? w->pace_cap * 2 : 1024;
-        pace_entry_t *h = realloc(w->pace_heap, (size_t)cap * sizeof(*h));
-        if (!h) {
-            fprintf(stderr, "[w%d] pace heap: out of memory\n", w->id);
-            exit(1);
-        }
-        w->pace_heap = h;
-        w->pace_cap = cap;
-    }
-    int i = w->pace_len++;
-    while (i > 0) {
-        const int parent = (i - 1) / 2;
-        if (w->pace_heap[parent].due_ns <= due_ns) break;
-        w->pace_heap[i] = w->pace_heap[parent];
-        i = parent;
-    }
-    w->pace_heap[i] = (pace_entry_t){ .due_ns = due_ns, .conn_idx = conn_idx, .gen = gen };
-}
-
-static pace_entry_t pace_pop(worker_t *w)
-{
-    const pace_entry_t top  = w->pace_heap[0];
-    const pace_entry_t last = w->pace_heap[--w->pace_len];
-    int i = 0;
-    for (;;) {
-        int child = 2 * i + 1;
-        if (child >= w->pace_len) break;
-        if (child + 1 < w->pace_len &&
-            w->pace_heap[child + 1].due_ns < w->pace_heap[child].due_ns)
-            child++;
-        if (last.due_ns <= w->pace_heap[child].due_ns) break;
-        w->pace_heap[i] = w->pace_heap[child];
-        i = child;
-    }
-    if (w->pace_len > 0) w->pace_heap[i] = last;
-    return top;
-}
-
-/* Send the request that is due on this connection, or note that it is owed
- * if the previous send has not completed yet (UD_SEND fires it then). */
-static void pace_fire(worker_t *w, gc_conn_t *c, const int conn_idx)
-{
-    if (c->send_inflight) {
-        c->pace_pending = 1;
-        return;
-    }
-    const uint64_t now = now_ns();
-    if (!fire_requests_at(w, c, conn_idx, 1, c->due_ns))
-        return;
-    const uint64_t lag_us = now > c->due_ns ? (now - c->due_ns) / 1000 : 0;
-    w->stats.paced_sends++;
-    if (lag_us > 1000) w->stats.paced_late++;
-    if (lag_us > w->stats.paced_lag_max_us) w->stats.paced_lag_max_us = lag_us;
-}
-
-/* The connection is free for its next request: send it now if it is due
- * (or overdue), otherwise queue it for its time. */
-static void pace_schedule(worker_t *w, gc_conn_t *c, const int conn_idx)
-{
-    if (c->due_ns <= now_ns())
-        pace_fire(w, c, conn_idx);
-    else
-        pace_push(w, c->due_ns, conn_idx, c->gen);
-}
-
-/* Fire everything whose time has come. */
-static void pace_tick(worker_t *w)
-{
-    if (!w->pace_len) return;
-    const uint64_t now = now_ns();
-    while (w->pace_len && w->pace_heap[0].due_ns <= now) {
-        const pace_entry_t e = pace_pop(w);
-        gc_conn_t *c = &w->conns[e.conn_idx];
-        if (c->gen != e.gen || c->state != CONN_ACTIVE || c->due_ns != e.due_ns)
-            continue;   /* closed or rescheduled since it was queued */
-        pace_fire(w, c, e.conn_idx);
-    }
-}
-
-/* How long the loop may sleep: until the next send is due, at most 1 ms. */
-static long pace_wait_ns(const worker_t *w)
-{
-    if (!w->pace_len) return 1000000L;
-    const uint64_t now = now_ns();
-    const uint64_t due = w->pace_heap[0].due_ns;
-    if (due <= now) return 0;
-    return due - now < 1000000ULL ? (long)(due - now) : 1000000L;
-}
-
 /* A connection is ready for requests (first time, or again after a
  * reconnect): closed loop fills its pipeline, --rate starts or resumes its
- * schedule.
- *
- * Every connection sends on one shared grid: connection g at
- * epoch + (g/N)*interval + k*interval. Anchoring each schedule at the moment
- * its connection came up instead would bunch the offsets of a fleet that
- * opens over a ramp (in index order, as --connect-limit does), and the
- * offered rate would pulse at the interval's period by about ramp/interval.
- * A connection starts at its first slot after it is up: slots that passed
- * while it was still connecting were setup, not owed. A reconnect keeps its
- * schedule and catches up on what it missed. */
+ * schedule (core/pace.c). */
 static void conn_start_requests(worker_t *w, gc_conn_t *c, const int conn_idx)
 {
     if (!w->interval_ns) {
         fire_requests(w, c, conn_idx, w->pipeline_depth);
         return;
     }
-    c->pace_pending = 0;
-    if (!c->due_ns) {
-        const int g = w->conn_offset + conn_idx;
-        const uint64_t now = now_ns();
-        uint64_t due = w->epoch_ns + (uint64_t)((double)w->interval_ns * g / w->total_conns);
-        if (due < now)
-            due += (now - due + w->interval_ns - 1) / w->interval_ns * w->interval_ns;
-        c->due_ns = due;
-    }
-    pace_schedule(w, c, conn_idx);
+    pace_start(w, c, conn_idx);
 }
 
 static inline uint64_t timespec_diff_us(const struct timespec *start, const struct timespec *end)
@@ -431,10 +177,7 @@ static void close_conn(worker_t *w, gc_conn_t *c, const int conn_idx)
         }
         close(c->fd);
     }
-    if (c->ssl) {
-        SSL_free(c->ssl);
-        c->ssl = NULL;
-    }
+    tls_free(&c->ssl);
     c->fd = -1;
     c->state = CONN_CLOSED;
     c->send_inflight = 0;
@@ -467,138 +210,33 @@ static void conn_ready(worker_t *w, gc_conn_t *c, const int conn_idx)
 
 /* ── TLS handshake ─────────────────────────────────────────────────── */
 
-/* OpenSSL runs the handshake directly on the socket, and all that comes out of
- * it are the TLS 1.3 traffic secrets. Those become kernel TLS keys and the SSL
- * object is freed, so from then on the connection is the same plain fd as for
- * http:// — the kernel just encrypts what goes through it. */
-
-/* Key log callback: the only public way OpenSSL 3.0 hands out the secrets */
-static void tls_keylog(const SSL *ssl, const char *line)
+/* https: act on what the handshake (proto/tls.c) needs next */
+static void conn_tls(worker_t *w, gc_conn_t *c, const int conn_idx, const tls_status_t st)
 {
-    gc_conn_t *c = SSL_get_app_data(ssl);
-    if (c) ktls_keylog_line(&c->tls_secrets, line);
-}
-
-static SSL_CTX *tls_ctx_new(void)
-{
-    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
-    if (!ctx) return NULL;
-    /* Kernel TLS carries TLS 1.3 records in these three suites, so offer
-       nothing it can't take. AES-128-GCM first, the order browsers use. */
-    if (!SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION) ||
-        !SSL_CTX_set_ciphersuites(ctx, "TLS_AES_128_GCM_SHA256:"
-                                       "TLS_AES_256_GCM_SHA384:"
-                                       "TLS_CHACHA20_POLY1305_SHA256")) {
-        SSL_CTX_free(ctx);
-        return NULL;
+    switch (st) {
+    case TLS_DONE:
+        conn_ready(w, c, conn_idx);
+        break;
+    case TLS_WANT_READ:
+    case TLS_WANT_WRITE: {
+        /* wait for the socket with a one-shot poll */
+        struct io_uring_sqe *sqe = sqe_get(&w->ring);
+        io_uring_prep_poll_add(sqe, c->fd, st == TLS_WANT_READ ? POLLIN : POLLOUT);
+        io_uring_sqe_set_data64(sqe, PACK_UD(UD_POLL, c->gen, conn_idx));
+        break;
     }
-    /* Benchmark targets mostly run with self-signed or test certificates */
-    SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
-    /* The receive path drops session tickets, so there is nothing to cache */
-    SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_OFF);
-    SSL_CTX_set_keylog_callback(ctx, tls_keylog);
-#ifdef SSL_OP_ENABLE_KTLS
-    /* Both directions are installed below. OpenSSL's own kTLS, if a system
-       config turns it on, would claim the transmit side first. */
-    SSL_CTX_clear_options(ctx, SSL_OP_ENABLE_KTLS);
-#endif
-    return ctx;
-}
-
-/* The first TLS failure of a run goes to stderr, so a target that won't do
-   TLS 1.3 says why instead of only piling up connect errors. */
-static void tls_report(const char *what, const char *why)
-{
-    static atomic_flag reported = ATOMIC_FLAG_INIT;
-    if (!atomic_flag_test_and_set(&reported))
-        fprintf(stderr, "TLS %s failed: %s\n", what, why);
-}
-
-static void tls_finish(worker_t *w, gc_conn_t *c, const int conn_idx)
-{
-    const ktls_secrets_t *k = &c->tls_secrets;
-    const char *name = SSL_CIPHER_get_name(SSL_get_current_cipher(c->ssl));
-    const ktls_suite_t suite = ktls_suite_from_name(name);
-    char why[128];
-    int rc = -EPROTO;
-
-    if (!suite) {
-        snprintf(why, sizeof(why), "kernel TLS can't carry %s", name ? name : "the suite");
-        tls_report("setup", why);
-    } else if (!k->client_len || k->client_len != k->server_len) {
-        tls_report("setup", "the handshake produced no traffic secrets");
-    } else if ((rc = ktls_install(c->fd, suite, k->client, k->server, k->client_len)) < 0) {
-        snprintf(why, sizeof(why), "installing kernel TLS keys: %s", strerror(-rc));
-        tls_report("setup", why);
-    }
-
-    OPENSSL_cleanse(&c->tls_secrets, sizeof(c->tls_secrets));
-    SSL_free(c->ssl);   /* SSL_set_fd doesn't own the fd, so it stays open */
-    c->ssl = NULL;
-
-    if (rc < 0) {
+    case TLS_FAILED:
         w->stats.connect_errors++;
         reconnect(w, conn_idx);
-        return;
+        break;
     }
-    conn_ready(w, c, conn_idx);
 }
 
-/* Drive the handshake as far as the socket allows, then wait for it with a
-   one-shot poll. */
-static void tls_step(worker_t *w, gc_conn_t *c, const int conn_idx)
-{
-    ERR_clear_error();   /* SSL_get_error reads this thread's error queue */
-    const int r = SSL_do_handshake(c->ssl);
-    if (r == 1) {
-        tls_finish(w, c, conn_idx);
-        return;
-    }
-    const int err = SSL_get_error(c->ssl, r);
-    if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
-        struct io_uring_sqe *sqe = sqe_get(&w->ring);
-        io_uring_prep_poll_add(sqe, c->fd, err == SSL_ERROR_WANT_READ ? POLLIN : POLLOUT);
-        io_uring_sqe_set_data64(sqe, PACK_UD(UD_POLL, c->gen, conn_idx));
-        return;
-    }
-
-    char why[256];
-    const unsigned long e = ERR_peek_last_error();
-    const char *reason = e ? ERR_reason_error_string(e) : NULL;
-    if (reason)
-        snprintf(why, sizeof(why), "%s", reason);
-    else if (e)
-        ERR_error_string_n(e, why, sizeof(why));
-    else if (err == SSL_ERROR_SYSCALL && errno)
-        snprintf(why, sizeof(why), "%s", strerror(errno));
-    else
-        snprintf(why, sizeof(why), "server closed the connection");
-    tls_report("handshake", why);
-    ERR_clear_error();
-
-    w->stats.connect_errors++;
-    reconnect(w, conn_idx);
-}
-
-static void tls_start(worker_t *w, gc_conn_t *c, const int conn_idx)
+static void conn_start_tls(worker_t *w, gc_conn_t *c, const int conn_idx)
 {
     c->state = CONN_TLS_HANDSHAKE;
-    memset(&c->tls_secrets, 0, sizeof(c->tls_secrets));
-    /* OpenSSL reads one whole record at a time (no read-ahead), so when the
-       handshake ends nothing past the server's Finished has left the socket:
-       kernel TLS starts at the first application record, sequence 0. */
-    c->ssl = SSL_new(w->ssl_ctx);
-    if (!c->ssl || !SSL_set_fd(c->ssl, c->fd)) {
-        tls_report("setup", "out of memory");
-        w->stats.connect_errors++;
-        reconnect(w, conn_idx);
-        return;
-    }
-    SSL_set_app_data(c->ssl, c);
-    if (w->tls_sni)
-        SSL_set_tlsext_host_name(c->ssl, w->tls_sni);
-    SSL_set_connect_state(c->ssl);
-    tls_step(w, c, conn_idx);
+    conn_tls(w, c, conn_idx,
+             tls_start(w->ssl_ctx, w->tls_sni, c->fd, &c->ssl, &c->tls_secrets));
 }
 
 
@@ -745,18 +383,8 @@ void worker_init(worker_t *w,
         }
     }
 
-    if (interval_ns) {
-        /* Sends are timed by the loop's wait, so the wait has to end when it
-           was asked to: the default 50 us timer slack would land in every
-           paced request's latency. */
-        prctl(PR_SET_TIMERSLACK, 1UL, 0, 0, 0);
-        w->pace_cap  = num_conns + 64;
-        w->pace_heap = malloc((size_t)w->pace_cap * sizeof(*w->pace_heap));
-        if (!w->pace_heap) {
-            fprintf(stderr, "[w%d] pace heap: out of memory\n", id);
-            exit(1);
-        }
-    }
+    if (interval_ns)
+        pace_init(w);
 
     for (int i = 0; i < num_conns; i++) {
         w->conns[i].fd = -1;
@@ -890,7 +518,7 @@ void worker_loop(worker_t *w)
                     break;
                 }
                 if (w->ktls)
-                    tls_start(w, c, conn_idx);
+                    conn_start_tls(w, c, conn_idx);
                 else
                     conn_ready(w, c, conn_idx);
                 break;
@@ -905,7 +533,7 @@ void worker_loop(worker_t *w)
                     reconnect(w, conn_idx);
                     break;
                 }
-                tls_step(w, c, conn_idx);
+                conn_tls(w, c, conn_idx, tls_step(c->fd, &c->ssl, &c->tls_secrets));
                 break;
             }
 
@@ -1176,10 +804,10 @@ void worker_destroy(worker_t *w)
     for (int i = 0; i < w->num_conns; i++) {
         if (w->conns[i].fd >= 0)
             close(w->conns[i].fd);
-        SSL_free(w->conns[i].ssl);
+        tls_free(&w->conns[i].ssl);
         free(w->conns[i].scratch_buf);
     }
-    SSL_CTX_free(w->ssl_ctx);
+    tls_ctx_free(w->ssl_ctx);
 
     io_uring_free_buf_ring(&w->ring, w->buf_ring,
                            BUF_RING_ENTRIES, BUFFER_RING_BGID);

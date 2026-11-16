@@ -11,32 +11,13 @@
 #include "proto/http.h"
 #include "proto/ws.h"
 #include "proto/ktls.h"
+#include "proto/template.h"
 
 typedef enum { CONN_CONNECTING, CONN_TLS_HANDSHAKE, CONN_WS_UPGRADING, CONN_ACTIVE,
                CONN_CLOSED } conn_state_t;
 
 struct ssl_st;
 struct ssl_ctx_st;
-
-/* Placeholder substitution types for {RAND:min:max} and {SEQ:start} in raw templates */
-typedef enum { SUB_NONE = 0, SUB_RAND, SUB_SEQ } sub_type_t;
-
-typedef struct {
-    sub_type_t type;
-    int        offset;      /* byte offset in the single-request buffer */
-    int        width;       /* zero-padded digit width (e.g. 6 for 000001-999999) */
-    uint64_t   min;         /* RAND lower bound (inclusive) */
-    uint64_t   max;         /* RAND upper bound (inclusive) */
-    _Atomic uint64_t seq;   /* SEQ: shared atomic counter across all threads */
-} placeholder_t;
-
-/* Request template — one per raw request file (or the auto-generated GET) */
-typedef struct {
-    char *pipeline_buf;   /* pipeline_depth copies concatenated */
-    int   request_len;    /* single request length */
-    int   pipeline_len;   /* pipeline_depth * request_len */
-    placeholder_t ph;     /* {RAND} or {SEQ} placeholder (ph.type == SUB_NONE if none) */
-} request_tpl_t;
 
 typedef struct gc_conn {
     int              fd;
