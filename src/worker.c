@@ -292,14 +292,24 @@ static long pace_wait_ns(const worker_t *w)
  * reconnect): closed loop fills its pipeline, --rate starts or resumes its
  * schedule.
  *
- * Every connection sends on one shared grid: connection g at
- * epoch + (g/N)*interval + k*interval. Anchoring each schedule at the moment
- * its connection came up instead would bunch the offsets of a fleet that
- * opens over a ramp (in index order, as --connect-limit does), and the
- * offered rate would pulse at the interval's period by about ramp/interval.
- * A connection starts at its first slot after it is up: slots that passed
- * while it was still connecting were setup, not owed. A reconnect keeps its
- * schedule and catches up on what it missed. */
+ * Every connection sends on one shared grid anchored at epoch: worker w's
+ * connection i at epoch + ((i + off/N) / n)*interval + k*interval, where n
+ * is the worker's connection count and off its first global index. Each
+ * worker spreads its own connections over the whole interval and the
+ * workers' slots interleave (off/N is w/T for an even split), so the fleet
+ * fills the same evenly spaced N-slot grid as g/N would, while every thread
+ * sends only its 1/T share of the rate at any moment. Numbering the slots
+ * g/N in global order gave each worker one contiguous 1/T slice instead:
+ * one thread at a time carried the whole fleet's rate, and at 1M
+ * connections, 64 threads and 250K req/s nearly every send went out
+ * 100-165 ms late, with the responses waiting behind them.
+ *
+ * Anchoring each schedule at the moment its connection came up instead would
+ * bunch the offsets of a fleet that opens over a ramp (in index order, as
+ * --connect-limit does), and the offered rate would pulse at the interval's
+ * period by about ramp/interval. A connection starts at its first slot after
+ * it is up: slots that passed while it was still connecting were setup, not
+ * owed. A reconnect keeps its schedule and catches up on what it missed. */
 static void conn_start_requests(worker_t *w, gc_conn_t *c, const int conn_idx)
 {
     if (!w->interval_ns) {
@@ -308,9 +318,11 @@ static void conn_start_requests(worker_t *w, gc_conn_t *c, const int conn_idx)
     }
     c->pace_pending = 0;
     if (!c->due_ns) {
-        const int g = w->conn_offset + conn_idx;
+        const double slot = ((double)conn_idx
+                             + (double)w->conn_offset / (double)w->total_conns)
+                            / (double)w->num_conns;
         const uint64_t now = now_ns();
-        uint64_t due = w->epoch_ns + (uint64_t)((double)w->interval_ns * g / w->total_conns);
+        uint64_t due = w->epoch_ns + (uint64_t)((double)w->interval_ns * slot);
         if (due < now)
             due += (now - due + w->interval_ns - 1) / w->interval_ns * w->interval_ns;
         c->due_ns = due;
