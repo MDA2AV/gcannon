@@ -12,8 +12,11 @@
 #   stall              a 400 ms server stall lands in the latency of every
 #                      request scheduled inside it, not only the ones already
 #                      on the wire (coordinated omission)
+#   settle             --settle keeps the load running before the window
+#                      opens: says so on stderr, the run takes the settle on
+#                      top of the duration, and the window still holds the rate
 #   arg errors         --rate refuses -p > 1, -r, a non-positive rate, and
-#                      --addr-span/--connect-limit refuse nonsense
+#                      --addr-span/--connect-limit/--settle refuse nonsense
 #   closed loop        without --rate the output carries no rate lines
 #
 # Run: make test-integration (or run this script directly)
@@ -107,6 +110,31 @@ else
     pass "rate" "rps=$rps ratio=$ratio paced_sends=$sends active=$active"
 fi
 
+# ── settle: 2 s of load after every connection is up, then a 2 s window ──
+settle_err="$TMP/settle.err"
+t0=$(date +%s.%N)
+IFS=$'\t' read -r ratio el <<<"$(HOME="$TMP" "$GCANNON" "http://127.0.0.1:$ANY_PORT/" -c 200 -t 2 -d 2s \
+    --rate 2000 --settle 2s --json 2>"$settle_err" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except ValueError:
+    print("-\t-"); sys.exit()
+print("%s\t%s" % ((d.get("rate") or {}).get("ratio", "-"), d.get("elapsed_sec", "-")))')"
+t1=$(date +%s.%N)
+wall=$(awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.1f", b - a }')
+if ! grep -q "settling for 2s" "$settle_err"; then
+    fail "settle" "no 'settling for 2s' line on stderr"
+elif ! awk -v w="$wall" 'BEGIN { exit !(w >= 4.0) }'; then
+    fail "settle" "the run took ${wall}s, want at least 4s (2s settle + 2s window)"
+elif ! awk -v r="$ratio" 'BEGIN { exit !(r >= 0.95 && r <= 1.05) }'; then
+    fail "settle" "ratio=$ratio, want 0.95-1.05"
+elif ! awk -v e="$el" 'BEGIN { exit !(e >= 1.9 && e <= 2.5) }'; then
+    fail "settle" "window ${el}s, want ~2s: the settle must not be in it"
+else
+    pass "settle" "run ${wall}s, window ${el}s, ratio=$ratio"
+fi
+
 # ── addr-span: 127.0.0.1-.4 against a listener on every address ──
 IFS=$'\t' read -r active cerr ratio <<<"$(run_json connections_active,errors.connect,rate.ratio \
     "http://127.0.0.1:$ANY_PORT/" -c 100 -t 2 -d 2s --rate 1000 --addr-span 4)"
@@ -171,6 +199,7 @@ check_err "rate with -r"        "cannot be combined" "http://127.0.0.1:1/" -c 4 
 check_err "rate 0"              "positive"          "http://127.0.0.1:1/" -c 4 -t 1 -d 1s --rate 0
 check_err "addr-span 0"         "addr-span"         "http://127.0.0.1:1/" -c 4 -t 1 -d 1s --addr-span 0
 check_err "connect-limit -1"    "connect-limit"     "http://127.0.0.1:1/" -c 4 -t 1 -d 1s --connect-limit -1
+check_err "settle -1"           "settle"            "http://127.0.0.1:1/" -c 4 -t 1 -d 1s --settle -1
 
 # ── closed loop: no rate lines unless --rate ──
 out="$(HOME="$TMP" "$GCANNON" "http://127.0.0.1:$ANY_PORT/" -c 8 -t 1 -d 1s 2>&1)"

@@ -301,6 +301,7 @@ int main(int argc, char **argv)
     int addr_span = 1;        /* --addr-span: consecutive target addresses */
     int connect_limit = 0;    /* --connect-limit: first connects in flight per thread */
     int warmup_max_sec = WARMUP_MAX_MS / 1000;
+    int settle_sec = 0;
     const char *ws_message = "hello";
     const char *url = NULL;
     const char *raw_files = NULL;
@@ -352,6 +353,8 @@ int main(int argc, char **argv)
             connect_limit = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--warmup-max") == 0 && i + 1 < argc) {
             warmup_max_sec = parse_duration(argv[++i]);
+        } else if (strcmp(argv[i], "--settle") == 0 && i + 1 < argc) {
+            settle_sec = parse_duration(argv[++i]);
         } else if (strcmp(argv[i], "--version") == 0) {
             printf("gcannon %s\n", GCANNON_VERSION);
             return 0;
@@ -366,7 +369,7 @@ int main(int argc, char **argv)
                             "[--ws [--ws-msg <message>]] [--tui] [--json] [-b <buckets>] "
                             "[--recv-buf <bytes>] [--cqe-latency] [--rate <req/s>] "
                             "[--addr-span <n>] [--connect-limit <n>] "
-                            "[--warmup-max <duration>] [--version]\n");
+                            "[--warmup-max <duration>] [--settle <duration>] [--version]\n");
             return 1;
         }
     }
@@ -432,6 +435,10 @@ int main(int argc, char **argv)
     }
     if (warmup_max_sec < 1) {
         fprintf(stderr, "Error: --warmup-max must be at least 1 second\n");
+        return 1;
+    }
+    if (settle_sec < 0) {
+        fprintf(stderr, "Error: --settle must not be negative (got %d)\n", settle_sec);
         return 1;
     }
 
@@ -734,6 +741,27 @@ int main(int argc, char **argv)
                 break;
             }
             nanosleep(&(struct timespec){ .tv_sec = 0, .tv_nsec = 1000000 }, NULL); /* 1ms */
+        }
+    }
+
+    /* --settle: keep the load running this much longer once every connection
+     * is up, and only then open the window. A fleet of millions takes a
+     * server a while to absorb - accepts still queued, a first garbage
+     * collection after allocating for all of them - and without a settle the
+     * window opens on that backlog and describes the tail of the connect
+     * phase rather than the steady state. Ctrl-C ends it like the warmup. */
+    if (settle_sec > 0 && g_running) {
+        if (rate > 0)
+            fprintf(stderr, "gcannon: all connections up, settling for %ds\n", settle_sec);
+        struct timespec settle_start, now;
+        clock_gettime(CLOCK_MONOTONIC, &settle_start);
+        for (;;) {
+            if (!g_running) break;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            const long waited_ms = (now.tv_sec - settle_start.tv_sec) * 1000L
+                                 + (now.tv_nsec - settle_start.tv_nsec) / 1000000L;
+            if (waited_ms >= (long)settle_sec * 1000L) break;
+            nanosleep(&(struct timespec){ .tv_sec = 0, .tv_nsec = 50000000L }, NULL); /* 50ms */
         }
     }
 
