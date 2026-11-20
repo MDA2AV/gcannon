@@ -269,6 +269,7 @@ static void *worker_thread(void *arg)
                 ctx->interval_ns, ctx->epoch_ns, ctx->total_conns,
                 ctx->connect_limit, &g_running);
     worker_loop(&ctx->worker);
+    worker_close_all(&ctx->worker);
     return NULL;
 }
 
@@ -838,8 +839,19 @@ int main(int argc, char **argv)
     for (int i = 0; i < num_threads; i++)
         pthread_join(threads[i], NULL);
 
-    struct timespec end_time;
-    clock_gettime(CLOCK_MONOTONIC, &end_time);
+    /* The window ends when the last worker stopped counting, not at the join:
+       each worker closes its own connections before it returns, and that
+       teardown is no part of the measurement */
+    struct timespec end_time = ctxs[0].worker.stopped_at;
+    for (int i = 1; i < num_threads; i++) {
+        const struct timespec *t = &ctxs[i].worker.stopped_at;
+        if (t->tv_sec > end_time.tv_sec ||
+            (t->tv_sec == end_time.tv_sec && t->tv_nsec > end_time.tv_nsec))
+            end_time = *t;
+    }
+    if (end_time.tv_sec < start_time.tv_sec ||
+        (end_time.tv_sec == start_time.tv_sec && end_time.tv_nsec < start_time.tv_nsec))
+        clock_gettime(CLOCK_MONOTONIC, &end_time);
     double elapsed = (end_time.tv_sec - start_time.tv_sec)
                    + (end_time.tv_nsec - start_time.tv_nsec) / 1e9;
 

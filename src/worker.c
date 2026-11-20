@@ -816,6 +816,7 @@ void worker_loop(worker_t *w)
          * returns > 0, so a check gated on `got == 0` never fires and the
          * worker spins past shutdown. */
         if (!*w->running) {
+            clock_gettime(CLOCK_MONOTONIC, &w->stopped_at);
             /* How many connections were still open at the end: --rate
                reports it, since a connection that dropped and never came
                back sends nothing and would otherwise show only as rate. */
@@ -1178,6 +1179,69 @@ void worker_loop(worker_t *w)
 
         io_uring_cq_advance(&w->ring, got);
         io_uring_submit(&w->ring);
+    }
+}
+
+/* ── teardown ──────────────────────────────────────────────────────── */
+
+/* Reap completions until none arrives for 10 ms, or the deadline passes. The
+   requests complete as task work this thread runs while it waits
+   (DEFER_TASKRUN). Returns how many it reaped. */
+static unsigned drain_quiet(worker_t *w, const uint64_t deadline_ns)
+{
+    unsigned total = 0;
+    while (now_ns() < deadline_ns) {
+        struct io_uring_cqe *cqe;
+        struct __kernel_timespec ts = { .tv_sec = 0, .tv_nsec = 10000000 }; /* 10ms */
+        const int ret = io_uring_submit_and_wait_timeout(&w->ring, &cqe, 1, &ts, NULL);
+        unsigned head, seen = 0;
+        io_uring_for_each_cqe(&w->ring, head, cqe)
+            seen++;
+        io_uring_cq_advance(&w->ring, seen);
+        total += seen;
+        if (seen == 0 && ret != -EINTR)
+            break;
+    }
+    return total;
+}
+
+/* Close every connection from this worker's own thread, before it returns.
+ *
+ * worker_destroy's close() runs on main while each socket's multishot recv
+ * still holds a reference to it, so it closes nothing: the sockets outlive
+ * gcannon, until the kernel tears the ring down after exit and closes them one
+ * by one on a single kernel worker. Unnoticeable at a few thousand
+ * connections; at five million it took minutes, and the host was still closing
+ * one run's fleet while the next run connected its own.
+ *
+ * So the requests are ended first: shutdown(SHUT_RD) wakes each socket's recv
+ * (or connect, or handshake poll) to complete, sending nothing on the wire,
+ * and reaping the completions drops their references. A recv that finds a
+ * response still arriving delivers it and stays armed instead, with that
+ * wakeup spent, so the round repeats until one completes nothing. The close()
+ * below is then each socket's last, and the socket is closed here - FIN, or
+ * RST under SO_LINGER 0, as before - by every worker at once.
+ *
+ * Bounded: a request that never completes delays the exit, never hangs it,
+ * and its socket is closed the old way. (IORING_ASYNC_CANCEL_ALL ends them
+ * too, but the kernel searches the ring afresh for every request it cancels:
+ * 40K took 11 s.) */
+void worker_close_all(worker_t *w)
+{
+    const uint64_t give_up = now_ns() + 5000000000ULL;   /* 5 s */
+    for (int round = 0; round < 8 && now_ns() < give_up; round++) {
+        for (int i = 0; i < w->num_conns; i++)
+            if (w->conns[i].fd >= 0)
+                shutdown(w->conns[i].fd, SHUT_RD);
+        if (drain_quiet(w, give_up) == 0)
+            break;
+    }
+
+    for (int i = 0; i < w->num_conns; i++) {
+        if (w->conns[i].fd >= 0) {
+            close(w->conns[i].fd);
+            w->conns[i].fd = -1;
+        }
     }
 }
 

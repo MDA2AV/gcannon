@@ -116,6 +116,10 @@ typedef struct worker {
                                                     zeroes its own stats and clears */
     _Atomic int               conns_settled;     /* conns whose first setup attempt
                                                     finished; main waits on it */
+    struct timespec           stopped_at;        /* when the loop stopped counting:
+                                                    main ends the window at the
+                                                    latest, so worker_close_all's
+                                                    teardown is not in it */
     int                       id;
 
     /* --rate: every connection sends one request per interval_ns, its first
@@ -151,6 +155,9 @@ void worker_init(worker_t *w, int id,
 
 /* Main event loop — blocks until *running == 0 */
 void worker_loop(worker_t *w);
+
+/* Close every connection from the worker's own thread, after worker_loop */
+void worker_close_all(worker_t *w);
 
 /* Cleanup */
 void worker_destroy(worker_t *w);

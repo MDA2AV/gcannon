@@ -2,7 +2,7 @@
 
 #include <stdint.h>
 
-#define GCANNON_VERSION "0.8.2"
+#define GCANNON_VERSION "0.8.3"
 
 /* ── User-data packing (64-bit: [kind:16][gen:16][conn_idx:32]) ───── */
 
