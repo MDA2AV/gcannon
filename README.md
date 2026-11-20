@@ -56,7 +56,7 @@ gcannon http://localhost:8080 --raw get.raw,post.raw -c 256 -t 4 -d 5s
 | `--per-tpl-latency` | | Per-template latency histograms (with `--raw` and multiple templates) |
 | `--rate` | closed loop | Fixed total request rate (req/s), paced per connection; latency counts from each request's scheduled time. Needs `-p 1` and no `-r`. See [Fixed-rate mode](#fixed-rate-mode---rate) |
 | `--addr-span` | 1 | Spread connections over N consecutive IPv4 addresses from the target's (`127.0.0.1`, `.2`, ...): one source address holds at most ~64K connections to one destination |
-| `--connect-limit` | all at once | First connection attempts in flight per thread; each completion starts the next |
+| `--connect-limit` | all at once | First connection attempts in flight per thread, over `https://` until the TLS handshake is done; each one that finishes starts the next |
 | `--warmup-max` | 10s | Longest the warmup waits for connections to settle before measuring anyway |
 | `--settle` | 0 | How long the load keeps running after every connection is up before the window opens |
 | `--version` | | Print the version and exit |
@@ -180,7 +180,7 @@ Output adds three lines (and a `rate` block plus `connections_active` in `--json
 
 On stderr, `--rate` prints `gcannon: warmup done, measuring for <N>s` when the window opens and `gcannon: measurement done` when it closes, before any connection is torn down, so a wrapper can sample something else (a server's cgroup CPU, say) over exactly the measured window.
 
-A large fleet needs `--addr-span` (one source address holds ~64K connections to one destination, so a server listening on `0.0.0.0` takes a million spread over 32 loopback addresses), `--connect-limit` (a million SYNs at once overflow any listen backlog, and every retry costs seconds), and a `--warmup-max` long enough to open them all. `--settle` then keeps the load running a while longer before the window opens (stderr: `gcannon: all connections up, settling for <N>s`): a server that has just accepted millions of connections can still be working through its accept backlog, or collecting garbage for the first time, and the window should measure what comes after.
+A large fleet needs `--addr-span` (one source address holds ~64K connections to one destination, so a server listening on `0.0.0.0` takes a million spread over 32 loopback addresses), `--connect-limit` (a million SYNs at once overflow any listen backlog, and every retry costs seconds; over `https://` a connection counts until its handshake is done, so a server is never handed more handshakes than it finishes, which would wait past its handshake timeout and be closed), and a `--warmup-max` long enough to open them all. `--settle` then keeps the load running a while longer before the window opens (stderr: `gcannon: all connections up, settling for <N>s`): a server that has just accepted millions of connections can still be working through its accept backlog, or collecting garbage for the first time, and the window should measure what comes after.
 
 When the window closes, every worker closes its own connections before gcannon exits, all workers at once, so the fleet is gone by the time gcannon returns (5 million held connections were otherwise left to the kernel, which closed them one at a time for minutes after exit). A run that follows straight away, or a server stopped right after, finds no half-closed fleet in the way. The teardown is not part of the window: `elapsed_sec` ends when the last worker stopped counting.
 
