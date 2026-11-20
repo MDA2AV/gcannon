@@ -300,7 +300,8 @@ int main(int argc, char **argv)
     int hist_buckets = 0; /* 0 = default (10) */
     double rate = 0;          /* --rate: total req/s; 0 = closed loop */
     int addr_span = 1;        /* --addr-span: consecutive target addresses */
-    int connect_limit = 0;    /* --connect-limit: first connects in flight per thread */
+    int connect_limit = 0;    /* --connect-limit: first attempts in flight per thread
+                                 (for https, through the handshake) */
     int warmup_max_sec = WARMUP_MAX_MS / 1000;
     int settle_sec = 0;
     const char *ws_message = "hello";

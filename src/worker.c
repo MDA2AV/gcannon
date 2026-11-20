@@ -412,19 +412,38 @@ static int start_connect(worker_t *w, const int conn_idx)
 }
 
 /* --connect-limit: start connections not yet started while fewer than the
-   limit have a first attempt in flight. Each first-attempt completion frees
-   a slot (UD_CONNECT); later reconnects are not counted. */
+   limit have a first attempt in flight. A first attempt holds its slot until
+   it is over (connect_slot_free): the connection is ready for requests, or it
+   failed. Later reconnects are not counted. */
 static void connect_fill(worker_t *w)
 {
     while (w->connect_next < w->num_conns &&
            w->connect_inflight < w->connect_limit && *w->running) {
-        if (start_connect(w, w->connect_next++))
+        const int idx = w->connect_next++;
+        if (start_connect(w, idx)) {
+            w->conns[idx].holds_slot = 1;
             w->connect_inflight++;
+        }
     }
 }
 
-static void connect_fill_after(worker_t *w)
+/* The connection's first attempt is over, so its slot goes to the next
+ * connection not yet started.
+ *
+ * Over, for https, means the handshake has finished, not the TCP connect. The
+ * kernel completes a TCP connect on its own, at once, whatever the server is
+ * doing; a server finishes handshakes at the rate its CPU signs them. Freeing
+ * the slot at the TCP connect let a thread start connections as fast as the
+ * kernel accepted them, while their handshakes queued at the server faster
+ * than it could finish them, until the ones at the back outlived the server's
+ * handshake timeout (ioxide and Kestrel 10 s, actix 3 s) and were closed:
+ * "TLS handshake failed: unexpected eof while reading", and a retry that queued
+ * again. Held to the end of the handshake, a slot caps what one thread can have
+ * waiting at the server at --connect-limit handshakes. */
+static void connect_slot_free(worker_t *w, gc_conn_t *c)
 {
+    if (!c->holds_slot) return;
+    c->holds_slot = 0;
     if (w->connect_inflight > 0) w->connect_inflight--;
     connect_fill(w);
 }
@@ -456,6 +475,7 @@ static void close_conn(worker_t *w, gc_conn_t *c, const int conn_idx)
 static void reconnect(worker_t *w, const int conn_idx)
 {
     conn_settle(w, &w->conns[conn_idx]);   /* a failed first attempt counts */
+    connect_slot_free(w, &w->conns[conn_idx]);
     close_conn(w, &w->conns[conn_idx], conn_idx);
     w->stats.reconnects++;
     if (*w->running)
@@ -466,6 +486,7 @@ static void reconnect(worker_t *w, const int conn_idx)
    WebSocket upgrade or the first pipeline. */
 static void conn_ready(worker_t *w, gc_conn_t *c, const int conn_idx)
 {
+    connect_slot_free(w, c);
     arm_recv_multishot(w, conn_idx);
     if (w->ws_mode) {
         c->state = CONN_WS_UPGRADING;
@@ -777,9 +798,10 @@ void worker_init(worker_t *w,
     }
 
     /* Start the connections: all at once, or with --connect-limit only that
-       many first attempts in flight, each completion starting the next (see
-       UD_CONNECT). A million SYNs at once overflow any listen backlog, and
-       the retries that follow cost seconds each. */
+       many first attempts in flight, each one that is over starting the next
+       (connect_slot_free). A million SYNs at once overflow any listen backlog,
+       and the retries that follow cost seconds each; a million handshakes at
+       once outlast any handshake timeout. */
     if (connect_limit > 0) {
         connect_fill(w);
     } else {
@@ -894,9 +916,8 @@ void worker_loop(worker_t *w)
             switch (kind) {
 
             case UD_CONNECT: {
-                /* --connect-limit: a first attempt finished either way */
-                if (w->connect_limit > 0 && cqe_gen == 1)
-                    connect_fill_after(w);
+                /* --connect-limit: the slot stays held through a TLS
+                   handshake; conn_ready or reconnect frees it */
                 if (res < 0) {
                     w->stats.connect_errors++;
                     reconnect(w, conn_idx);

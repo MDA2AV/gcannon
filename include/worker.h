@@ -59,6 +59,7 @@ typedef struct gc_conn {
     int              scratch_len;    /* allocated size of scratch_buf */
     uint64_t         rng_state;      /* xorshift64 state for RAND placeholders */
     int              settled;        /* first setup attempt finished (ready or failed) */
+    int              holds_slot;     /* --connect-limit: its first attempt is in flight */
     struct ssl_st   *ssl;            /* only while the TLS handshake runs */
     ktls_secrets_t   tls_secrets;    /* traffic secrets captured during it */
     /* --rate: when this connection's next request is due (CLOCK_MONOTONIC ns).

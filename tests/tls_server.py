@@ -14,6 +14,12 @@ a fixed 200 with a 2-byte body.
                       and drop it (0 = never)
   --garbage           not TLS at all: answer every connection with a plain
                       HTTP 400 and close, so the client's handshake fails
+  --handshake-delay MS
+                      hold every handshake back this long after the accept,
+                      like a server busy signing other handshakes, and print
+                      "PENDING_MAX <n>" when the first one finishes: how many
+                      accepted connections were waiting on a handshake at
+                      once until then
 
 Binds an ephemeral port and prints "PORT <n>" on stdout, then "SNI <name>"
 the first time each server name is seen.
@@ -24,12 +30,36 @@ import socket
 import ssl
 import sys
 import threading
+import time
 
 RESPONSE = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
 GARBAGE = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"
 
 _sni_lock = threading.Lock()
 _sni_seen = set()
+
+# --handshake-delay: connections accepted and not yet through their handshake
+_pending_lock = threading.Lock()
+_pending = 0
+_pending_max = 0
+_first_done = False
+
+
+def pending_add():
+    global _pending, _pending_max
+    with _pending_lock:
+        _pending += 1
+        if not _first_done:
+            _pending_max = max(_pending_max, _pending)
+
+
+def pending_done():
+    global _pending, _first_done
+    with _pending_lock:
+        _pending -= 1
+        if not _first_done:
+            _first_done = True
+            print("PENDING_MAX %d" % _pending_max, flush=True)
 
 
 def on_sni(_sslsock, name, _ctx):
@@ -44,7 +74,14 @@ def serve_conn(conn, ctx, args):
         if args.garbage:
             conn.sendall(GARBAGE)
             return
-        conn = ctx.wrap_socket(conn, server_side=True)
+        if args.handshake_delay:
+            time.sleep(args.handshake_delay / 1000.0)
+            try:
+                conn = ctx.wrap_socket(conn, server_side=True)
+            finally:
+                pending_done()
+        else:
+            conn = ctx.wrap_socket(conn, server_side=True)
         buf = b""
         served = 0
         while True:
@@ -82,6 +119,7 @@ def main():
     ap.add_argument("--key")
     ap.add_argument("--close-after", type=int, default=0)
     ap.add_argument("--garbage", action="store_true")
+    ap.add_argument("--handshake-delay", type=int, default=0)
     args = ap.parse_args()
 
     ctx = None
@@ -104,6 +142,8 @@ def main():
                 conn, _ = srv.accept()
             except socket.timeout:
                 continue
+            if args.handshake_delay:
+                pending_add()
             threading.Thread(target=serve_conn, args=(conn, ctx, args),
                              daemon=True).start()
     except KeyboardInterrupt:
