@@ -182,6 +182,8 @@ On stderr, `--rate` prints `gcannon: warmup done, measuring for <N>s` when the w
 
 A large fleet needs `--addr-span` (one source address holds ~64K connections to one destination, so a server listening on `0.0.0.0` takes a million spread over 32 loopback addresses), `--connect-limit` (a million SYNs at once overflow any listen backlog, and every retry costs seconds), and a `--warmup-max` long enough to open them all. `--settle` then keeps the load running a while longer before the window opens (stderr: `gcannon: all connections up, settling for <N>s`): a server that has just accepted millions of connections can still be working through its accept backlog, or collecting garbage for the first time, and the window should measure what comes after.
 
+When the window closes, every worker closes its own connections before gcannon exits, all workers at once, so the fleet is gone by the time gcannon returns (5 million held connections were otherwise left to the kernel, which closed them one at a time for minutes after exit). A run that follows straight away, or a server stopped right after, finds no half-closed fleet in the way. The teardown is not part of the window: `elapsed_sec` ends when the last worker stopped counting.
+
 ### HTTPS
 
 `https://` targets run over TLS 1.3. OpenSSL does the handshake, then the record keys go to kernel TLS (kTLS), which encrypts and decrypts on the socket itself. The io_uring hot path is the same as for `http://`, and every mode works over TLS: pipelining, `--raw`, placeholders, `-r` and `--ws`.
@@ -384,6 +386,7 @@ main thread
 worker thread
   io_uring ring + provided buffer ring
   for each connection: connect -> send(pipeline) -> recv -> count -> refill -> [reconnect]
+  at the end: shutdown(SHUT_RD) wakes every pending recv, reap, close its connections
 ```
 
 ## Building
