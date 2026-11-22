@@ -904,7 +904,10 @@ static void ramp_snapshot(worker_t *w)
     w->snap_at = now;
 }
 
-/* Do what main asked for (worker_t.ctl), then tell it so */
+/* Do what main asked for (worker_t.ctl), then tell it so. Never inlined: it
+   runs a few times a run, and inlined into worker_loop its locals pushed the
+   loop's own out of registers and onto the stack, on every completion. */
+__attribute__((noinline, cold))
 static void worker_ctl(worker_t *w, const int req)
 {
     if (req & CTL_SNAPSHOT)
