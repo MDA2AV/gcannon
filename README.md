@@ -59,6 +59,9 @@ gcannon http://localhost:8080 --raw get.raw,post.raw -c 256 -t 4 -d 5s
 | `--connect-limit` | all at once | First connection attempts in flight per thread, over `https://` until the TLS handshake is done; each one that finishes starts the next |
 | `--warmup-max` | 10s | Longest the warmup waits for connections to settle before measuring anyway |
 | `--settle` | 0 | How long the load keeps running after every connection is up before the window opens |
+| `--ramp-p99` | | Grow the connections a step at a time until p99 goes over this latency (`5ms`, `500us`, `1.5s`); `-c` is the ceiling, `-d` each step's window. See [Ramp to a p99 threshold](#ramp-to-a-p99-threshold---ramp-p99) |
+| `--ramp` | `-t` | The first step's connection count (with `--ramp-p99`) |
+| `--ramp-step` | `x2` | How the steps grow: `x<factor>` multiplies, `+<n>` adds (with `--ramp-p99`) |
 | `--version` | | Print the version and exit |
 | `--clear-history` | | Clear saved run history and exit |
 
@@ -183,6 +186,67 @@ On stderr, `--rate` prints `gcannon: warmup done, measuring for <N>s` when the w
 A large fleet needs `--addr-span` (one source address holds ~64K connections to one destination, so a server listening on `0.0.0.0` takes a million spread over 32 loopback addresses), `--connect-limit` (a million SYNs at once overflow any listen backlog, and every retry costs seconds; over `https://` a connection counts until its handshake is done, so a server is never handed more handshakes than it finishes, which would wait past its handshake timeout and be closed), and a `--warmup-max` long enough to open them all. `--settle` then keeps the load running a while longer before the window opens (stderr: `gcannon: all connections up, settling for <N>s`): a server that has just accepted millions of connections can still be working through its accept backlog, or collecting garbage for the first time, and the window should measure what comes after.
 
 When the window closes, every worker closes its own connections before gcannon exits, all workers at once, so the fleet is gone by the time gcannon returns (5 million held connections were otherwise left to the kernel, which closed them one at a time for minutes after exit). A run that follows straight away, or a server stopped right after, finds no half-closed fleet in the way. The teardown is not part of the window: `elapsed_sec` ends when the last worker stopped counting.
+
+### Ramp to a p99 threshold (`--ramp-p99`)
+
+```bash
+# From 64 connections, doubled every step, until p99 goes over 5 ms or the
+# fleet reaches 8192; each step measures for 5s
+gcannon http://localhost:8080/ -t 8 -c 8192 -d 5s --ramp 64 --ramp-p99 5ms
+```
+
+`--ramp-p99` finds how many connections a server takes before its p99 goes over a threshold. The fleet grows a step at a time and stays open in between. Each step opens its new connections, waits until they are up (like the warmup, within `--warmup-max`, then `--settle`), measures one `-d` window, and checks it. The ramp stops at the first step that fails, or at `-c`.
+
+- **Steps.** `--ramp <n>` is the first step's connection count (one per thread by default). `--ramp-step x2` (the default) multiplies it each step, `+256` adds to it. `-c` is the last step.
+- **p99 once per step, not per request.** Workers record latencies into their histograms as in any other run. As a window closes, each worker copies its stats out from its own thread, and main merges the copies and works out p99 from them. The per-request path doesn't change.
+- **What fails a step.** Its p99 is over the threshold, or:
+  - connections could not get a socket (`ulimit -n`);
+  - not all of them were set up within `--warmup-max`;
+  - there were no responses;
+  - a connection waited the whole window on a request the server never answered;
+  - responses had an unexpected status (`-s`);
+  - there were connect or read errors.
+
+  The unanswered-request check is there because a closed loop sends nothing more on a connection that is waiting. A server that never answers some connections (a full accept queue, say) leaves no latency sample for them, while the ones it does answer keep p99 low.
+- **A failing step is measured once more**, straight away, before the ramp stops, so one noisy window doesn't end it early. This doesn't apply when connections lost their sockets, since they never get them back.
+- **Doubling brackets the answer.** The limit lies between the last step that passed and the one that failed. To narrow it, run again from the passing count with `+n` steps.
+
+The step table prints as the ramp goes (on stderr with `--json`). Below it come the results of the last step that passed, or the last step if none did, and then a line that sums up. Here it runs against `tests/ramp_server.py --service-ms 2`, which answers one request at a time in 2 ms each, so p99 grows by about 2 ms per connection:
+
+```
+  Ramp:      from 1 connection, x2 per step, while p99 stays within 12.00ms
+
+     Conns      Req/s       p50       p90       p99     p99.9
+         1        474    2.11ms    2.14ms    2.25ms    2.34ms
+         2        472    4.22ms    4.28ms    4.35ms    4.52ms
+         4        472    8.45ms    8.56ms    8.78ms    9.06ms
+         8        473   16.80ms   17.00ms   17.30ms   17.40ms   p99 over 12.00ms, measuring again
+         8        473   16.80ms   17.00ms   17.50ms   17.70ms   p99 over 12.00ms
+
+  Thread Stats   Avg      p50      p90      p99    p99.9
+    Latency   8.45ms   8.45ms   8.56ms   8.78ms   9.06ms
+  ...
+  Ramp:       held p99 within 12.00ms up to 4 connections (p99 8.78ms); at 8, p99 over 12.00ms
+```
+
+`--json` describes that same step and adds a `ramp` block listing every window measured. From a run like the one above:
+
+```json
+  "ramp": {
+    "p99_max_us": 12000,
+    "max_connections": 4,
+    "stopped": "p99",
+    "steps": [
+      {"connections": 1, "set_up": 1, "active": 1, "elapsed_sec": 1.000, "responses": 479, "rps": 479.00, "latency_us": {"p50": 2079, "p90": 2121, "p99": 2177, "p999": 2230, "samples": 479}, "errors": 0, "unexpected": 0, "silent": 0, "dead": 0, "retry": false, "pass": true},
+      ...
+      {"connections": 8, "set_up": 8, "active": 8, "elapsed_sec": 1.000, "responses": 478, "rps": 477.93, "latency_us": {"p50": 16600, "p90": 16800, "p99": 16900, "p999": 17000, "samples": 478}, "errors": 0, "unexpected": 0, "silent": 0, "dead": 0, "retry": true, "pass": false, "fail": "p99"}
+    ]
+  }
+```
+
+`stopped` is the failing step's reason (`p99`, `errors`, `status`, `silent`, `responses`, `setup` or `sockets`), `ceiling`, or `interrupted` after Ctrl-C. `max_connections` is 0 when no step passed, and the exit code is then 1.
+
+The answer is the concurrency at which p99 holds in a closed loop. A stall there delays only the requests already sent, so it weighs less in p99 than it would for an open stream of requests, which is what `--rate` measures. `--rate` can't be combined with `--ramp-p99`, because it lays its send slots out for the whole fleet, and a fleet part of the way up would send in bursts. `--tui` can't be combined with it either.
 
 ### HTTPS
 
@@ -359,7 +423,7 @@ gcannon http://localhost:8080/ -c 512 -t 8 -d 10s --json
 }
 ```
 
-In WebSocket mode, additional `ws_upgrades` and `ws_frames` fields are included. Pipe to `jq` for filtering:
+In WebSocket mode, additional `ws_upgrades` and `ws_frames` fields are included. `--rate` adds a `rate` block, and `--ramp-p99` a `ramp` block (see [Ramp to a p99 threshold](#ramp-to-a-p99-threshold---ramp-p99)). Pipe to `jq` for filtering:
 
 ```bash
 gcannon http://localhost:8080/ -c 512 -t 8 -d 5s --json | jq '.rps'
@@ -381,6 +445,9 @@ Each worker thread runs an independent io_uring event loop with zero cross-threa
 main thread
   spawn N workers (warmup: >= 100ms and until every connection is set up;
                    reset stats, run for duration)
+  --ramp-p99: per step, open the step's connections, warm up, reset stats,
+              run for duration, have each worker copy its stats out, merge
+              them and check p99; repeat until a step fails or -c
   join, aggregate stats, print
 
 worker thread

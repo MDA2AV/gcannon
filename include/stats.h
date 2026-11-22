@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <stdio.h>
 #include "constants.h"
 
 /*
@@ -57,21 +58,80 @@ typedef struct worker_stats {
     uint64_t paced_sends;          /* requests sent on a schedule */
     uint64_t paced_late;           /* ...more than 1 ms after it */
     uint64_t paced_lag_max_us;     /* the largest schedule-to-send gap */
-    uint64_t conns_active;         /* connections open when the worker stopped */
+    uint64_t conns_active;         /* connections open when the worker stopped
+                                      (--ramp-p99: when the step's window closed) */
+    /* --ramp-p99 only, counted as a step's window closes */
+    uint64_t conns_dead;           /* opened connections left without a socket:
+                                      socket() failed, and they never retry */
+    uint64_t conns_silent;         /* connections still waiting, past the
+                                      threshold, on a request sent before the
+                                      window opened: no response all window */
 } worker_stats_t;
+
+/* --ramp-p99: how a step's window went. A step passes on RAMP_OK; anything
+   else fails it, checked in this order. The last two only end the ramp. */
+typedef enum {
+    RAMP_OK = 0,
+    RAMP_SOCKETS,       /* connections that could not get a socket */
+    RAMP_SETUP,         /* connections not set up within --warmup-max */
+    RAMP_RESPONSES,     /* no responses at all */
+    RAMP_SILENT,        /* connections with no response all window */
+    RAMP_STATUS,        /* responses with an unexpected status */
+    RAMP_ERRORS,        /* connect or read errors, refused WebSocket upgrades */
+    RAMP_P99,           /* p99 over the threshold */
+    RAMP_CEILING,       /* every step passed, up to -c */
+    RAMP_INTERRUPTED,   /* Ctrl-C */
+} ramp_verdict_t;
+
+typedef struct ramp_step {
+    int            connections;   /* the step's connection count */
+    int            set_up;        /* ...of which settled before the window opened */
+    int            retry;         /* the second window of a step whose first failed */
+    ramp_verdict_t verdict;
+    double         elapsed_sec;
+    uint64_t       responses;
+    uint64_t       samples;
+    uint64_t       p50_us, p90_us, p99_us, p999_us;
+    uint64_t       active;        /* connections open when the window closed */
+    uint64_t       dead;          /* see conns_dead */
+    uint64_t       silent;        /* see conns_silent */
+    uint64_t       errors;        /* connect + read errors + refused upgrades */
+    uint64_t       unexpected;    /* responses outside the expected status class */
+} ramp_step_t;
+
+typedef struct ramp_result {
+    uint64_t       p99_max_us;    /* the threshold */
+    ramp_step_t   *steps;         /* every window measured, in order */
+    int            num_steps;
+    int            best;          /* the last step that passed, -1 if none did */
+    ramp_verdict_t stop;          /* why the ramp ended */
+} ramp_result_t;
 
 void stats_record_latency(worker_stats_t *s, uint64_t latency_us);
 void hist_record(latency_hist_t *h, uint64_t latency_us);
 void hist_merge(latency_hist_t *dst, const latency_hist_t *src);
 uint64_t hist_percentile(const latency_hist_t *h, double pct);
 void stats_merge(worker_stats_t *dst, const worker_stats_t *src);
+/* Zero s, keeping its per-template histograms (zeroed too) */
+void stats_clear(worker_stats_t *s);
+/* Copy src into dst, per-template histograms included, into dst's own */
+void stats_copy(worker_stats_t *dst, const worker_stats_t *src);
 uint64_t stats_percentile(const worker_stats_t *s, double pct);
 void stats_print(const worker_stats_t *s, double elapsed_sec, int num_templates,
                  int ws_mode);
+/* ramp is NULL except for --ramp-p99, whose steps it adds */
 void stats_print_json(const worker_stats_t *s, double elapsed_sec,
                       int num_templates, int ws_mode,
                       const char *target, int num_connections, int num_threads,
-                      int pipeline_depth, int duration_sec, double target_rate);
+                      int pipeline_depth, int duration_sec, double target_rate,
+                      const ramp_result_t *ramp);
 /* --rate only: target vs achieved rate, schedule lag, connections still open */
 void stats_print_rate(const worker_stats_t *s, double elapsed_sec,
                       double target_rate, int num_connections);
+
+/* --ramp-p99: the plan for the banner, the step table (a header, then one
+   line per window as it is measured) and the outcome after the results */
+void ramp_print_plan(int start, double factor, int increment, uint64_t p99_max_us);
+void ramp_print_header(FILE *out);
+void ramp_print_step(FILE *out, const ramp_step_t *st, uint64_t p99_max_us, int again);
+void ramp_print_result(const ramp_result_t *r);

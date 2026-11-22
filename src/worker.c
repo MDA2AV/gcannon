@@ -5,6 +5,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <limits.h>
 #include <sys/socket.h>
 #include <netinet/tcp.h>
 #include <fcntl.h>
@@ -411,14 +412,17 @@ static int start_connect(worker_t *w, const int conn_idx)
     return 1;
 }
 
-/* --connect-limit: start connections not yet started while fewer than the
-   limit have a first attempt in flight. A first attempt holds its slot until
-   it is over (connect_slot_free): the connection is ready for requests, or it
-   failed. Later reconnects are not counted. */
+/* Start connections not yet started, in index order, up to conn_target (the
+   step's share under --ramp-p99, every connection otherwise), and with
+   --connect-limit only while fewer than the limit have a first attempt in
+   flight. A first attempt holds its slot until it is over (connect_slot_free):
+   the connection is ready for requests, or it failed. Later reconnects are not
+   counted. */
 static void connect_fill(worker_t *w)
 {
-    while (w->connect_next < w->num_conns &&
-           w->connect_inflight < w->connect_limit && *w->running) {
+    const int limit = w->connect_limit > 0 ? w->connect_limit : INT_MAX;
+    while (w->connect_next < w->conn_target &&
+           w->connect_inflight < limit && *w->running) {
         const int idx = w->connect_next++;
         if (start_connect(w, idx)) {
             w->conns[idx].holds_slot = 1;
@@ -663,6 +667,8 @@ void worker_init(worker_t *w,
                  const uint64_t epoch_ns,
                  const int total_conns,
                  const int connect_limit,
+                 const int conn_target,
+                 const uint64_t ramp_p99_us,
                  volatile int *running)
 {
     memset(w, 0, sizeof(*w));
@@ -680,6 +686,9 @@ void worker_init(worker_t *w,
     w->epoch_ns          = epoch_ns;
     w->total_conns       = total_conns > 0 ? total_conns : num_conns;
     w->connect_limit     = connect_limit;
+    w->conn_target       = conn_target > 0 && conn_target < num_conns
+                         ? conn_target : num_conns;
+    w->ramp_p99_us       = ramp_p99_us;
     w->templates         = templates;
     w->num_templates     = num_templates;
     w->pipeline_depth    = pipeline_depth;
@@ -698,6 +707,23 @@ void worker_init(worker_t *w,
     if (per_tpl_latency && num_templates > 1) {
         w->stats.tpl_latency = calloc(num_templates, sizeof(latency_hist_t));
         w->stats.num_tpl_latency = num_templates;
+    }
+
+    if (ramp_p99_us) {
+        /* What main reads at the end of each step (CTL_SNAPSHOT) */
+        w->snap = calloc(1, sizeof(*w->snap));
+        if (!w->snap) {
+            fprintf(stderr, "[w%d] calloc: out of memory\n", id);
+            exit(1);
+        }
+        if (w->stats.tpl_latency) {
+            w->snap->tpl_latency = calloc(num_templates, sizeof(latency_hist_t));
+            if (!w->snap->tpl_latency) {
+                fprintf(stderr, "[w%d] calloc: out of memory\n", id);
+                exit(1);
+            }
+            w->snap->num_tpl_latency = num_templates;
+        }
     }
 
     if (ws_mode && ws_host) {
@@ -801,8 +827,9 @@ void worker_init(worker_t *w,
        many first attempts in flight, each one that is over starting the next
        (connect_slot_free). A million SYNs at once overflow any listen backlog,
        and the retries that follow cost seconds each; a million handshakes at
-       once outlast any handshake timeout. */
-    if (connect_limit > 0) {
+       once outlast any handshake timeout. --ramp-p99 starts only the first
+       step's, and CTL_GROW the rest. */
+    if (connect_limit > 0 || w->conn_target < num_conns) {
         connect_fill(w);
     } else {
         for (int i = 0; i < num_conns; i++)
@@ -828,6 +855,70 @@ static inline int ktls_read_error(const int res)
     }
 }
 
+/* Zero the stats as a window opens. WebSocket upgrades happen before it, so
+   their counts are kept for the results. */
+static void stats_window_reset(worker_t *w)
+{
+    const uint64_t ws      = w->stats.ws_upgrades;
+    const uint64_t ws_fail = w->stats.ws_upgrade_failures;
+    stats_clear(&w->stats);
+    w->stats.ws_upgrades = ws;
+    w->stats.ws_upgrade_failures = ws_fail;
+    w->ws_fail_base = ws_fail;
+    clock_gettime(CLOCK_MONOTONIC, &w->window_start);
+}
+
+/* --ramp-p99: copy the stats out for main as a step's window closes, with
+ * what only this thread can see: how many connections are open, how many
+ * lost their socket, and how many have had no response all window.
+ *
+ * That last one is what a p99 can't show. A closed loop sends nothing more on
+ * a connection that is waiting, so a request the server never answers (a
+ * full accept queue, a stalled worker) leaves no latency sample at all: the
+ * connections still answered keep p99 low while the rest sit idle. A
+ * connection counts once its oldest request has waited past both the window
+ * and the threshold, so a slow but answered request never does. */
+static void ramp_snapshot(worker_t *w)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    const uint64_t window_us = timespec_diff_us(&w->window_start, &now);
+    const uint64_t silent_us = window_us > w->ramp_p99_us ? window_us : w->ramp_p99_us;
+
+    worker_stats_t *s = w->snap;
+    stats_copy(s, &w->stats);
+    s->ws_upgrade_failures -= w->ws_fail_base;   /* refused in this window */
+    s->conns_active = s->conns_dead = s->conns_silent = 0;
+    for (int i = 0; i < w->connect_next; i++) {
+        const gc_conn_t *c = &w->conns[i];
+        if (c->state == CONN_ACTIVE) {
+            s->conns_active++;
+            if (c->send_time_head < c->send_time_tail &&
+                timespec_diff_us(&c->send_times[c->send_time_head % PIPELINE_DEPTH_MAX],
+                                 &now) > silent_us)
+                s->conns_silent++;
+        } else if (c->state == CONN_CLOSED) {
+            s->conns_dead++;   /* socket() failed, so it never retries */
+        }
+    }
+    w->snap_at = now;
+}
+
+/* Do what main asked for (worker_t.ctl), then tell it so */
+static void worker_ctl(worker_t *w, const int req)
+{
+    if (req & CTL_SNAPSHOT)
+        ramp_snapshot(w);
+    if (req & CTL_RESET)
+        stats_window_reset(w);
+    if (req & CTL_GROW) {
+        const int next = w->conn_target_next;
+        w->conn_target = next < w->num_conns ? next : w->num_conns;
+        connect_fill(w);
+    }
+    atomic_fetch_and_explicit(&w->ctl, ~req, memory_order_release);
+}
+
 void worker_loop(worker_t *w)
 {
     struct io_uring_cqe *cqes[BATCH_CQES];
@@ -851,24 +942,16 @@ void worker_loop(worker_t *w)
             break;
         }
 
-        /* Warmup reset: zero our own stats from this thread. Doing it from the
+        /* Main's requests: zero our own stats as the window opens, and for
+         * --ramp-p99 copy them out as a step's window closes, or open the next
+         * step's connections. Done here, on this thread: zeroing them from the
          * main thread (as before) raced with these same counters being
-         * incremented here — a concurrent memset vs ++ is undefined behavior. */
-        if (w->reset_request) {
-            latency_hist_t *saved_tpl = w->stats.tpl_latency;
-            int saved_n = w->stats.num_tpl_latency;
-            uint64_t saved_ws      = w->stats.ws_upgrades;
-            uint64_t saved_ws_fail = w->stats.ws_upgrade_failures;
-            memset(&w->stats, 0, sizeof(w->stats));
-            if (saved_tpl) {
-                memset(saved_tpl, 0, (size_t)saved_n * sizeof(latency_hist_t));
-                w->stats.tpl_latency = saved_tpl;
-                w->stats.num_tpl_latency = saved_n;
-            }
-            w->stats.ws_upgrades = saved_ws;
-            w->stats.ws_upgrade_failures = saved_ws_fail;
-            w->reset_request = 0;
-        }
+         * incremented here — a concurrent memset vs ++ is undefined behavior.
+         * One load per loop iteration, not per request; p99 itself is worked
+         * out by main from the copy, once per step. */
+        const int ctl = atomic_load_explicit(&w->ctl, memory_order_acquire);
+        if (__builtin_expect(ctl != 0, 0))
+            worker_ctl(w, ctl);
 
         /* --rate: send what has come due */
         if (w->interval_ns) {
@@ -1285,4 +1368,8 @@ void worker_destroy(worker_t *w)
     free(w->conns);
     free(w->stats.tpl_latency);
     free(w->pace_heap);
+    if (w->snap) {
+        free(w->snap->tpl_latency);
+        free(w->snap);
+    }
 }
