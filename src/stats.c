@@ -279,12 +279,13 @@ void stats_print(const worker_stats_t *s, double elapsed_sec, int num_templates,
 }
 
 static void ramp_print_json(const ramp_result_t *r);
+static void timeline_print_json(const timeline_t *t);
 
 void stats_print_json(const worker_stats_t *s, double elapsed_sec,
                       int num_templates, int ws_mode,
                       const char *target, int num_connections, int num_threads,
                       int pipeline_depth, int duration_sec, double target_rate,
-                      const ramp_result_t *ramp)
+                      const ramp_result_t *ramp, const timeline_t *timeline)
 {
     const uint64_t avg_us = s->latency_count
                             ? s->latency_sum_us / s->latency_count : 0;
@@ -372,6 +373,8 @@ void stats_print_json(const worker_stats_t *s, double elapsed_sec,
     /* --ramp-p99 only, like the rate block */
     if (ramp)
         ramp_print_json(ramp);
+    if (timeline)
+        timeline_print_json(timeline);
 
     printf("\n}\n");
 }
@@ -547,4 +550,224 @@ static void ramp_print_json(const ramp_result_t *r)
         printf("}");
     }
     printf("\n    ]\n  }");
+}
+
+/* ── --ramp-up and --idle ──────────────────────────────────────────── */
+
+void idle_age_record(idle_stats_t *s, const uint64_t age_us)
+{
+    if (!s->age_count || age_us < s->age_min_us) s->age_min_us = age_us;
+    if (!s->age_count || age_us > s->age_max_us) s->age_max_us = age_us;
+    s->age_count++;
+    const uint64_t bucket = age_us / IDLE_AGE_STEP_US;
+    if (bucket < IDLE_AGE_BUCKETS) s->age_hist[bucket]++;
+    else                           s->age_overflow++;
+}
+
+/* The age under which pct of the closes fell, within 100 ms. */
+uint64_t idle_age_percentile(const idle_stats_t *s, const double pct)
+{
+    if (!s->age_count) return 0;
+    const uint64_t target = (uint64_t)(s->age_count * pct);
+    uint64_t cumulative = 0;
+    for (int i = 0; i < IDLE_AGE_BUCKETS; i++) {
+        cumulative += s->age_hist[i];
+        if (cumulative > target) {
+            uint64_t us = (uint64_t)i * IDLE_AGE_STEP_US + IDLE_AGE_STEP_US / 2;
+            if (us < s->age_min_us) us = s->age_min_us;
+            if (us > s->age_max_us) us = s->age_max_us;
+            return us;
+        }
+    }
+    return s->age_max_us;
+}
+
+void idle_stats_merge(idle_stats_t *dst, const idle_stats_t *src)
+{
+    dst->c.opened         += src->c.opened;
+    dst->c.answered       += src->c.answered;
+    dst->c.open_now       += src->c.open_now;
+    dst->c.closed         += src->c.closed;
+    dst->c.failed         += src->c.failed;
+    dst->c.connect_errors += src->c.connect_errors;
+    dst->c.read_errors    += src->c.read_errors;
+    dst->c.bad_status     += src->c.bad_status;
+    dst->c.unsolicited    += src->c.unsolicited;
+    if (src->age_count) {
+        if (!dst->age_count || src->age_min_us < dst->age_min_us)
+            dst->age_min_us = src->age_min_us;
+        if (!dst->age_count || src->age_max_us > dst->age_max_us)
+            dst->age_max_us = src->age_max_us;
+        dst->age_count += src->age_count;
+    }
+    for (int i = 0; i < IDLE_AGE_BUCKETS; i++)
+        dst->age_hist[i] += src->age_hist[i];
+    dst->age_overflow += src->age_overflow;
+    hist_merge(&dst->first, &src->first);
+}
+
+static void format_seconds(char *buf, const size_t sz, const uint64_t us)
+{
+    snprintf(buf, sz, "%.1fs", us / 1e6);
+}
+
+void timeline_print_plan(const timeline_t *t)
+{
+    if (t->ramp_sec > 0)
+        printf("  Ramp-up:   from %d to %d active connections over %ds\n",
+               t->floor, t->num_active, t->ramp_sec);
+    if (t->num_idle > 0)
+        printf("  Idle:      %d of %d connections (%.1f%%), one request each%s\n",
+               t->num_idle, t->total_conns, 100.0 * t->num_idle / t->total_conns,
+               t->ramp_sec > 0 ? "" : ", opened when the window does");
+}
+
+void timeline_print_header(FILE *out, const int has_idle)
+{
+    if (has_idle)
+        fprintf(out, "  %7s  %8s  %8s  %8s  %8s  %9s  %8s  %8s  %8s\n",
+                "Time", "Active", "Idle", "Opened", "Closed", "Req/s", "p50", "p99", "p99.9");
+    else
+        fprintf(out, "  %7s  %8s  %9s  %8s  %8s  %8s\n",
+                "Time", "Active", "Req/s", "p50", "p99", "p99.9");
+    fflush(out);
+}
+
+void timeline_print_row(FILE *out, const timeline_row_t *r, const int has_idle)
+{
+    char time[32], active[32], idle[32], opened[32], closed[32];
+    char rps[32], p50[32], p99[32], p999[32];
+    snprintf(time, sizeof(time), "%.1fs", r->t);
+    format_count(active, sizeof(active), r->open_active);
+    format_count(rps, sizeof(rps), (uint64_t)r->rps);
+    format_latency(p50,  sizeof(p50),  r->p50_us);
+    format_latency(p99,  sizeof(p99),  r->p99_us);
+    format_latency(p999, sizeof(p999), r->p999_us);
+    if (has_idle) {
+        format_count(idle,   sizeof(idle),   r->open_idle);
+        format_count(opened, sizeof(opened), r->opened);
+        format_count(closed, sizeof(closed), r->closed);
+        fprintf(out, "  %7s  %8s  %8s  %8s  %8s  %9s  %8s  %8s  %8s",
+                time, active, idle, opened, closed, rps, p50, p99, p999);
+        if (r->failed)
+            fprintf(out, "   %lu failed", r->failed);
+    } else {
+        fprintf(out, "  %7s  %8s  %9s  %8s  %8s  %8s",
+                time, active, rps, p50, p99, p999);
+    }
+    fprintf(out, "\n");
+    fflush(out);
+}
+
+static void phase_print(const char *label, const timeline_phase_t *p)
+{
+    char rps[32], p50[32], p99[32], p999[32];
+    format_count(rps, sizeof(rps), (uint64_t)p->rps);
+    format_latency(p50,  sizeof(p50),  p->p50_us);
+    format_latency(p99,  sizeof(p99),  p->p99_us);
+    format_latency(p999, sizeof(p999), p->p999_us);
+    printf("%s %.0fs: %s req/s, p50 %s, p99 %s, p99.9 %s", label, p->sec, rps, p50, p99, p999);
+}
+
+void timeline_print_result(const timeline_t *t)
+{
+    if (t->has_ramp || t->has_hold) {
+        printf("  Phases:     ");
+        if (t->has_ramp) phase_print("ramp", &t->ramp);
+        if (t->has_ramp && t->has_hold) printf("; ");
+        if (t->has_hold) phase_print(t->has_ramp ? "after" : "all", &t->hold);
+        printf("\n");
+    }
+    const idle_stats_t *m = t->merged;
+    if (!m || t->num_idle <= 0) return;
+    const idle_counts_t *c = &m->c;
+    char p50[32], p99[32];
+    printf("  Idle:       %d asked for, %lu opened, %lu answered, %lu failed",
+           t->num_idle, c->opened, c->answered, c->failed);
+    if (c->connect_errors || c->read_errors)
+        printf(" (connect %lu, read %lu)", c->connect_errors, c->read_errors);
+    if (t->pending)
+        printf(", %lu not opened by the end", t->pending);
+    const uint64_t lost = c->failed - (c->connect_errors < c->failed ? c->connect_errors : c->failed);
+    const uint64_t waiting = c->opened > c->answered + lost ? c->opened - c->answered - lost : 0;
+    if (waiting)
+        printf(", %lu still waiting for their response", waiting);
+    printf("\n");
+    if (m->first.count) {
+        format_latency(p50, sizeof(p50), hist_percentile(&m->first, 0.50));
+        format_latency(p99, sizeof(p99), hist_percentile(&m->first, 0.99));
+        printf("              first response p50 %s, p99 %s\n", p50, p99);
+    }
+    if (c->closed) {
+        char first[32], med[32], last[32];
+        format_seconds(first, sizeof(first), m->age_min_us);
+        format_seconds(med,   sizeof(med),   idle_age_percentile(m, 0.50));
+        format_seconds(last,  sizeof(last),  m->age_max_us);
+        printf("              %lu closed by the server (first after %s idle, "
+               "median %s, last %s), %lu still open at the end\n",
+               c->closed, first, med, last, c->open_now);
+    } else {
+        printf("              none closed by the server, %lu still open at the end\n",
+               c->open_now);
+    }
+    if (c->bad_status)
+        printf("              %lu answered with an unexpected status\n", c->bad_status);
+    if (c->unsolicited)
+        printf("              %lu were sent data nobody asked for\n", c->unsolicited);
+}
+
+static void phase_print_json(const char *name, const timeline_phase_t *p)
+{
+    printf("\"%s\": {\"sec\": %.3f, \"rps\": %.2f, \"p50_us\": %lu, "
+           "\"p99_us\": %lu, \"p999_us\": %lu}",
+           name, p->sec, p->rps, p->p50_us, p->p99_us, p->p999_us);
+}
+
+static void timeline_print_json(const timeline_t *t)
+{
+    if (t->ramp_sec > 0)
+        printf(",\n  \"ramp_up\": {\"sec\": %d, \"from\": %d, \"to\": %d}",
+               t->ramp_sec, t->floor, t->num_active);
+    if (t->merged && t->num_idle > 0) {
+        const idle_stats_t *m = t->merged;
+        const idle_counts_t *c = &m->c;
+        printf(",\n  \"idle\": {\"connections\": %d, \"opened\": %lu, "
+               "\"answered\": %lu, \"failed\": %lu, \"connect_errors\": %lu, "
+               "\"read_errors\": %lu, \"not_opened\": %lu, \"unexpected_status\": %lu, "
+               "\"unsolicited\": %lu, \"closed_by_server\": %lu, \"open_at_end\": %lu",
+               t->num_idle, c->opened, c->answered, c->failed, c->connect_errors,
+               c->read_errors, t->pending, c->bad_status, c->unsolicited, c->closed,
+               c->open_now);
+        if (c->closed)
+            printf(", \"closed_after_s\": {\"first\": %.3f, \"p50\": %.3f, "
+                   "\"p90\": %.3f, \"p99\": %.3f, \"last\": %.3f}",
+                   m->age_min_us / 1e6, idle_age_percentile(m, 0.50) / 1e6,
+                   idle_age_percentile(m, 0.90) / 1e6,
+                   idle_age_percentile(m, 0.99) / 1e6, m->age_max_us / 1e6);
+        if (m->first.count)
+            printf(", \"first_response_us\": {\"p50\": %lu, \"p99\": %lu, \"samples\": %lu}",
+                   hist_percentile(&m->first, 0.50), hist_percentile(&m->first, 0.99),
+                   m->first.count);
+        printf("}");
+    }
+    if (t->has_ramp || t->has_hold) {
+        printf(",\n  \"phases\": {");
+        if (t->has_ramp) phase_print_json("ramp", &t->ramp);
+        if (t->has_ramp && t->has_hold) printf(", ");
+        if (t->has_hold) phase_print_json("hold", &t->hold);
+        printf("}");
+    }
+    printf(",\n  \"timeline\": [");
+    for (int i = 0; i < t->num_rows; i++) {
+        const timeline_row_t *r = &t->rows[i];
+        printf("%s\n    {\"t\": %.3f, \"active\": %lu, \"rps\": %.2f, "
+               "\"p50_us\": %lu, \"p99_us\": %lu, \"p999_us\": %lu",
+               i ? "," : "", r->t, r->open_active, r->rps, r->p50_us, r->p99_us, r->p999_us);
+        if (t->num_idle > 0)
+            printf(", \"idle_open\": %lu, \"idle_opened\": %lu, \"idle_answered\": %lu, "
+                   "\"idle_closed\": %lu, \"idle_failed\": %lu",
+                   r->open_idle, r->opened, r->answered, r->closed, r->failed);
+        printf("}");
+    }
+    printf("\n  ]");
 }

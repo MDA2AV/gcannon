@@ -10,6 +10,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <limits.h>
+#include <fcntl.h>
 #include <time.h>
 
 #include "constants.h"
@@ -50,6 +51,14 @@ typedef struct thread_ctx {
     int              connect_limit;
     int              conn_target;     /* --ramp-p99: the first step's share */
     uint64_t         ramp_p99_us;
+    int              num_active;      /* --idle: the rest of num_conns are idle */
+    int              active_offset;
+    int              total_active;
+    int              ramp_floor;      /* --ramp-up: active connections opened first */
+    uint64_t         ramp_up_ns;
+    double           ramp_frac;
+    uint64_t         slot_ns;         /* --ramp-up with --rate: the thread's period */
+    uint64_t         slot_base_ns;
 } thread_ctx_t;
 
 /* ── URL parser ────────────────────────────────────────────────────── */
@@ -271,6 +280,9 @@ static void *worker_thread(void *arg)
                 ctx->tls, ctx->tls_sni,
                 ctx->interval_ns, ctx->epoch_ns, ctx->total_conns,
                 ctx->connect_limit, ctx->conn_target, ctx->ramp_p99_us,
+                ctx->num_active, ctx->active_offset, ctx->total_active,
+                ctx->ramp_floor, ctx->ramp_up_ns, ctx->ramp_frac,
+                ctx->slot_ns, ctx->slot_base_ns,
                 &g_running);
     worker_loop(&ctx->worker);
     worker_close_all(&ctx->worker);
@@ -330,6 +342,18 @@ static int wait_settled(thread_ctx_t *ctxs, const int num_threads, const int tar
             return settled;
         nanosleep(&(struct timespec){ .tv_sec = 0, .tv_nsec = 1000000 }, NULL); /* 1ms */
     }
+}
+
+/* Grow this process's file table to hold n descriptors, so nothing has to
+   later. It never shrinks. Past the limit (ulimit -n) the call fails, and so
+   does nothing. */
+static void reserve_files(const int n)
+{
+    const int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    const int high = fcntl(fd, F_DUPFD_CLOEXEC, n);
+    if (high >= 0) close(high);
+    close(fd);
 }
 
 /* Sleep for ms, or until Ctrl-C */
@@ -571,6 +595,155 @@ out:
     return best ? best : (res->num_steps ? cur : NULL);
 }
 
+/* ── --ramp-up and --idle ──────────────────────────────────────────── */
+
+/* "900000" -> the count, "90%" -> that share of -c once it is known */
+static int parse_idle(const char *s, int *count, double *pct)
+{
+    char *end;
+    errno = 0;
+    *count = -1;
+    *pct = 0;
+    const double v = strtod(s, &end);
+    if (end == s || errno || !(v > 0))
+        return -1;
+    if (strcmp(end, "%") == 0) {
+        if (v > 100) return -1;
+        *pct = v;
+        return 0;
+    }
+    if (*end != '\0' || v > INT_MAX || v != (double)(long)v)
+        return -1;
+    *count = (int)v;
+    return 0;
+}
+
+/* The spacing of the table's rows: a round number of seconds, about 30 rows
+   in all, such that a row ends with the ramp */
+static double timeline_interval(const int duration_sec, const int ramp_sec)
+{
+    static const int nice[] = { 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1800, 3600 };
+    const int want = (duration_sec + 29) / 30;
+    int pick = nice[sizeof(nice) / sizeof(nice[0]) - 1];
+    for (size_t i = 0; i < sizeof(nice) / sizeof(nice[0]); i++)
+        if (nice[i] >= want) { pick = nice[i]; break; }
+    if (ramp_sec <= 0)
+        return pick;
+    return (double)ramp_sec / ((ramp_sec + pick - 1) / pick);
+}
+
+/* Merge the workers' counters and copies into an interval's line. cur holds
+   the stats of the active connections, zeroed by the caller. */
+static void timeline_collect(thread_ctx_t *ctxs, const int num_threads,
+                             timeline_row_t *row, worker_stats_t *cur)
+{
+    memset(row, 0, sizeof(*row));
+    for (int i = 0; i < num_threads; i++) {
+        const worker_t *w = &ctxs[i].worker;
+        stats_merge(cur, w->snap);
+        row->open_active += w->snap->conns_active;
+        if (w->idle) {
+            row->open_idle += w->idle_snap.open_now;
+            row->opened    += w->idle_snap.opened;
+            row->answered  += w->idle_snap.answered;
+            row->closed    += w->idle_snap.closed;
+            row->failed    += w->idle_snap.failed;
+        }
+    }
+}
+
+static void timeline_fill_row(timeline_row_t *row, const worker_stats_t *cur,
+                              const double t, const double elapsed)
+{
+    row->t       = t;
+    row->elapsed = elapsed;
+    row->rps     = elapsed > 0 ? cur->responses / elapsed : 0;
+    row->p50_us  = stats_percentile(cur, 0.50);
+    row->p99_us  = stats_percentile(cur, 0.99);
+    row->p999_us = stats_percentile(cur, 0.999);
+}
+
+static void phase_fill(timeline_phase_t *ph, const worker_stats_t *s, const double sec)
+{
+    ph->sec     = sec;
+    ph->rps     = sec > 0 ? s->responses / sec : 0;
+    ph->p50_us  = stats_percentile(s, 0.50);
+    ph->p99_us  = stats_percentile(s, 0.99);
+    ph->p999_us = stats_percentile(s, 0.999);
+}
+
+/* Append to the table's rows, whose array grows as needed */
+static void timeline_add(timeline_t *t, const timeline_row_t *row)
+{
+    if (t->num_rows % 64 == 0) {
+        timeline_row_t *grown = realloc(t->rows, (size_t)(t->num_rows + 64) * sizeof(*grown));
+        if (!grown) {
+            fprintf(stderr, "Error: out of memory\n");
+            exit(1);
+        }
+        t->rows = grown;
+    }
+    t->rows[t->num_rows++] = *row;
+}
+
+/* Accumulated figures while the connections open, and after it. */
+typedef struct timeline_run {
+    worker_stats_t *cur;       /* one interval */
+    worker_stats_t *ramp;      /* the ramp's intervals, merged */
+    worker_stats_t *hold;      /* ...and those after it */
+    double          ramp_sec, hold_sec;
+} timeline_run_t;
+
+static void timeline_account(timeline_run_t *run, timeline_t *t, const worker_stats_t *cur,
+                             const double row_t, const double elapsed)
+{
+    if (t->ramp_sec > 0 && row_t <= t->ramp_sec + 1e-6) {
+        stats_merge(run->ramp, cur);
+        run->ramp_sec += elapsed;
+    } else {
+        stats_merge(run->hold, cur);
+        run->hold_sec += elapsed;
+    }
+}
+
+/* --ramp-up and --idle: the measured window, cut into intervals. Each ends
+ * with the workers copying their stats out and zeroing them (the same control
+ * word as --ramp-p99), from which main makes a line of the table: how many
+ * connections are open, what the idle ones have come to, and the active ones'
+ * rate and latency over the interval. Returns when the window ends or Ctrl-C
+ * comes. opened is when the window opened, total gathers everything. */
+static void run_timeline(thread_ctx_t *ctxs, const int num_threads, const int duration_sec,
+                         FILE *out, timeline_t *t, timeline_run_t *run,
+                         worker_stats_t *total, const struct timespec *opened)
+{
+    const double iv = timeline_interval(duration_sec, t->ramp_sec);
+    int rows = (int)(duration_sec / iv + 0.5);
+    if (rows < 1) rows = 1;
+
+    timeline_print_header(out, t->num_idle > 0);
+    double prev = 0;
+    for (int k = 1; k <= rows && g_running; k++) {
+        const double at = k == rows ? duration_sec : k * iv;
+        sleep_running((long)(at * 1000.0) - ms_since(opened));
+        if (!g_running) break;
+        ctl_all(ctxs, num_threads, CTL_SNAPSHOT | CTL_RESET);
+        if (!g_running) break;
+
+        timeline_row_t row;
+        stats_clear(run->cur);
+        timeline_collect(ctxs, num_threads, &row, run->cur);
+        const double now_s = ms_since(opened) / 1000.0;
+        timeline_fill_row(&row, run->cur, now_s, now_s - prev);
+        prev = now_s;
+        timeline_add(t, &row);
+        timeline_print_row(out, &row, t->num_idle > 0);
+
+        run->cur->conns_active = 0;   /* a count, not a sum: the end's is what is reported */
+        timeline_account(run, t, run->cur, at, row.elapsed);
+        stats_merge(total, run->cur);
+    }
+}
+
 /* ── main ──────────────────────────────────────────────────────────── */
 
 int main(int argc, char **argv)
@@ -596,6 +769,10 @@ int main(int argc, char **argv)
     int settle_sec = 0;
     ramp_plan_t ramp = { .factor = 2.0 };   /* --ramp-p99; x2 unless --ramp-step */
     int ramp_start_set = 0, ramp_step_set = 0;
+    int ramp_up_sec = 0, ramp_up_set = 0;   /* --ramp-up */
+    int idle_count = -1;                    /* --idle: a count... */
+    double idle_pct = 0;                    /* ...or a share of -c */
+    int idle_set = 0;
     const char *ws_message = "hello";
     const char *url = NULL;
     const char *raw_files = NULL;
@@ -658,6 +835,16 @@ int main(int argc, char **argv)
         } else if (strcmp(argv[i], "--ramp") == 0 && i + 1 < argc) {
             ramp.start = atoi(argv[++i]);
             ramp_start_set = 1;
+        } else if (strcmp(argv[i], "--idle") == 0 && i + 1 < argc) {
+            if (parse_idle(argv[++i], &idle_count, &idle_pct) < 0) {
+                fprintf(stderr, "Error: --idle takes a number of connections or a "
+                                "percentage of -c, like 900000 or 90%% (got '%s')\n", argv[i]);
+                return 1;
+            }
+            idle_set = 1;
+        } else if (strcmp(argv[i], "--ramp-up") == 0 && i + 1 < argc) {
+            ramp_up_sec = parse_duration(argv[++i]);
+            ramp_up_set = 1;
         } else if (strcmp(argv[i], "--ramp-step") == 0 && i + 1 < argc) {
             if (parse_ramp_step(argv[++i], &ramp.factor, &ramp.increment) < 0) {
                 fprintf(stderr, "Error: --ramp-step takes x<factor> above 1 or "
@@ -681,6 +868,7 @@ int main(int argc, char **argv)
                             "[--addr-span <n>] [--connect-limit <n>] "
                             "[--warmup-max <duration>] [--settle <duration>] "
                             "[--ramp-p99 <latency> [--ramp <conns>] [--ramp-step x2|+<n>]] "
+                            "[--idle <conns>|<n>%%] [--ramp <conns> --ramp-up <duration>] "
                             "[--version]\n");
             return 1;
         }
@@ -754,11 +942,75 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* --ramp-p99: -c is the ceiling and -d each step's window */
-    if (!ramp.p99_us && (ramp_start_set || ramp_step_set)) {
-        fprintf(stderr, "Error: --ramp and --ramp-step need --ramp-p99\n");
+    /* --idle: -c counts them too, and what is left carries the load */
+    int num_idle = 0;
+    if (idle_set) {
+        num_idle = idle_pct > 0 ? (int)(num_connections * idle_pct / 100.0 + 0.5) : idle_count;
+        if (num_idle < 1) {
+            fprintf(stderr, "Error: --idle comes to no connections out of -c (%d)\n",
+                    num_connections);
+            return 1;
+        }
+        if (ws_mode || tui_mode || ramp.p99_us) {
+            fprintf(stderr, "Error: --idle cannot be combined with %s\n",
+                    ws_mode ? "--ws" : tui_mode ? "--tui" : "--ramp-p99");
+            return 1;
+        }
+        if (num_connections - num_idle < num_threads) {
+            fprintf(stderr, "Error: --idle (%d) leaves %d of -c (%d) active, fewer than -t "
+                            "(%d); every thread needs at least one\n",
+                    num_idle, num_connections - num_idle, num_connections, num_threads);
+            return 1;
+        }
+    }
+    const int num_active = num_connections - num_idle;
+
+    /* --ramp-up: opens the rest of the connections, the idle ones included,
+       inside the measured window, after a floor of active ones */
+    if (!ramp.p99_us && !ramp_up_set && ramp_start_set) {
+        fprintf(stderr, "Error: --ramp needs --ramp-p99 or --ramp-up\n");
         return 1;
     }
+    if (!ramp.p99_us && ramp_step_set) {
+        fprintf(stderr, "Error: --ramp-step needs --ramp-p99\n");
+        return 1;
+    }
+    if (ramp_up_set) {
+        if (ramp.p99_us || tui_mode || ws_mode) {
+            fprintf(stderr, "Error: --ramp-up cannot be combined with %s\n",
+                    ramp.p99_us ? "--ramp-p99" : tui_mode ? "--tui" : "--ws");
+            return 1;
+        }
+        if (ramp_up_sec < 1) {
+            fprintf(stderr, "Error: --ramp-up must be at least 1 second (got %d)\n", ramp_up_sec);
+            return 1;
+        }
+        if (!ramp_start_set) {
+            fprintf(stderr, "Error: --ramp-up needs --ramp <n>, the active connections that "
+                            "open first\n");
+            return 1;
+        }
+        if (ramp.start < num_threads) {
+            fprintf(stderr, "Error: --ramp (%d) must be at least -t (%d); every "
+                            "thread needs at least one connection\n",
+                    ramp.start, num_threads);
+            return 1;
+        }
+        if (ramp.start > num_active) {
+            fprintf(stderr, "Error: --ramp (%d) must not be above the %d active connections\n",
+                    ramp.start, num_active);
+            return 1;
+        }
+        if (ramp_up_sec > duration_sec) {
+            fprintf(stderr, "Error: --ramp-up (%ds) must not be longer than -d (%ds), the "
+                            "window it runs inside\n", ramp_up_sec, duration_sec);
+            return 1;
+        }
+    }
+    const int timeline_on = idle_set || ramp_up_set;
+    const int floor_conns = ramp_up_set ? ramp.start : num_active;
+
+    /* --ramp-p99: -c is the ceiling and -d each step's window */
     if (ramp.p99_us) {
         if (ramp.p99_us >= TIER2_MAX_US) {
             fprintf(stderr, "Error: --ramp-p99 must be under %ds, the top of the "
@@ -974,9 +1226,21 @@ int main(int argc, char **argv)
        at the rate asked for */
     uint64_t interval_ns = 0;
     if (rate > 0) {
-        interval_ns = (uint64_t)((double)num_connections * 1e9 / rate);
+        interval_ns = (uint64_t)((double)num_active * 1e9 / rate);
         if (interval_ns == 0) interval_ns = 1;
     }
+    /* ...but with --ramp-up the active connections come and go, so each thread
+       has its own share of the rate to send on whichever are open */
+    uint64_t slot_ns = 0;
+    if (rate > 0 && ramp_up_set) {
+        slot_ns = (uint64_t)(num_threads * 1e9 / rate);
+        if (slot_ns == 0) slot_ns = 1;
+    }
+
+    timeline_t tl = {
+        .total_conns = num_connections, .num_active = num_active, .num_idle = num_idle,
+        .floor = floor_conns, .ramp_sec = ramp_up_set ? ramp_up_sec : 0,
+    };
 
     int conns_per_thread = num_connections / num_threads;
     int extra = num_connections % num_threads;
@@ -1014,9 +1278,14 @@ int main(int argc, char **argv)
             inet_ntop(AF_INET, &addrs[addr_span - 1].sin_addr, last, sizeof(last));
             printf("  Addresses: %s - %s (%d)\n", first, last, addr_span);
         }
-        if (rate > 0)
+        if (slot_ns)
+            printf("  Rate:      %.0f req/s, over whichever active connections are open\n",
+                   rate);
+        else if (rate > 0)
             printf("  Rate:      %.0f req/s, one request per connection every %.3fs\n",
                    rate, interval_ns / 1e9);
+        if (timeline_on)
+            timeline_print_plan(&tl);
         if (ramp.p99_us)
             ramp_print_plan(ramp.start, ramp.factor, ramp.increment, ramp.p99_us);
         printf("\n");
@@ -1024,6 +1293,13 @@ int main(int argc, char **argv)
 
     signal(SIGINT, sigint_handler);
     signal(SIGPIPE, SIG_IGN);
+
+    /* --ramp-up and --idle open connections inside the measured window, and
+       the kernel grows the file table as they do: with several threads sharing
+       it, that waits out an RCU grace period, 5-15 ms at each power of two,
+       inside a worker. Grow it once now, while there is one thread. */
+    if (timeline_on)
+        reserve_files(num_connections + num_threads * 4 + 64);
 
     /* Spawn worker threads */
     thread_ctx_t *ctxs = calloc(num_threads, sizeof(thread_ctx_t));
@@ -1039,7 +1315,7 @@ int main(int argc, char **argv)
     const uint64_t epoch_ns = (uint64_t)epoch_ts.tv_sec * 1000000000ULL
                             + (uint64_t)epoch_ts.tv_nsec;
 
-    int conn_offset = 0;
+    int conn_offset = 0, active_offset = 0;
     for (int i = 0; i < num_threads; i++) {
         ctxs[i].worker.id        = i;
         ctxs[i].worker.conn_offset = conn_offset;
@@ -1066,9 +1342,20 @@ int main(int argc, char **argv)
         ctxs[i].epoch_ns          = epoch_ns;
         ctxs[i].total_conns       = num_connections;
         ctxs[i].connect_limit     = connect_limit;
-        ctxs[i].conn_target       = ramp.p99_us ? ramp_share(ramp.start, num_threads, i)
-                                                : ctxs[i].num_conns;
+        const int active = ramp_share(num_active, num_threads, i);
         ctxs[i].ramp_p99_us       = ramp.p99_us;
+        ctxs[i].num_active        = active;
+        ctxs[i].active_offset     = active_offset;
+        ctxs[i].total_active      = num_active;
+        ctxs[i].ramp_floor        = ramp_up_set ? ramp_share(floor_conns, num_threads, i)
+                                                : active;
+        ctxs[i].ramp_up_ns        = (uint64_t)ramp_up_sec * 1000000000ULL * ramp_up_set;
+        ctxs[i].ramp_frac         = (i + 0.5) / num_threads;
+        ctxs[i].slot_ns           = slot_ns;
+        ctxs[i].slot_base_ns      = epoch_ns + (uint64_t)(slot_ns * (i / (double)num_threads));
+        ctxs[i].conn_target       = ramp.p99_us ? ramp_share(ramp.start, num_threads, i)
+                                                : ctxs[i].ramp_floor;
+        active_offset += active;
         conn_offset += ctxs[i].num_conns;
         pthread_create(&threads[i], NULL, worker_thread, &ctxs[i]);
     }
@@ -1131,11 +1418,11 @@ int main(int argc, char **argv)
 
     /* Warmup: until every connection is set up (wait_settled) */
     {
-        const int settled = wait_settled(ctxs, num_threads, num_connections, warmup_max_sec);
-        if (settled < num_connections && g_running)
+        const int settled = wait_settled(ctxs, num_threads, floor_conns, warmup_max_sec);
+        if (settled < floor_conns && g_running)
             fprintf(stderr, "Warning: %d of %d connections still not set up after "
                             "%ds of warmup; measuring anyway\n",
-                    num_connections - settled, num_connections, warmup_max_sec);
+                    floor_conns - settled, floor_conns, warmup_max_sec);
     }
 
     /* --settle: keep the load running this much longer once every connection
@@ -1154,7 +1441,7 @@ int main(int argc, char **argv)
      * own thread; memset-ing them here would race with the workers still
      * incrementing those same counters (a data race / undefined behavior).
      * The clock starts once every worker has. */
-    ctl_all(ctxs, num_threads, CTL_RESET);
+    ctl_all(ctxs, num_threads, CTL_RESET | (timeline_on ? CTL_RAMP : 0));
 
     if (!g_running) {
         /* Ctrl-C before the clock started. Nothing was measured, so there is
@@ -1190,7 +1477,25 @@ int main(int argc, char **argv)
         tui_progress_init(duration_sec);
     }
 
-    while (g_running && ticks < duration_sec) {
+    timeline_run_t run = {0};
+    if (timeline_on) {
+        worker_stats_t **buf[] = { &run.cur, &run.ramp, &run.hold };
+        for (int i = 0; i < 3; i++) {
+            *buf[i] = calloc(1, sizeof(worker_stats_t));
+            if (*buf[i] && total.tpl_latency) {
+                (*buf[i])->tpl_latency = calloc(num_templates, sizeof(latency_hist_t));
+                (*buf[i])->num_tpl_latency = num_templates;
+            }
+            if (!*buf[i] || (total.tpl_latency && !(*buf[i])->tpl_latency)) {
+                fprintf(stderr, "Error: out of memory\n");
+                return 1;
+            }
+        }
+        run_timeline(ctxs, num_threads, duration_sec, json_mode ? stderr : stdout,
+                     &tl, &run, &total, &start_time);
+    }
+
+    while (g_running && !timeline_on && ticks < duration_sec) {
         nanosleep(&(struct timespec){ .tv_sec = 1, .tv_nsec = 0 }, NULL);
         ticks++;
 
@@ -1233,6 +1538,49 @@ int main(int argc, char **argv)
     elapsed = (end_time.tv_sec - start_time.tv_sec)
             + (end_time.tv_nsec - start_time.tv_nsec) / 1e9;
 
+    /* What came after the timeline's last line: nothing after a normal end,
+       and the rest of the interval Ctrl-C cut short */
+    if (timeline_on) {
+        timeline_row_t row = {0};
+        stats_clear(run.cur);
+        for (int i = 0; i < num_threads; i++) {
+            const worker_t *w = &ctxs[i].worker;
+            stats_merge(run.cur, &w->stats);
+            row.open_active += w->stats.conns_active;
+            if (w->idle) {
+                row.open_idle += w->idle->c.open_now;
+                row.opened    += w->idle->c.opened;
+                row.answered  += w->idle->c.answered;
+                row.closed    += w->idle->c.closed;
+                row.failed    += w->idle->c.failed;
+            }
+        }
+        const double prev = tl.num_rows ? tl.rows[tl.num_rows - 1].t : 0;
+        if (elapsed - prev > 0.2) {
+            timeline_fill_row(&row, run.cur, elapsed, elapsed - prev);
+            timeline_add(&tl, &row);
+            timeline_print_row(json_mode ? stderr : stdout, &row, num_idle > 0);
+            run.cur->conns_active = 0;
+            timeline_account(&run, &tl, run.cur, row.t, row.elapsed);
+        }
+        phase_fill(&tl.ramp, run.ramp, run.ramp_sec);
+        phase_fill(&tl.hold, run.hold, run.hold_sec);
+        tl.has_ramp = run.ramp_sec > 0;
+        tl.has_hold = run.hold_sec > 0;
+        tl.merged = calloc(1, sizeof(*tl.merged));
+        if (!tl.merged) { fprintf(stderr, "Error: out of memory\n"); return 1; }
+        for (int i = 0; i < num_threads; i++)
+            if (ctxs[i].worker.idle)
+                idle_stats_merge(tl.merged, ctxs[i].worker.idle);
+        const uint64_t accounted = tl.merged->c.opened + tl.merged->c.connect_errors;
+        tl.pending = (uint64_t)num_idle > accounted ? (uint64_t)num_idle - accounted : 0;
+        for (int i = 0; i < 3; i++) {
+            worker_stats_t *b = ((worker_stats_t *[]){ run.cur, run.ramp, run.hold })[i];
+            free(b->tpl_latency);
+            free(b);
+        }
+    }
+
     /* Aggregate stats */
     for (int i = 0; i < num_threads; i++) {
         stats_merge(&total, &ctxs[i].worker.stats);
@@ -1267,7 +1615,8 @@ report:
         stats_print_json(&total, elapsed, num_templates, ws_mode,
                          target, report_conns, num_threads,
                          pipeline_depth, duration_sec, rate,
-                         ramp.p99_us ? &ramp_res : NULL);
+                         ramp.p99_us ? &ramp_res : NULL,
+                         timeline_on ? &tl : NULL);
     } else if (tui_mode) {
         tui_print_results(&total, elapsed, num_templates, expected_status,
                           hist_buckets, prev_runs, num_prev, &current_record,
@@ -1275,8 +1624,9 @@ report:
         if (rate > 0) stats_print_rate(&total, elapsed, rate, num_connections);
     } else {
         stats_print(&total, elapsed, num_templates, ws_mode);
-        if (rate > 0) stats_print_rate(&total, elapsed, rate, num_connections);
+        if (rate > 0) stats_print_rate(&total, elapsed, rate, num_active);
         if (ramp.p99_us) ramp_print_result(&ramp_res);
+        if (timeline_on) timeline_print_result(&tl);
     }
 
     /* Check for unexpected status codes (exit code) */
@@ -1294,6 +1644,8 @@ report:
         exit_code = 1;
 
     free(ramp_res.steps);
+    free(tl.rows);
+    free(tl.merged);
     free(total.tpl_latency);
     free(history);
     free(prev_runs);

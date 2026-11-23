@@ -289,6 +289,99 @@ static long pace_wait_ns(const worker_t *w)
     return due - now < 1000000ULL ? (long)(due - now) : 1000000L;
 }
 
+/* ── --ramp-up with --rate: the thread's schedule ──────────────────── */
+
+/* The schedule starts at the next slot from now. What went by before was
+   setup, not owed. */
+static void slot_rebase(worker_t *w)
+{
+    const uint64_t now = now_ns();
+    w->slot_next = now > w->slot_base_ns
+                 ? (now - w->slot_base_ns + w->slot_ns - 1) / w->slot_ns : 0;
+}
+
+/* The connection can take a request: queue it behind the others. The first
+   one ever starts the schedule. Out of line, as it is only for --ramp-up with
+   --rate. */
+__attribute__((noinline))
+static void slot_push(worker_t *w, gc_conn_t *c, const int conn_idx)
+{
+    if (w->free_len == w->free_cap) {
+        const int cap = w->free_cap ? w->free_cap * 2 : 256;
+        free_entry_t *q = malloc((size_t)cap * sizeof(*q));
+        if (!q) {
+            fprintf(stderr, "[w%d] free list: out of memory\n", w->id);
+            exit(1);
+        }
+        if (w->free_cap == 0)
+            slot_rebase(w);
+        for (int i = 0; i < w->free_len; i++)
+            q[i] = w->free_q[(w->free_head + i) & (w->free_cap - 1)];
+        free(w->free_q);
+        w->free_q    = q;
+        w->free_cap  = cap;
+        w->free_head = 0;
+    }
+    w->free_q[(w->free_head + w->free_len++) & (w->free_cap - 1)] =
+        (free_entry_t){ .conn_idx = conn_idx, .gen = c->gen };
+}
+
+/* The connection free the longest, or -1. A connection that closed since it
+   was queued is dropped, and so is one that turns out busy. */
+static int slot_pop(worker_t *w)
+{
+    while (w->free_len > 0) {
+        const free_entry_t e = w->free_q[w->free_head];
+        w->free_head = (w->free_head + 1) & (w->free_cap - 1);
+        w->free_len--;
+        const gc_conn_t *c = &w->conns[e.conn_idx];
+        if (c->gen == e.gen && c->state == CONN_ACTIVE &&
+            !c->send_inflight && c->pipeline_inflight == 0)
+            return e.conn_idx;
+    }
+    return -1;
+}
+
+/* Send everything that is due, on the connections free the longest. A slot
+   that finds none free is kept, and goes out when one frees, its latency
+   counted from the slot.
+
+   Out of line, and the wait with it: only --ramp-up with --rate paces this
+   way, and inlined into worker_loop they cost the closed loop registers. */
+__attribute__((noinline))
+static void slot_tick(worker_t *w)
+{
+    while (w->free_len > 0) {
+        const uint64_t due = w->slot_base_ns + w->slot_next * w->slot_ns;
+        const uint64_t now = now_ns();
+        if (due > now) return;
+        const int idx = slot_pop(w);
+        if (idx < 0) return;
+        gc_conn_t *c = &w->conns[idx];
+        if (!fire_requests_at(w, c, idx, 1, due)) {
+            slot_push(w, c, idx);
+            return;
+        }
+        const uint64_t lag_us = (now - due) / 1000;
+        w->stats.paced_sends++;
+        if (lag_us > 1000) w->stats.paced_late++;
+        if (lag_us > w->stats.paced_lag_max_us) w->stats.paced_lag_max_us = lag_us;
+        w->slot_next++;
+    }
+}
+
+/* How long the loop may sleep: until the next slot if a connection is free to
+   take it, otherwise until something arrives, at most 1 ms. */
+__attribute__((noinline))
+static long slot_wait_ns(const worker_t *w)
+{
+    if (!w->free_len) return 1000000L;
+    const uint64_t now = now_ns();
+    const uint64_t due = w->slot_base_ns + w->slot_next * w->slot_ns;
+    if (due <= now) return 0;
+    return due - now < 1000000ULL ? (long)(due - now) : 1000000L;
+}
+
 /* A connection is ready for requests (first time, or again after a
  * reconnect): closed loop fills its pipeline, --rate starts or resumes its
  * schedule.
@@ -313,6 +406,11 @@ static long pace_wait_ns(const worker_t *w)
  * owed. A reconnect keeps its schedule and catches up on what it missed. */
 static void conn_start_requests(worker_t *w, gc_conn_t *c, const int conn_idx)
 {
+    if (w->slot_ns) {
+        c->pace_pending = 0;
+        slot_push(w, c, conn_idx);
+        return;
+    }
     if (!w->interval_ns) {
         fire_requests(w, c, conn_idx, w->pipeline_depth);
         return;
@@ -320,8 +418,8 @@ static void conn_start_requests(worker_t *w, gc_conn_t *c, const int conn_idx)
     c->pace_pending = 0;
     if (!c->due_ns) {
         const double slot = ((double)conn_idx
-                             + (double)w->conn_offset / (double)w->total_conns)
-                            / (double)w->num_conns;
+                             + (double)w->active_offset / (double)w->total_active)
+                            / (double)w->num_active;
         const uint64_t now = now_ns();
         uint64_t due = w->epoch_ns + (uint64_t)((double)w->interval_ns * slot);
         if (due < now)
@@ -350,6 +448,19 @@ static inline void conn_settle(worker_t *w, gc_conn_t *c)
     atomic_fetch_add_explicit(&w->conns_settled, 1, memory_order_relaxed);
 }
 
+/* --idle: an idle connection's errors are its own, not the active ones' */
+static inline void count_connect_error(worker_t *w, const int conn_idx)
+{
+    if (conn_idx < w->num_active) w->stats.connect_errors++;
+    else w->idle->c.connect_errors++;
+}
+
+static inline void count_read_error(worker_t *w, const int conn_idx)
+{
+    if (conn_idx < w->num_active) w->stats.read_errors++;
+    else w->idle->c.read_errors++;
+}
+
 static int create_connect_socket(int linger_rst)
 {
     const int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
@@ -369,8 +480,11 @@ static int start_connect(worker_t *w, const int conn_idx)
     gc_conn_t *c = &w->conns[conn_idx];
     const int fd = create_connect_socket(w->requests_per_conn > 0);
     if (fd < 0) {
-        w->stats.connect_errors++;
-        conn_settle(w, c);   /* never retried, so don't hold the warmup on it */
+        count_connect_error(w, conn_idx);
+        if (conn_idx < w->num_active)
+            conn_settle(w, c);   /* never retried, so don't hold the warmup on it */
+        else
+            w->idle->c.failed++;
         return 0;
     }
 
@@ -412,18 +526,23 @@ static int start_connect(worker_t *w, const int conn_idx)
     return 1;
 }
 
-/* Start connections not yet started, in index order, up to conn_target (the
-   step's share under --ramp-p99, every connection otherwise), and with
-   --connect-limit only while fewer than the limit have a first attempt in
-   flight. A first attempt holds its slot until it is over (connect_slot_free):
-   the connection is ready for requests, or it failed. Later reconnects are not
-   counted. */
+/* Start connections not yet started: the active ones in index order up to
+   conn_target (the step's share under --ramp-p99, every one of them otherwise),
+   then the idle ones up to idle_target. With --connect-limit, only while fewer
+   than the limit have a first attempt in flight: one holds its slot until it is
+   over (connect_slot_free), the connection being ready for requests or having
+   failed. Later reconnects are not counted. */
 static void connect_fill(worker_t *w)
 {
     const int limit = w->connect_limit > 0 ? w->connect_limit : INT_MAX;
-    while (w->connect_next < w->conn_target &&
-           w->connect_inflight < limit && *w->running) {
-        const int idx = w->connect_next++;
+    while (w->connect_inflight < limit && *w->running) {
+        int idx;
+        if (w->connect_next < w->conn_target)
+            idx = w->connect_next++;
+        else if (w->idle_next < w->idle_target)
+            idx = w->num_active + w->idle_next++;
+        else
+            break;
         if (start_connect(w, idx)) {
             w->conns[idx].holds_slot = 1;
             w->connect_inflight++;
@@ -476,8 +595,30 @@ static void close_conn(worker_t *w, gc_conn_t *c, const int conn_idx)
     c->pipeline_inflight = 0;
 }
 
+/* --idle: the connection is gone, and stays gone. If it was parked, the server
+   closed it; otherwise it never got its answer. */
+static void idle_lost(worker_t *w, const int conn_idx)
+{
+    gc_conn_t *c = &w->conns[conn_idx];
+    connect_slot_free(w, c);
+    if (c->state == CONN_PARKED) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        w->idle->c.closed++;
+        w->idle->c.open_now--;
+        idle_age_record(w->idle, timespec_diff_us(&c->send_times[0], &now));
+    } else {
+        w->idle->c.failed++;
+    }
+    close_conn(w, c, conn_idx);
+}
+
 static void reconnect(worker_t *w, const int conn_idx)
 {
+    if (__builtin_expect(conn_idx >= w->num_active, 0)) {
+        idle_lost(w, conn_idx);
+        return;
+    }
     conn_settle(w, &w->conns[conn_idx]);   /* a failed first attempt counts */
     connect_slot_free(w, &w->conns[conn_idx]);
     close_conn(w, &w->conns[conn_idx], conn_idx);
@@ -486,12 +627,27 @@ static void reconnect(worker_t *w, const int conn_idx)
         start_connect(w, conn_idx);
 }
 
+/* --idle: the connection is up, so send its one request. That goes into its
+   own counters: fire_requests_at counts it with the active connections'. */
+__attribute__((noinline, cold))
+static void idle_ask(worker_t *w, gc_conn_t *c, const int conn_idx)
+{
+    c->state = CONN_ACTIVE;
+    w->idle->c.opened++;
+    if (fire_requests_at(w, c, conn_idx, 1, 0))
+        w->stats.requests--;
+}
+
 /* The connection is up (and for https, keyed): start receiving, then send the
    WebSocket upgrade or the first pipeline. */
 static void conn_ready(worker_t *w, gc_conn_t *c, const int conn_idx)
 {
     connect_slot_free(w, c);
     arm_recv_multishot(w, conn_idx);
+    if (__builtin_expect(conn_idx >= w->num_active, 0)) {
+        idle_ask(w, c, conn_idx);
+        return;
+    }
     if (w->ws_mode) {
         c->state = CONN_WS_UPGRADING;
         fire_ws_upgrade(w, c, conn_idx);
@@ -574,7 +730,7 @@ static void tls_finish(worker_t *w, gc_conn_t *c, const int conn_idx)
     c->ssl = NULL;
 
     if (rc < 0) {
-        w->stats.connect_errors++;
+        count_connect_error(w, conn_idx);
         reconnect(w, conn_idx);
         return;
     }
@@ -613,7 +769,7 @@ static void tls_step(worker_t *w, gc_conn_t *c, const int conn_idx)
     tls_report("handshake", why);
     ERR_clear_error();
 
-    w->stats.connect_errors++;
+    count_connect_error(w, conn_idx);
     reconnect(w, conn_idx);
 }
 
@@ -627,7 +783,7 @@ static void tls_start(worker_t *w, gc_conn_t *c, const int conn_idx)
     c->ssl = SSL_new(w->ssl_ctx);
     if (!c->ssl || !SSL_set_fd(c->ssl, c->fd)) {
         tls_report("setup", "out of memory");
-        w->stats.connect_errors++;
+        count_connect_error(w, conn_idx);
         reconnect(w, conn_idx);
         return;
     }
@@ -669,6 +825,14 @@ void worker_init(worker_t *w,
                  const int connect_limit,
                  const int conn_target,
                  const uint64_t ramp_p99_us,
+                 const int num_active,
+                 const int active_offset,
+                 const int total_active,
+                 const int ramp_floor,
+                 const uint64_t ramp_up_ns,
+                 const double ramp_frac,
+                 const uint64_t slot_ns,
+                 const uint64_t slot_base_ns,
                  volatile int *running)
 {
     memset(w, 0, sizeof(*w));
@@ -686,8 +850,17 @@ void worker_init(worker_t *w,
     w->epoch_ns          = epoch_ns;
     w->total_conns       = total_conns > 0 ? total_conns : num_conns;
     w->connect_limit     = connect_limit;
-    w->conn_target       = conn_target > 0 && conn_target < num_conns
-                         ? conn_target : num_conns;
+    w->num_active        = num_active;
+    w->active_offset     = active_offset;
+    w->total_active      = total_active > 0 ? total_active : num_active;
+    w->ramp_floor        = ramp_floor;
+    w->ramp_up_ns        = ramp_up_ns;
+    w->ramp_frac         = ramp_frac;
+    w->timeline          = ramp_up_ns > 0 || num_active < num_conns;
+    w->slot_ns           = slot_ns;
+    w->slot_base_ns      = slot_base_ns;
+    w->conn_target       = conn_target > 0 && conn_target < num_active
+                         ? conn_target : num_active;
     w->ramp_p99_us       = ramp_p99_us;
     w->templates         = templates;
     w->num_templates     = num_templates;
@@ -709,7 +882,15 @@ void worker_init(worker_t *w,
         w->stats.num_tpl_latency = num_templates;
     }
 
-    if (ramp_p99_us) {
+    if (num_active < num_conns) {
+        w->idle = calloc(1, sizeof(*w->idle));
+        if (!w->idle) {
+            fprintf(stderr, "[w%d] calloc: out of memory\n", id);
+            exit(1);
+        }
+    }
+
+    if (ramp_p99_us || w->timeline) {
         /* What main reads at the end of each step (CTL_SNAPSHOT) */
         w->snap = calloc(1, sizeof(*w->snap));
         if (!w->snap) {
@@ -809,7 +990,7 @@ void worker_init(worker_t *w,
            was asked to: the default 50 us timer slack would land in every
            paced request's latency. */
         prctl(PR_SET_TIMERSLACK, 1UL, 0, 0, 0);
-        w->pace_cap  = num_conns + 64;
+        w->pace_cap  = num_active + 64;
         w->pace_heap = malloc((size_t)w->pace_cap * sizeof(*w->pace_heap));
         if (!w->pace_heap) {
             fprintf(stderr, "[w%d] pace heap: out of memory\n", id);
@@ -830,7 +1011,7 @@ void worker_init(worker_t *w,
        once outlast any handshake timeout. --ramp-p99 starts only the first
        step's, and CTL_GROW the rest. */
     if (connect_limit > 0 || w->conn_target < num_conns) {
-        connect_fill(w);
+        connect_fill(w);   /* --idle and --ramp-up start the rest at CTL_RAMP */
     } else {
         for (int i = 0; i < num_conns; i++)
             start_connect(w, i);
@@ -904,22 +1085,151 @@ static void ramp_snapshot(worker_t *w)
     w->snap_at = now;
 }
 
+/* --ramp-up/--idle: copy out the stats since the last interval, how many
+   connections are open, and the idle ones' counters so far. */
+static void timeline_snapshot(worker_t *w)
+{
+    stats_copy(w->snap, &w->stats);
+    uint64_t active = 0;
+    for (int i = 0; i < w->num_active; i++)
+        if (w->conns[i].state == CONN_ACTIVE) active++;
+    w->snap->conns_active = active;
+    if (w->idle)
+        w->idle_snap = w->idle->c;
+    clock_gettime(CLOCK_MONOTONIC, &w->snap_at);
+}
+
+/* How many of n connections should be started by t, evenly over the ramp.
+   This worker's first is due at its own place in the spacing, so every worker
+   together spaces them evenly. */
+static int ramp_due(const worker_t *w, const uint64_t t_ns, const int n)
+{
+    if (!w->ramp_up_ns) return n;
+    const double x = (double)t_ns * n / (double)w->ramp_up_ns - w->ramp_frac;
+    if (x < 0) return 0;
+    const int due = (int)x + 1;
+    return due < n ? due : n;
+}
+
+/* Start whatever the ramp has made due; once everything is started, it is
+   over. Called once per loop iteration while it lasts. */
+__attribute__((noinline, cold))
+static void ramp_open(worker_t *w)
+{
+    const uint64_t t = now_ns() - w->ramp_start_ns;
+    w->conn_target = w->ramp_floor + ramp_due(w, t, w->num_active - w->ramp_floor);
+    w->idle_target = ramp_due(w, t, w->num_conns - w->num_active);
+    connect_fill(w);
+    if (w->connect_next >= w->num_active &&
+        w->idle_next >= w->num_conns - w->num_active)
+        w->ramp_start_ns = 0;
+}
+
 /* Do what main asked for (worker_t.ctl), then tell it so. Never inlined: it
    runs a few times a run, and inlined into worker_loop its locals pushed the
    loop's own out of registers and onto the stack, on every completion. */
 __attribute__((noinline, cold))
 static void worker_ctl(worker_t *w, const int req)
 {
-    if (req & CTL_SNAPSHOT)
-        ramp_snapshot(w);
+    if (req & CTL_SNAPSHOT) {
+        if (w->timeline)
+            timeline_snapshot(w);
+        else
+            ramp_snapshot(w);
+    }
     if (req & CTL_RESET)
         stats_window_reset(w);
+    if (req & CTL_RAMP) {
+        if (w->slot_ns)
+            slot_rebase(w);   /* the window opens with nothing owed */
+        w->ramp_start_ns = now_ns();
+    }
     if (req & CTL_GROW) {
         const int next = w->conn_target_next;
         w->conn_target = next < w->num_conns ? next : w->num_conns;
         connect_fill(w);
     }
     atomic_fetch_and_explicit(&w->ctl, ~req, memory_order_release);
+}
+
+/* --idle: what a receive on an idle connection means. Its one response parks
+   it; after that the server only ever closes it, or sends what nobody asked
+   for. Cold: once per connection, plus the close. */
+__attribute__((noinline, cold))
+static void idle_recv(worker_t *w, gc_conn_t *c, const int conn_idx,
+                      const struct io_uring_cqe *cqe)
+{
+    const int res        = cqe->res;
+    const int has_buffer = (cqe->flags & IORING_CQE_F_BUFFER) != 0;
+    const int has_more   = (cqe->flags & IORING_CQE_F_MORE)   != 0;
+    const uint16_t bid   = has_buffer ? (uint16_t)(cqe->flags >> IORING_CQE_BUFFER_SHIFT) : 0;
+
+    if (res <= 0) {
+        if (has_buffer) return_buffer(w, bid);
+        if (w->ktls && ktls_read_error(res)) {
+            count_read_error(w, conn_idx);
+            tls_report("read", strerror(-res));
+        }
+        idle_lost(w, conn_idx);
+        return;
+    }
+    if (!has_buffer) return;
+
+    uint8_t *slot = w->buf_slab + (size_t)bid * w->recv_buf_size;
+    const uint8_t *buf = slot;
+    int len = res;
+    if (w->ktls) {
+        uint32_t plen = 0;
+        const int type = ktls_recvmsg_record(slot, res, &w->recv_msg, &buf, &plen);
+        len = (int)plen;
+        if (type == KTLS_RECORD_HANDSHAKE) {   /* a session ticket */
+            return_buffer(w, bid);
+            if (!has_more) arm_recv_multishot(w, conn_idx);
+            return;
+        }
+        if (type < 0 || len == 0 || (type != KTLS_RECORD_DATA && type != 0)) {
+            const int orderly = type >= 0 &&
+                (len == 0 || (type == KTLS_RECORD_ALERT && len >= 2 && buf[1] == 0));
+            if (!orderly) count_read_error(w, conn_idx);
+            return_buffer(w, bid);
+            idle_lost(w, conn_idx);
+            return;
+        }
+    }
+
+    if (c->state == CONN_PARKED) {
+        /* Not a response to anything. Count a connection once: send_total is
+           spare here, its own send is long done. */
+        if (c->send_total != -1) {
+            c->send_total = -1;
+            w->idle->c.unsolicited++;
+        }
+    } else {
+        const int completed = http_parse_responses(&c->parser, buf, len);
+        if (completed < 0) {
+            count_read_error(w, conn_idx);
+            return_buffer(w, bid);
+            idle_lost(w, conn_idx);
+            return;
+        }
+        if (completed > 0) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            if (c->send_time_head < c->send_time_tail)
+                hist_record(&w->idle->first, timespec_diff_us(
+                    &c->send_times[c->send_time_head % PIPELINE_DEPTH_MAX], &now));
+            const int code = c->parser.completed_statuses[0];
+            if (w->expected_status >= 200 && w->expected_status < 600 &&
+                code / 100 != w->expected_status / 100)
+                w->idle->c.bad_status++;
+            c->state = CONN_PARKED;
+            c->send_times[0] = now;   /* how long it stays open counts from here */
+            w->idle->c.answered++;
+            w->idle->c.open_now++;
+        }
+    }
+    return_buffer(w, bid);
+    if (!has_more) arm_recv_multishot(w, conn_idx);
 }
 
 void worker_loop(worker_t *w)
@@ -936,9 +1246,9 @@ void worker_loop(worker_t *w)
             /* How many connections were still open at the end: --rate
                reports it, since a connection that dropped and never came
                back sends nothing and would otherwise show only as rate. */
-            if (w->interval_ns) {
+            if (w->interval_ns || w->timeline) {
                 uint64_t active = 0;
-                for (int i = 0; i < w->num_conns; i++)
+                for (int i = 0; i < w->num_active; i++)
                     if (w->conns[i].state == CONN_ACTIVE) active++;
                 w->stats.conns_active = active;
             }
@@ -956,9 +1266,13 @@ void worker_loop(worker_t *w)
         if (__builtin_expect(ctl != 0, 0))
             worker_ctl(w, ctl);
 
+        if (__builtin_expect(w->ramp_start_ns != 0, 0))
+            ramp_open(w);
+
         /* --rate: send what has come due */
         if (w->interval_ns) {
-            pace_tick(w);
+            if (w->slot_ns) slot_tick(w);
+            else            pace_tick(w);
             io_uring_submit(&w->ring);
         }
 
@@ -968,7 +1282,7 @@ void worker_loop(worker_t *w)
             if (w->interval_ns) {
                 /* Sleep only until the next send is due, so it goes out on
                    time rather than up to a millisecond late. */
-                const long wait = pace_wait_ns(w);
+                const long wait = w->slot_ns ? slot_wait_ns(w) : pace_wait_ns(w);
                 if (wait == 0) continue;
                 struct __kernel_timespec pts = { .tv_sec = 0, .tv_nsec = wait };
                 io_uring_submit_and_wait_timeout(&w->ring, &wait_cqe, 1, &pts, NULL);
@@ -1005,7 +1319,7 @@ void worker_loop(worker_t *w)
                 /* --connect-limit: the slot stays held through a TLS
                    handshake; conn_ready or reconnect frees it */
                 if (res < 0) {
-                    w->stats.connect_errors++;
+                    count_connect_error(w, conn_idx);
                     reconnect(w, conn_idx);
                     break;
                 }
@@ -1021,7 +1335,7 @@ void worker_loop(worker_t *w)
                    SSL_do_handshake will report) */
                 if (c->state != CONN_TLS_HANDSHAKE) break;
                 if (res < 0) {
-                    w->stats.connect_errors++;
+                    count_connect_error(w, conn_idx);
                     reconnect(w, conn_idx);
                     break;
                 }
@@ -1032,7 +1346,7 @@ void worker_loop(worker_t *w)
             case UD_SEND: {
                 if (res < 0) {
                     c->send_inflight = 0;
-                    w->stats.read_errors++;
+                    count_read_error(w, conn_idx);
                     reconnect(w, conn_idx);
                     break;
                 }
@@ -1054,13 +1368,20 @@ void worker_loop(worker_t *w)
                 } else {
                     c->send_inflight = 0;
 
+                    /* --idle: one request, and nothing after it */
+                    if (__builtin_expect(conn_idx >= w->num_active, 0))
+                        break;
+
                     if (w->interval_ns) {
                         /* --rate: a request came due while this send was
-                           still in flight; send it now. Never refill the way
-                           the closed loop does - that would break the pacing. */
+                           still in flight; send it now (or, with --ramp-up,
+                           the connection is free only now). Never refill the
+                           way the closed loop does - that would break the
+                           pacing. */
                         if (c->pace_pending && c->state == CONN_ACTIVE) {
                             c->pace_pending = 0;
-                            pace_fire(w, c, conn_idx);
+                            if (w->slot_ns) slot_push(w, c, conn_idx);
+                            else            pace_fire(w, c, conn_idx);
                         }
                         break;
                     }
@@ -1078,6 +1399,11 @@ void worker_loop(worker_t *w)
             }
 
             case UD_RECV: {
+                if (__builtin_expect(conn_idx >= w->num_active, 0)) {
+                    idle_recv(w, c, conn_idx, cqe);
+                    break;
+                }
+
                 const int has_buffer = (cqe->flags & IORING_CQE_F_BUFFER) != 0;
                 const int has_more   = (cqe->flags & IORING_CQE_F_MORE)   != 0;
 
@@ -1267,10 +1593,17 @@ void worker_loop(worker_t *w)
 
                     if (completed > 0) {
                         if (w->interval_ns) {
-                            /* --rate: the next request is due one interval
-                               after the last one was, however late it ran */
-                            c->due_ns += w->interval_ns;
-                            pace_schedule(w, c, conn_idx);
+                            if (w->slot_ns) {
+                                /* --ramp-up: free for the next due request,
+                                   once its own send has completed */
+                                if (c->send_inflight) c->pace_pending = 1;
+                                else                  slot_push(w, c, conn_idx);
+                            } else {
+                                /* --rate: the next request is due one interval
+                                   after the last one was, however late it ran */
+                                c->due_ns += w->interval_ns;
+                                pace_schedule(w, c, conn_idx);
+                            }
                         } else {
                             fire_requests(w, c, conn_idx, completed);
                         }
@@ -1371,6 +1704,8 @@ void worker_destroy(worker_t *w)
     free(w->conns);
     free(w->stats.tpl_latency);
     free(w->pace_heap);
+    free(w->free_q);
+    free(w->idle);
     if (w->snap) {
         free(w->snap->tpl_latency);
         free(w->snap);
