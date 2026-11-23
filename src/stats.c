@@ -84,6 +84,8 @@ void stats_merge(worker_stats_t *dst, const worker_stats_t *src)
     dst->paced_sends    += src->paced_sends;
     dst->paced_late     += src->paced_late;
     dst->conns_active   += src->conns_active;
+    dst->conns_dead     += src->conns_dead;
+    dst->conns_silent   += src->conns_silent;
     if (src->paced_lag_max_us > dst->paced_lag_max_us)
         dst->paced_lag_max_us = src->paced_lag_max_us;
 
@@ -102,6 +104,31 @@ void stats_merge(worker_stats_t *dst, const worker_stats_t *src)
                 ? dst->num_tpl_latency : src->num_tpl_latency;
         for (int i = 0; i < n; i++)
             hist_merge(&dst->tpl_latency[i], &src->tpl_latency[i]);
+    }
+}
+
+void stats_clear(worker_stats_t *s)
+{
+    latency_hist_t *tpl = s->tpl_latency;
+    const int n = s->num_tpl_latency;
+    memset(s, 0, sizeof(*s));
+    if (tpl) {
+        memset(tpl, 0, (size_t)n * sizeof(*tpl));
+        s->tpl_latency = tpl;
+        s->num_tpl_latency = n;
+    }
+}
+
+void stats_copy(worker_stats_t *dst, const worker_stats_t *src)
+{
+    latency_hist_t *tpl = dst->tpl_latency;
+    const int n = dst->num_tpl_latency;
+    *dst = *src;
+    dst->tpl_latency = tpl;
+    dst->num_tpl_latency = n;
+    if (tpl && src->tpl_latency) {
+        const int m = n < src->num_tpl_latency ? n : src->num_tpl_latency;
+        memcpy(tpl, src->tpl_latency, (size_t)m * sizeof(*tpl));
     }
 }
 
@@ -251,10 +278,13 @@ void stats_print(const worker_stats_t *s, double elapsed_sec, int num_templates,
     }
 }
 
+static void ramp_print_json(const ramp_result_t *r);
+
 void stats_print_json(const worker_stats_t *s, double elapsed_sec,
                       int num_templates, int ws_mode,
                       const char *target, int num_connections, int num_threads,
-                      int pipeline_depth, int duration_sec, double target_rate)
+                      int pipeline_depth, int duration_sec, double target_rate,
+                      const ramp_result_t *ramp)
 {
     const uint64_t avg_us = s->latency_count
                             ? s->latency_sum_us / s->latency_count : 0;
@@ -339,6 +369,10 @@ void stats_print_json(const worker_stats_t *s, double elapsed_sec,
         printf("  \"connections_active\": %lu", s->conns_active);
     }
 
+    /* --ramp-p99 only, like the rate block */
+    if (ramp)
+        ramp_print_json(ramp);
+
     printf("\n}\n");
 }
 
@@ -354,4 +388,163 @@ void stats_print_rate(const worker_stats_t *s, double elapsed_sec,
            s->paced_sends, s->paced_late, lag);
     printf("  Active:     %lu of %d connections open at the end\n",
            s->conns_active, num_connections);
+}
+
+/* ── --ramp-p99 ────────────────────────────────────────────────────── */
+
+/* The word --json reports for a verdict */
+static const char *ramp_verdict_name(const ramp_verdict_t v)
+{
+    switch (v) {
+    case RAMP_OK:          return "ok";
+    case RAMP_SOCKETS:     return "sockets";
+    case RAMP_SETUP:       return "setup";
+    case RAMP_RESPONSES:   return "responses";
+    case RAMP_SILENT:      return "silent";
+    case RAMP_STATUS:      return "status";
+    case RAMP_ERRORS:      return "errors";
+    case RAMP_P99:         return "p99";
+    case RAMP_CEILING:     return "ceiling";
+    case RAMP_INTERRUPTED: return "interrupted";
+    }
+    return "unknown";
+}
+
+static const char *plural(const uint64_t n)
+{
+    return n == 1 ? "" : "s";
+}
+
+/* Why a step failed, in words */
+static void ramp_describe(char *buf, const size_t sz, const ramp_step_t *st,
+                          const uint64_t p99_max_us)
+{
+    char thr[32];
+    format_latency(thr, sizeof(thr), p99_max_us);
+    switch (st->verdict) {
+    case RAMP_SOCKETS:
+        snprintf(buf, sz, "%lu connection%s could not get a socket (ulimit -n?)",
+                 st->dead, plural(st->dead));
+        break;
+    case RAMP_SETUP:
+        snprintf(buf, sz, "only %d of %d connections set up", st->set_up, st->connections);
+        break;
+    case RAMP_RESPONSES:
+        snprintf(buf, sz, "no responses");
+        break;
+    case RAMP_SILENT:
+        snprintf(buf, sz, "%lu connection%s got no response", st->silent, plural(st->silent));
+        break;
+    case RAMP_STATUS:
+        snprintf(buf, sz, "%lu response%s with an unexpected status",
+                 st->unexpected, plural(st->unexpected));
+        break;
+    case RAMP_ERRORS:
+        snprintf(buf, sz, "%lu error%s", st->errors, plural(st->errors));
+        break;
+    case RAMP_P99:
+        snprintf(buf, sz, "p99 over %s", thr);
+        break;
+    default:
+        buf[0] = '\0';
+    }
+}
+
+void ramp_print_plan(const int start, const double factor, const int increment,
+                     const uint64_t p99_max_us)
+{
+    char thr[32], step[32];
+    format_latency(thr, sizeof(thr), p99_max_us);
+    if (increment > 0)
+        snprintf(step, sizeof(step), "+%d", increment);
+    else
+        snprintf(step, sizeof(step), "x%g", factor);
+    printf("  Ramp:      from %d connection%s, %s per step, while p99 stays within %s\n",
+           start, plural((uint64_t)start), step, thr);
+}
+
+void ramp_print_header(FILE *out)
+{
+    fprintf(out, "  %8s  %9s  %8s  %8s  %8s  %8s\n",
+            "Conns", "Req/s", "p50", "p90", "p99", "p99.9");
+    fflush(out);
+}
+
+void ramp_print_step(FILE *out, const ramp_step_t *st, const uint64_t p99_max_us,
+                     const int again)
+{
+    char rps[32], p50[32], p90[32], p99[32], p999[32];
+    format_count(rps, sizeof(rps),
+                 st->elapsed_sec > 0 ? (uint64_t)(st->responses / st->elapsed_sec) : 0);
+    format_latency(p50,  sizeof(p50),  st->p50_us);
+    format_latency(p90,  sizeof(p90),  st->p90_us);
+    format_latency(p99,  sizeof(p99),  st->p99_us);
+    format_latency(p999, sizeof(p999), st->p999_us);
+    fprintf(out, "  %8d  %9s  %8s  %8s  %8s  %8s",
+            st->connections, rps, p50, p90, p99, p999);
+    if (st->verdict != RAMP_OK) {
+        char why[128];
+        ramp_describe(why, sizeof(why), st, p99_max_us);
+        fprintf(out, "   %s%s", why, again ? ", measuring again" : "");
+    }
+    fprintf(out, "\n");
+    fflush(out);
+}
+
+void ramp_print_result(const ramp_result_t *r)
+{
+    char thr[32];
+    format_latency(thr, sizeof(thr), r->p99_max_us);
+
+    printf("  Ramp:       held p99 within %s ", thr);
+    if (r->best >= 0) {
+        const ramp_step_t *b = &r->steps[r->best];
+        char p99[32];
+        format_latency(p99, sizeof(p99), b->p99_us);
+        printf("up to %d connection%s (p99 %s)", b->connections,
+               plural((uint64_t)b->connections), p99);
+    } else {
+        printf("at no step");
+    }
+
+    const ramp_step_t *last = r->num_steps > 0 ? &r->steps[r->num_steps - 1] : NULL;
+    if (r->stop == RAMP_CEILING) {
+        printf(", the -c ceiling\n");
+    } else if (r->stop == RAMP_INTERRUPTED || !last) {
+        printf("; interrupted\n");
+    } else {
+        char why[128];
+        ramp_describe(why, sizeof(why), last, r->p99_max_us);
+        printf("; at %d, %s\n", last->connections, why);
+    }
+}
+
+static void ramp_print_json(const ramp_result_t *r)
+{
+    printf(",\n  \"ramp\": {\n");
+    printf("    \"p99_max_us\": %lu,\n", r->p99_max_us);
+    printf("    \"max_connections\": %d,\n",
+           r->best >= 0 ? r->steps[r->best].connections : 0);
+    printf("    \"stopped\": \"%s\",\n", ramp_verdict_name(r->stop));
+    printf("    \"steps\": [");
+    for (int i = 0; i < r->num_steps; i++) {
+        const ramp_step_t *st = &r->steps[i];
+        const double rps = st->elapsed_sec > 0 ? st->responses / st->elapsed_sec : 0;
+        printf("%s\n      {\"connections\": %d, \"set_up\": %d, \"active\": %lu, "
+               "\"elapsed_sec\": %.3f, \"responses\": %lu, \"rps\": %.2f, "
+               "\"latency_us\": {\"p50\": %lu, \"p90\": %lu, \"p99\": %lu, "
+               "\"p999\": %lu, \"samples\": %lu}, "
+               "\"errors\": %lu, \"unexpected\": %lu, \"silent\": %lu, \"dead\": %lu, "
+               "\"retry\": %s, \"pass\": %s",
+               i ? "," : "", st->connections, st->set_up, st->active,
+               st->elapsed_sec, st->responses, rps,
+               st->p50_us, st->p90_us, st->p99_us, st->p999_us, st->samples,
+               st->errors, st->unexpected, st->silent, st->dead,
+               st->retry ? "true" : "false",
+               st->verdict == RAMP_OK ? "true" : "false");
+        if (st->verdict != RAMP_OK)
+            printf(", \"fail\": \"%s\"", ramp_verdict_name(st->verdict));
+        printf("}");
+    }
+    printf("\n    ]\n  }");
 }

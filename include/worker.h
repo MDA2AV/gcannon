@@ -69,6 +69,16 @@ typedef struct gc_conn {
     int              pace_pending;   /* due while the previous send was still in flight */
 } gc_conn_t;
 
+/* What main asks of a worker, as bits of worker_t.ctl. The worker does it at
+   the top of its loop, from its own thread, so its stats and connections are
+   never touched by two threads at once, then clears the bits; main waits for
+   that. */
+enum {
+    CTL_RESET    = 1 << 0,  /* zero the stats: the window opens */
+    CTL_SNAPSHOT = 1 << 1,  /* --ramp-p99: copy them to snap, the step's window closed */
+    CTL_GROW     = 1 << 2,  /* --ramp-p99: open connections up to conn_target_next */
+};
+
 /* --rate: one queued send. Stale entries (the connection closed, or was
    rescheduled) are recognised by gen/due and dropped when they surface. */
 typedef struct pace_entry {
@@ -113,8 +123,8 @@ typedef struct worker {
     int                       per_tpl_latency;   /* 1 = per-template latency histograms */
     worker_stats_t            stats;
     volatile int             *running;
-    volatile int              reset_request;     /* main sets after warmup; worker
-                                                    zeroes its own stats and clears */
+    _Atomic int               ctl;               /* CTL_* bits main asked for, cleared
+                                                    by the worker once done */
     _Atomic int               conns_settled;     /* conns whose first setup attempt
                                                     finished; main waits on it */
     struct timespec           stopped_at;        /* when the loop stopped counting:
@@ -138,6 +148,16 @@ typedef struct worker {
     int                       connect_limit;
     int                       connect_next;      /* next connection not yet started */
     int                       connect_inflight;
+
+    /* --ramp-p99: only connections [0, conn_target) are opened, and main
+       raises it a step at a time (CTL_GROW). num_conns otherwise. */
+    int                       conn_target;
+    int                       conn_target_next;  /* main's next target, for CTL_GROW */
+    uint64_t                  ramp_p99_us;       /* the threshold, 0 = no ramp */
+    worker_stats_t           *snap;              /* the stats as the last window closed */
+    struct timespec           snap_at;           /* ...and when that was */
+    struct timespec           window_start;      /* when the stats were last zeroed */
+    uint64_t                  ws_fail_base;      /* ws_upgrade_failures then */
 } worker_t;
 
 /* Initialize worker (must be called from worker thread for SINGLE_ISSUER) */
@@ -152,7 +172,8 @@ void worker_init(worker_t *w, int id,
                  int cqe_latency, int per_tpl_latency,
                  int tls, const char *tls_sni,
                  uint64_t interval_ns, uint64_t epoch_ns, int total_conns,
-                 int connect_limit, volatile int *running);
+                 int connect_limit, int conn_target, uint64_t ramp_p99_us,
+                 volatile int *running);
 
 /* Main event loop — blocks until *running == 0 */
 void worker_loop(worker_t *w);
