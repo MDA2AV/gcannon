@@ -13,7 +13,9 @@
 #include "ktls.h"
 
 typedef enum { CONN_CONNECTING, CONN_TLS_HANDSHAKE, CONN_WS_UPGRADING, CONN_ACTIVE,
-               CONN_CLOSED } conn_state_t;
+               CONN_CLOSED,
+               CONN_PARKED /* --idle: its one request is answered, and it is left alone */
+             } conn_state_t;
 
 struct ssl_st;
 struct ssl_ctx_st;
@@ -77,7 +79,15 @@ enum {
     CTL_RESET    = 1 << 0,  /* zero the stats: the window opens */
     CTL_SNAPSHOT = 1 << 1,  /* --ramp-p99: copy them to snap, the step's window closed */
     CTL_GROW     = 1 << 2,  /* --ramp-p99: open connections up to conn_target_next */
+    CTL_RAMP     = 1 << 3,  /* --ramp-up/--idle: start opening the rest */
 };
+
+/* --ramp-up with --rate: a connection free for the next due request. Stale
+   entries (the connection closed since) are recognised by gen. */
+typedef struct free_entry {
+    int      conn_idx;
+    uint16_t gen;
+} free_entry_t;
 
 /* --rate: one queued send. Stale entries (the connection closed, or was
    rescheduled) are recognised by gen/due and dropped when they surface. */
@@ -158,6 +168,43 @@ typedef struct worker {
     struct timespec           snap_at;           /* ...and when that was */
     struct timespec           window_start;      /* when the stats were last zeroed */
     uint64_t                  ws_fail_base;      /* ws_upgrade_failures then */
+
+    /* Which connections are active: [0, num_active) send as in any run, and
+       --idle's [num_active, num_conns) send one request and are then left
+       alone: never sent on again, and never reopened when the server closes
+       them. Without --idle every connection is active, and the three numbers
+       that lay out the --rate schedule are the fleet's own. */
+    int                       num_active;
+    int                       active_offset;     /* active connections before this worker's */
+    int                       total_active;      /* ...and in all */
+
+    /* --ramp-up: the warmup opens only the first ramp_floor active
+       connections; the rest of the active ones, and the idle ones, open evenly
+       over ramp_up_ns once main says so (CTL_RAMP). Without it the idle ones
+       open all at once, then (ramp_up_ns is 0) and the floor is num_active. */
+    int                       ramp_floor;
+    uint64_t                  ramp_up_ns;
+    double                    ramp_frac;         /* this worker's place in the even spacing, 0..1 */
+    uint64_t                  ramp_start_ns;     /* when it began; 0 = not yet, or all open */
+    int                       idle_next;         /* next idle connection not yet started... */
+    int                       idle_target;       /* ...and how many should be by now */
+    int                       timeline;          /* --ramp-up or --idle: snapshots are taken */
+    idle_stats_t             *idle;              /* NULL without --idle */
+    idle_counts_t             idle_snap;         /* its counters at the last snapshot */
+
+    /* --ramp-up with --rate: the active connections come and go, so the rate
+       is the thread's, not each connection's. A request is due every slot_ns,
+       and goes out on the connection that has been free the longest (free_q,
+       a ring of {conn, gen}; entries whose connection has since closed are
+       skipped). Slots due while none was free wait, oldest first, and their
+       latency counts from the slot. 0 = not in use. */
+    uint64_t                  slot_ns;
+    uint64_t                  slot_base_ns;      /* slot 0 is due then */
+    uint64_t                  slot_next;         /* the oldest slot not yet sent */
+    free_entry_t             *free_q;
+    int                       free_cap;
+    int                       free_head;
+    int                       free_len;
 } worker_t;
 
 /* Initialize worker (must be called from worker thread for SINGLE_ISSUER) */
@@ -173,6 +220,9 @@ void worker_init(worker_t *w, int id,
                  int tls, const char *tls_sni,
                  uint64_t interval_ns, uint64_t epoch_ns, int total_conns,
                  int connect_limit, int conn_target, uint64_t ramp_p99_us,
+                 int num_active, int active_offset, int total_active,
+                 int ramp_floor, uint64_t ramp_up_ns, double ramp_frac,
+                 uint64_t slot_ns, uint64_t slot_base_ns,
                  volatile int *running);
 
 /* Main event loop — blocks until *running == 0 */

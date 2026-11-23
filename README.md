@@ -60,8 +60,10 @@ gcannon http://localhost:8080 --raw get.raw,post.raw -c 256 -t 4 -d 5s
 | `--warmup-max` | 10s | Longest the warmup waits for connections to settle before measuring anyway |
 | `--settle` | 0 | How long the load keeps running after every connection is up before the window opens |
 | `--ramp-p99` | | Grow the connections a step at a time until p99 goes over this latency (`5ms`, `500us`, `1.5s`); `-c` is the ceiling, `-d` each step's window. See [Ramp to a p99 threshold](#ramp-to-a-p99-threshold---ramp-p99) |
-| `--ramp` | `-t` | The first step's connection count (with `--ramp-p99`) |
+| `--ramp` | `-t` | The first step's connection count (with `--ramp-p99`), or the active connections opened before the ramp (with `--ramp-up`) |
 | `--ramp-step` | `x2` | How the steps grow: `x<factor>` multiplies, `+<n>` adds (with `--ramp-p99`) |
+| `--idle` | | Part of `-c` (a count, or a share like `90%`) that opens, sends one request and is then left alone. See [Idle connections](#idle-connections-and-a-timed-ramp---idle---ramp-up) |
+| `--ramp-up` | | Open the connections beyond `--ramp` evenly over this long, inside the measured window (`2m`). Needs `--ramp` |
 | `--version` | | Print the version and exit |
 | `--clear-history` | | Clear saved run history and exit |
 
@@ -248,6 +250,46 @@ The step table prints as the ramp goes (on stderr with `--json`). Below it come 
 
 The answer is the concurrency at which p99 holds in a closed loop. A stall there delays only the requests already sent, so it weighs less in p99 than it would for an open stream of requests, which is what `--rate` measures. `--rate` can't be combined with `--ramp-p99`, because it lays its send slots out for the whole fleet, and a fleet part of the way up would send in bursts. `--tui` can't be combined with it either.
 
+### Idle connections and a timed ramp (`--idle`, `--ramp-up`)
+
+```bash
+# 1M connections, 900K of them idle. 4000 active ones first; the rest of both
+# opened evenly over 2 minutes, at a fixed 100K req/s throughout
+gcannon http://127.0.0.1:8080/ -c 1000000 -t 64 -d 5m --rate 100000 \
+    --idle 90% --ramp 4000 --ramp-up 2m --addr-span 128 --connect-limit 512
+```
+
+A server holds far more connections than it serves at once, and has to shed the ones that have gone quiet. `--idle` makes part of `-c` those connections: each one connects, sends one request, reads the response, and is then left alone. Nothing is sent on it again, and it is never reopened. Keep-alive timeouts, `limit_conn`-style limits and anything else the server does to its idle connections then shows in the report:
+
+```
+  Idle:       160 asked for, 160 opened, 160 answered, 0 failed
+              first response p50 71us, p99 277us
+              160 closed by the server (first after 2.0s idle, median 2.0s, last 2.0s), 0 still open at the end
+```
+
+- **`--idle`** takes a count or a percentage of `-c`. What is left of `-c` carries the load, and has to be at least `-t`. The idle connections' single requests and responses are counted apart: the results, the latency and the exit code are the active connections'.
+- **`--ramp-up <duration>`** opens the connections over time. It runs inside the measured window (`-d` can't be shorter). `--ramp <n>` of the active connections open first, in the warmup, which waits for them (then `--settle`); once the window opens, the rest of the active ones and every idle one open evenly over the duration. Without `--ramp-up`, the idle connections open all at once when the window does.
+- **`--rate` holds the total.** The active connections come and go with the ramp, so with `--ramp-up` each thread paces its share of the rate itself, and gives every request due to whichever of its active connections has been free the longest. The rate is the same with 4,000 connections open as with 100,000. Latency counts from the request's scheduled time, as with any `--rate`. Without `--rate`, the active connections send as fast as they can.
+- **A line for each interval** says how many connections are open, how many idle ones have been opened and closed so far, and the active connections' rate and latency in it. Against `tests/idle_server.py --idle-timeout 2`, `-c 200 -t 2 -d 8s --rate 500 --idle 80% --ramp 8 --ramp-up 4s`:
+
+```
+     Time    Active      Idle    Opened    Closed      Req/s       p50       p99     p99.9
+     1.0s        16        40        40         0        499      17us     144us     199us
+     2.0s        24        80        80         0        500      20us     328us   12.50ms
+     3.0s        32        80       120        40        500      19us      99us     115us
+     4.0s        40        80       160        80        500      20us     109us     129us
+     5.0s        40        40       160       120        500      19us      76us     103us
+     6.0s        40         0       160       160        499      19us      82us      94us
+```
+
+  Opened and Closed count the idle connections over the whole run, Idle those open now. Then `Phases:` gives the rate and latency while the connections open and after it.
+- **Only what outlasts the server's timeout is shed.** A run or a ramp shorter than it ends with every idle connection still open. The report says how many, and how long each shed connection had been idle.
+- **Failures are counted, not retried.** A connection that can't connect, or whose request is never answered, is in `failed` or "still waiting for their response". A server that sends something on an idle connection, such as a 408 before closing it, is in "sent data nobody asked for".
+- **Ports.** Past half the ephemeral range (`net.ipv4.ip_local_port_range`, 28K ports on a default Linux), the kernel scans for a free port for each new connection to the same address, which costs a few hundred microseconds each and delays whatever else the thread is doing. Spread a large fleet with `--addr-span` so that no address has more than about 14K connections. `ulimit -n` has to cover `-c`.
+- `--json` adds `idle`, `ramp_up`, `phases` and `timeline`; the interval lines go to stderr.
+
+`--idle` can't be combined with `--ws`, `--tui` or `--ramp-p99`, and `--ramp-up` can't with `--ws`, `--tui` or `--ramp-p99`.
+
 ### HTTPS
 
 `https://` targets run over TLS 1.3. OpenSSL does the handshake, then the record keys go to kernel TLS (kTLS), which encrypts and decrypts on the socket itself. The io_uring hot path is the same as for `http://`, and every mode works over TLS: pipelining, `--raw`, placeholders, `-r` and `--ws`.
@@ -423,7 +465,7 @@ gcannon http://localhost:8080/ -c 512 -t 8 -d 10s --json
 }
 ```
 
-In WebSocket mode, additional `ws_upgrades` and `ws_frames` fields are included. `--rate` adds a `rate` block, and `--ramp-p99` a `ramp` block (see [Ramp to a p99 threshold](#ramp-to-a-p99-threshold---ramp-p99)). Pipe to `jq` for filtering:
+In WebSocket mode, additional `ws_upgrades` and `ws_frames` fields are included. `--rate` adds a `rate` block, `--idle` an `idle` block, `--ramp-up` and `--idle` a `timeline`, and `--ramp-p99` a `ramp` block (see [Ramp to a p99 threshold](#ramp-to-a-p99-threshold---ramp-p99)). Pipe to `jq` for filtering:
 
 ```bash
 gcannon http://localhost:8080/ -c 512 -t 8 -d 5s --json | jq '.rps'
@@ -448,6 +490,9 @@ main thread
   --ramp-p99: per step, open the step's connections, warm up, reset stats,
               run for duration, have each worker copy its stats out, merge
               them and check p99; repeat until a step fails or -c
+  --ramp-up, --idle: at each interval have the workers copy their stats out
+              and zero them, and print a line; the workers open the rest of
+              the connections over the ramp
   join, aggregate stats, print
 
 worker thread

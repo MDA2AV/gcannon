@@ -68,6 +68,66 @@ typedef struct worker_stats {
                                       window opened: no response all window */
 } worker_stats_t;
 
+/* --idle: connections that send one request and are then left alone. Counted
+   apart from worker_stats_t, whose figures describe the active connections
+   only. */
+typedef struct idle_counts {
+    uint64_t opened;          /* up, and its one request sent */
+    uint64_t answered;        /* ...and answered: parked from here on */
+    uint64_t open_now;        /* parked, and not closed yet */
+    uint64_t closed;          /* parked, then closed by the server */
+    uint64_t failed;          /* never answered: could not connect, or the
+                                 server closed it before the response */
+    uint64_t connect_errors;  /* ...of which could not connect (or handshake) */
+    uint64_t read_errors;     /* ...of which failed reading or parsing it */
+    uint64_t bad_status;      /* answered outside the expected class (-s) */
+    uint64_t unsolicited;     /* parked connections the server sent data to */
+} idle_counts_t;
+
+#define IDLE_AGE_STEP_US  100000   /* how long a parked connection stayed open
+                                      before the server closed it: 100 ms... */
+#define IDLE_AGE_BUCKETS  36000    /* ...buckets, up to an hour */
+
+typedef struct idle_stats {
+    idle_counts_t  c;
+    uint64_t       age_count, age_min_us, age_max_us;
+    uint32_t       age_hist[IDLE_AGE_BUCKETS];
+    uint32_t       age_overflow;
+    latency_hist_t first;        /* request sent to response, of the one request */
+} idle_stats_t;
+
+/* --ramp-up/--idle: one line of the table over time */
+typedef struct timeline_row {
+    double   t;                  /* when the interval ended, from the window opening */
+    double   elapsed;
+    double   rps;                /* active connections' responses per second */
+    uint64_t p50_us, p99_us, p999_us;   /* ...and their latency, in the interval */
+    uint64_t open_active;        /* connections open as it ended: the active... */
+    uint64_t open_idle;          /* ...and the parked ones */
+    uint64_t opened, answered, closed, failed;   /* idle, so far */
+} timeline_row_t;
+
+/* A stretch of the run: its length, and the active connections' figures in it */
+typedef struct timeline_phase {
+    double   sec;
+    double   rps;
+    uint64_t p50_us, p99_us, p999_us;
+} timeline_phase_t;
+
+typedef struct timeline {
+    int               total_conns;   /* -c */
+    int               num_active;    /* ...of which active */
+    int               num_idle;      /* ...and idle (0 without --idle) */
+    int               floor;         /* active connections opened in the warmup */
+    int               ramp_sec;      /* --ramp-up; 0 = none */
+    idle_stats_t     *merged;        /* --idle: every worker's, summed */
+    uint64_t          pending;       /* idle: neither opened nor failed by the end */
+    timeline_row_t   *rows;
+    int               num_rows;
+    int               has_ramp, has_hold;
+    timeline_phase_t  ramp, hold;    /* while the connections open, and after */
+} timeline_t;
+
 /* --ramp-p99: how a step's window went. A step passes on RAMP_OK; anything
    else fails it, checked in this order. The last two only end the ramp. */
 typedef enum {
@@ -119,12 +179,13 @@ void stats_copy(worker_stats_t *dst, const worker_stats_t *src);
 uint64_t stats_percentile(const worker_stats_t *s, double pct);
 void stats_print(const worker_stats_t *s, double elapsed_sec, int num_templates,
                  int ws_mode);
-/* ramp is NULL except for --ramp-p99, whose steps it adds */
+/* ramp is NULL except for --ramp-p99, whose steps it adds; timeline likewise
+   for --ramp-up and --idle */
 void stats_print_json(const worker_stats_t *s, double elapsed_sec,
                       int num_templates, int ws_mode,
                       const char *target, int num_connections, int num_threads,
                       int pipeline_depth, int duration_sec, double target_rate,
-                      const ramp_result_t *ramp);
+                      const ramp_result_t *ramp, const timeline_t *timeline);
 /* --rate only: target vs achieved rate, schedule lag, connections still open */
 void stats_print_rate(const worker_stats_t *s, double elapsed_sec,
                       double target_rate, int num_connections);
@@ -135,3 +196,13 @@ void ramp_print_plan(int start, double factor, int increment, uint64_t p99_max_u
 void ramp_print_header(FILE *out);
 void ramp_print_step(FILE *out, const ramp_step_t *st, uint64_t p99_max_us, int again);
 void ramp_print_result(const ramp_result_t *r);
+
+/* --ramp-up/--idle: counters, the table over time, and what came of the
+   connections */
+void idle_age_record(idle_stats_t *s, uint64_t age_us);
+uint64_t idle_age_percentile(const idle_stats_t *s, double pct);
+void idle_stats_merge(idle_stats_t *dst, const idle_stats_t *src);
+void timeline_print_plan(const timeline_t *r);
+void timeline_print_header(FILE *out, int has_idle);
+void timeline_print_row(FILE *out, const timeline_row_t *row, int has_idle);
+void timeline_print_result(const timeline_t *r);

@@ -18,7 +18,8 @@
 #                  so, and the exit code is 1
 #   ctrl-c         before the first step is measured: nothing to report, 130;
 #                  after one passed: its results, stopped "interrupted"
-#   arg errors     --ramp/--ramp-step need --ramp-p99, which needs a unit,
+#   arg errors     --ramp needs --ramp-p99 or --ramp-up, --ramp-step needs
+#                  --ramp-p99, which needs a unit,
 #                  stays under 5s, and refuses --rate and --tui; --ramp sits
 #                  between -t and -c; --ramp-step takes x<factor> or +<n>
 #   no ramp        without --ramp-p99 the output carries no ramp lines
@@ -226,8 +227,8 @@ check_err() {
     fi
 }
 U="http://127.0.0.1:1/"
-check_err "ramp alone"          "need --ramp-p99"   "$U" -c 8 -t 1 -d 1s --ramp 2
-check_err "ramp-step alone"     "need --ramp-p99"   "$U" -c 8 -t 1 -d 1s --ramp-step x2
+check_err "ramp alone"          "needs --ramp-p99 or --ramp-up"   "$U" -c 8 -t 1 -d 1s --ramp 2
+check_err "ramp-step alone"     "needs --ramp-p99"   "$U" -c 8 -t 1 -d 1s --ramp-step x2
 check_err "p99 with no unit"    "with its unit"     "$U" -c 8 -t 1 -d 1s --ramp-p99 5
 check_err "p99 of 0"            "with its unit"     "$U" -c 8 -t 1 -d 1s --ramp-p99 0ms
 check_err "p99 of 5s"           "under 5s"          "$U" -c 8 -t 1 -d 1s --ramp-p99 5s
